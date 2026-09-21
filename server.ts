@@ -1257,6 +1257,8 @@ function generateFallbackExplanation(question: string, category: string, course:
     ],
     interviewTip: 'Always structure your answer clearly and state your assumptions before answering.',
   };
+}
+
 // Global Error-Handling Middleware (Ensures Serverless/Express always returns JSON, never HTML 500)
 app.use((err: any, req: Request, res: Response, next: any) => {
   console.error('[Unhandled Server Error in Express]', err);

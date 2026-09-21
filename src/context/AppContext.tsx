@@ -139,9 +139,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     fetch('/api/auth/me', {
       headers: { Authorization: `Bearer ${token}` },
     })
-      .then((res) => res.json())
+      .then((res) => (res.ok ? res.json().catch(() => null) : null))
       .then((data) => {
-        if (data.success && data.user) {
+        if (data && data.success && data.user) {
           setUser((prev) => ({ ...prev, ...data.user }));
           setIsAuthenticated(true);
         } else {
@@ -619,9 +619,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             notes: `Mock interview session completed on ${new Date().toLocaleDateString()}`,
           }),
         })
-          .then((res) => res.json())
+          .then((res) => (res.ok ? res.json().catch(() => null) : null))
           .then((data) => {
-            if (data.success) {
+            if (data?.success) {
               console.log('✅ Session saved to MongoDB Atlas:', data.data?._id);
             }
           })

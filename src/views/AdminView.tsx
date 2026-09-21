@@ -45,7 +45,7 @@ export const AdminView: React.FC = () => {
   // Load real registered users from MongoDB via /api/auth/users
   useEffect(() => {
     fetch('/api/auth/users')
-      .then((res) => res.json())
+      .then((res) => (res.ok ? res.json().catch(() => null) : null))
       .then((data) => {
         if (data?.success && Array.isArray(data.users)) {
           setDbUsers(data.users);
