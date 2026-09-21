@@ -15,9 +15,14 @@ const router = Router();
 // Rate limiting: Protect login & registration against brute-force attacks
 export const authRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 50, // Limit each IP to 50 authentication requests per windowMs
+  max: 100, // Limit each IP to 100 authentication requests per windowMs
   standardHeaders: true,
   legacyHeaders: false,
+  validate: {
+    trustProxy: false,
+    xForwardedForHeader: false,
+    default: false,
+  },
   message: {
     success: false,
     message: 'Too many authentication attempts. Please wait 15 minutes before trying again.',

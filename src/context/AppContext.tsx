@@ -253,7 +253,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       body: JSON.stringify({ email: targetEmail, password: targetPassword }),
     });
 
-    const data = await res.json();
+    const responseText = await res.text();
+    let data: any = {};
+    try {
+      data = JSON.parse(responseText);
+    } catch {
+      throw new Error(`Server returned status ${res.status}: ${responseText.slice(0, 120)}`);
+    }
+
     if (!res.ok || !data.success) {
       throw new Error(data.message || 'Invalid email or password');
     }
@@ -277,7 +284,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       body: JSON.stringify({ name, email, password, targetRole }),
     });
 
-    const data = await res.json();
+    const responseText = await res.text();
+    let data: any = {};
+    try {
+      data = JSON.parse(responseText);
+    } catch {
+      throw new Error(`Server returned status ${res.status}: ${responseText.slice(0, 120)}`);
+    }
+
     if (!res.ok || !data.success) {
       throw new Error(data.message || 'Registration failed');
     }

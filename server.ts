@@ -12,6 +12,7 @@ import authRoutes, { seedAuthUsers } from './server/routes/authRoutes';
 dotenv.config();
 
 const app = express();
+app.set('trust proxy', 1);
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 app.use(express.json({ limit: '10mb' }));
@@ -1256,9 +1257,17 @@ function generateFallbackExplanation(question: string, category: string, course:
     ],
     interviewTip: 'Always structure your answer clearly and state your assumptions before answering.',
   };
-}
-
-
+// Global Error-Handling Middleware (Ensures Serverless/Express always returns JSON, never HTML 500)
+app.use((err: any, req: Request, res: Response, next: any) => {
+  console.error('[Unhandled Server Error in Express]', err);
+  if (res.headersSent) {
+    return next(err);
+  }
+  return res.status(err.status || 500).json({
+    success: false,
+    message: err?.message || 'An unexpected server error occurred.',
+  });
+});
 
 async function startServer() {
   // Connect to MongoDB with resilient lifecycle management
