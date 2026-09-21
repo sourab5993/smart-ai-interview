@@ -1281,18 +1281,23 @@ async function startServer() {
   // Create HTTP server instance to share with Vite HMR (avoids standalone port 24678 conflict)
   const httpServer = http.createServer(app);
 
-  if (process.env.NODE_ENV !== 'production') {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { 
-        middlewareMode: true,
-        hmr: {
-          server: httpServer,
+  if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+    try {
+      const viteModule = 'vite';
+      const { createServer: createViteServer } = await import(/* @vite-ignore */ viteModule);
+      const vite = await createViteServer({
+        server: { 
+          middlewareMode: true,
+          hmr: {
+            server: httpServer,
+          },
         },
-      },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    } catch (viteErr) {
+      console.warn('Vite dev middleware could not be loaded:', viteErr);
+    }
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
