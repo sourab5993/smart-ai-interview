@@ -4,7 +4,6 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import { exec } from "child_process";
-import { GoogleGenAI } from "@google/genai";
 import dotenv2 from "dotenv";
 
 // server/config/database.ts
@@ -1326,36 +1325,11 @@ async function seedAuthUsers() {
 }
 var authRoutes_default = router2;
 
-// server.ts
-dotenv2.config();
-var app = express();
-app.set("trust proxy", 1);
-var PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3e3;
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true, limit: "10mb" }));
-var dbInitPromise = null;
-app.use(async (req, res, next) => {
-  if (req.path.startsWith("/api")) {
-    if (!dbInitPromise) {
-      dbInitPromise = (async () => {
-        try {
-          await connectDB();
-          await seedAuthUsers();
-        } catch (err) {
-          console.error("[Database Init Error in Serverless]", err);
-          dbInitPromise = null;
-        }
-      })();
-    }
-    try {
-      await dbInitPromise;
-    } catch {
-    }
-  }
-  next();
-});
-app.use("/api/auth", authRoutes_default);
-app.use("/api/db", databaseRoutes_default);
+// server/routes/aiRoutes.ts
+import { Router as Router3 } from "express";
+
+// server/services/geminiService.ts
+import { GoogleGenAI } from "@google/genai";
 function getGeminiClient() {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -1368,7 +1342,8 @@ function getGeminiClient() {
 async function callGemini(ai, prompt, config) {
   const candidateModels = [
     "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite"
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash"
   ];
   let lastError = null;
   for (const model of candidateModels) {
@@ -1392,491 +1367,8 @@ async function callGemini(ai, prompt, config) {
   }
   throw lastError || new Error("All candidate Gemini models failed.");
 }
-app.get("/api/health", async (req, res) => {
-  const dbStatus = await getDatabaseStatus();
-  res.json({
-    status: "ok",
-    hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
-    database: dbStatus
-  });
-});
-app.post("/api/ai/generate-questions", async (req, res) => {
-  const {
-    course = "B.Tech",
-    specialization = "Computer Science",
-    role = "Software Engineer",
-    difficulty = "Medium",
-    type = "Technical",
-    language = "English",
-    skills = [],
-    resumeText = "",
-    count = 4
-  } = req.body;
-  const ai = getGeminiClient();
-  if (!ai) {
-    const fallbackQuestions = generateFallbackQuestions(course, specialization, role, difficulty, type, language, skills, count);
-    return res.json({ success: true, questions: fallbackQuestions, source: "universal_offline_engine" });
-  }
-  try {
-    const prompt = `You are a Senior Industry Bar Raiser and Dean of Academic Placements conducting an interview.
-Candidate Profile:
-- Course / Degree: ${course}
-- Specialization / Branch: ${specialization}
-- Target Career / Job Role: ${role}
-- Interview Type: ${type}
-- Difficulty Level: ${difficulty}
-- Language: ${language} (Note: if Hindi or Hinglish, keep professional domain terms accurate in English script or standard Hindi as appropriate)
-- Candidate Key Skills: ${(skills || []).join(", ") || "Standard course fundamentals"}
-- Candidate Resume Snippet: ${resumeText ? resumeText.slice(0, 800) : "None provided"}
-
-CRITICAL INSTRUCTION:
-Do NOT assume this candidate is a Computer Science or IT student unless their course explicitly specifies Computer Science / IT.
-Generate questions STRICTLY aligned with their specific discipline:
-- If Mechanical Engineering -> Thermodynamics, GD&T, CAD/CAM, Manufacturing, Machine Design, Fluid Mechanics, Materials.
-- If Commerce / B.Com -> Double Entry Accounting, GST, Balance Sheet & P&L Analysis, Auditing, Direct Tax, Banking.
-- If Medical / Pharmacy / Nursing -> Pharmacology, ADME, Clinical Safety, Patient Triage, Medication Administration, Infection Control, Pharmacovigilance. (Disclaimer: Educational interview prep only).
-- If Management / MBA / BBA -> Strategy, Porter 5 Forces, CAC/LTV, Marketing, Supply Chain, Decision Making, Business Case Studies.
-- If Law -> Constitutional Law, Contract drafting, Statutory Interpretation, IRAC Case Analysis, IPR, Criminal Procedure.
-- If Arts / English / Journalism -> Editorial Strategy, SEO Copywriting, Critical Analysis, Communication, Storytelling.
-- If Design -> User Research, Figma, Double Diamond, Visual Hierarchy, Design Systems.
-- If Agriculture -> Crop Science, Soil Fertility, Pest Management, Food Safety.
-- If HR / Behavioral -> STAR method questions on conflict, leadership, deadline pressure, and career motivation.
-
-Generate exactly ${count} realistic, challenging, and adaptive interview questions.
-Questions must become progressively nuanced based on difficulty (${difficulty}).
-
-Return ONLY a JSON array of objects with the following schema:
-[
-  {
-    "question": "string",
-    "category": "string (the specific domain concept e.g. Thermodynamics, GST & Tax, Pharmacology, Contract Law, System Design, STAR Behavioral)",
-    "difficulty": "${difficulty}",
-    "type": "${type}",
-    "expectedKeyPoints": ["key point 1", "key point 2", "key point 3"]
-  }
-]`;
-    const { text, modelUsed } = await callGemini(ai, prompt);
-    let questions = [];
-    try {
-      questions = JSON.parse(text);
-    } catch {
-      const match = text.match(/\[[\s\S]*\]/);
-      questions = match ? JSON.parse(match[0]) : [];
-    }
-    if (!Array.isArray(questions) || questions.length === 0) {
-      questions = generateFallbackQuestions(course, specialization, role, difficulty, type, language, skills, count);
-    }
-    const formatted = questions.map((q, idx) => ({
-      id: `gen_q_${Date.now()}_${idx + 1}`,
-      questionNumber: idx + 1,
-      question: q.question,
-      category: q.category || "Domain Technical",
-      difficulty: q.difficulty || difficulty,
-      type: q.type || type,
-      expectedKeyPoints: q.expectedKeyPoints || [],
-      status: "pending"
-    }));
-    return res.json({ success: true, questions: formatted, source: modelUsed });
-  } catch (error) {
-    console.error("Error generating AI questions:", error);
-    const fallbackQuestions = generateFallbackQuestions(course, specialization, role, difficulty, type, language, skills, count);
-    return res.json({ success: true, questions: fallbackQuestions, source: "fallback_error_recovery" });
-  }
-});
-app.post("/api/ai/evaluate-answer", async (req, res) => {
-  const {
-    question,
-    userAnswer,
-    course = "B.Tech",
-    specialization = "General",
-    role = "Professional",
-    difficulty = "Medium",
-    type = "Domain",
-    answerMode = "voice",
-    language = "English"
-  } = req.body;
-  if (!userAnswer || userAnswer.trim().length === 0) {
-    return res.status(400).json({ error: "User answer is required." });
-  }
-  const ai = getGeminiClient();
-  if (!ai) {
-    const fallbackEval = evaluateFallbackAnswer(question, userAnswer, course, role, type);
-    return res.json({ success: true, evaluation: fallbackEval, source: "universal_offline_engine" });
-  }
-  try {
-    const prompt = `You are a strict, objective, and realistic Universal AI Interview Bar Raiser evaluating a candidate's answer.
-Context:
-- Course / Degree: ${course} (${specialization})
-- Target Role: ${role}
-- Interview Type: ${type}
-- Difficulty: ${difficulty}
-- Answer Mode: ${answerMode}
-- Language: ${language}
-
-Question:
-"${question}"
-
-Candidate's Answer:
-"${userAnswer}"
-
-CRITICAL GRADING RIGOR RULES (DO NOT INFLATE SCORES):
-1. IF THE ANSWER IS WRONG, NONSENSE, EVASIVE, OR OFF-TOPIC:
-   - If the candidate says something factually incorrect, confuses concepts, writes gibberish, evasive phrases ("don't know", "skip", "idk", "pata nahi", "galat answer"), or talks about something completely unrelated:
-     * overall_score MUST BE BETWEEN 0 AND 20!
-     * technical_accuracy MUST BE 0 to 15!
-     * relevance MUST BE 0 to 20!
-     * In weaknesses, explicitly explain the factual error: "The provided answer is incorrect / unrelated to the question."
-     * Do NOT award generous or passing scores to wrong answers. Be completely honest and strict!
-2. IF THE ANSWER IS PARTIALLY CORRECT:
-   - If there are major conceptual gaps or shallow understanding: score 30 to 55.
-3. IF THE ANSWER IS SOLID AND ACCURATE:
-   - Solid answer with minor gaps: score 70 to 84.
-   - Comprehensive, production-ready top candidate answer: score 85 to 100.
-
-Score each dimension from 0 to 100 based on the candidate's actual accuracy:
-1. relevance (did they directly answer what was asked?)
-2. technical_accuracy (are domain facts, formulas, principles, or statutes correct?)
-3. completeness (did they address edge cases, nuances, and constraints?)
-4. clarity (is the phrasing concise and easy to understand?)
-5. communication (tone, fluency, vocabulary, professionalism)
-6. structure (logical flow e.g. STAR or Principle -> Application -> Tradeoff)
-7. confidence (assertiveness, lack of hesitation or self-doubt)
-8. problem_solving (depth of reasoning and critical thinking)
-
-Return ONLY a valid JSON object matching this schema:
-{
-  "overall_score": number,
-  "technical_accuracy": number,
-  "relevance": number,
-  "completeness": number,
-  "clarity": number,
-  "communication": number,
-  "structure": number,
-  "confidence": number,
-  "problem_solving": number,
-  "strengths": ["specific strength 1", "specific strength 2"],
-  "weaknesses": ["actionable weakness 1", "actionable weakness 2"],
-  "missing_points": ["key domain concept omitted 1", "key domain concept omitted 2"],
-  "better_answer": "An exemplar, production-ready answer demonstrating how a top candidate would articulate it in this specific field",
-  "improvement_tip": "One memorable piece of coaching advice tailored to this discipline"
-}`;
-    const { text, modelUsed } = await callGemini(ai, prompt);
-    let evaluation;
-    try {
-      evaluation = JSON.parse(text);
-    } catch {
-      const match = text.match(/\{[\s\S]*\}/);
-      evaluation = match ? JSON.parse(match[0]) : evaluateFallbackAnswer(question, userAnswer, course, role, type);
-    }
-    return res.json({ success: true, evaluation, source: modelUsed });
-  } catch (error) {
-    console.error("Error evaluating answer:", error);
-    const fallbackEval = evaluateFallbackAnswer(question, userAnswer, course, role, type);
-    return res.json({ success: true, evaluation: fallbackEval, source: "fallback_error_recovery" });
-  }
-});
-app.post("/api/ai/analyze-interview", async (req, res) => {
-  const { session, course = "B.Tech", role = "Candidate" } = req.body;
-  const ai = getGeminiClient();
-  if (!ai) {
-    const fallbackReport = generateFallbackReport(session, course, role);
-    return res.json({ success: true, report: fallbackReport, source: "universal_offline_engine" });
-  }
-  try {
-    const prompt = `You are a Senior Bar Raiser and Placement Dean assessing an entire mock interview for a "${course}" graduate targeting "${role}".
-Session Details:
-- Total Questions: ${session.questions?.length || 0}
-- Questions & Answers:
-${JSON.stringify(
-      session.questions?.map((q) => ({
-        question: q.question,
-        category: q.category,
-        answer: q.userAnswer || "Skipped",
-        score: q.evaluation?.overall_score || 0,
-        strengths: q.evaluation?.strengths || [],
-        weaknesses: q.evaluation?.weaknesses || []
-      })) || [],
-      null,
-      2
-    )}
-
-Provide a comprehensive, senior-level post-interview synthesis JSON tailored to ${course} and ${role}:
-{
-  "overallScore": number (0-100),
-  "performanceLabel": "string (e.g. Highly Ready / Strong Readiness / Solid Baseline / Needs Targeted Preparation)",
-  "technicalScore": number (0-100),
-  "communicationScore": number (0-100),
-  "problemSolvingScore": number (0-100),
-  "clarityScore": number (0-100),
-  "confidenceScore": number (0-100),
-  "completenessScore": number (0-100),
-  "relevanceScore": number (0-100),
-  "structureScore": number (0-100),
-  "domainSpecificScore": number (0-100),
-  "domainDimensions": [
-    { "dimension": "string (e.g. Core Discipline Knowledge, Practical Application, Regulatory/Standard Awareness)", "score": number, "comment": "string" }
-  ],
-  "topStrengths": ["string"],
-  "topWeaknesses": ["string"],
-  "repeatedMistakes": ["string"],
-  "missingConcepts": ["string"],
-  "technicalKnowledgeGaps": ["string"],
-  "aiExecutiveSummary": "string (2-3 detailed paragraphs summarizing candidate profile and domain readiness)",
-  "personalizedImprovementPlan": ["string"]
-}`;
-    const { text, modelUsed } = await callGemini(ai, prompt);
-    let report;
-    try {
-      report = JSON.parse(text);
-    } catch {
-      const match = text.match(/\{[\s\S]*\}/);
-      report = match ? JSON.parse(match[0]) : generateFallbackReport(session, course, role);
-    }
-    report.id = `rep_${Date.now()}`;
-    report.sessionId = session.id;
-    report.userId = session.userId;
-    report.course = course;
-    report.role = role;
-    report.createdAt = (/* @__PURE__ */ new Date()).toISOString();
-    return res.json({ success: true, report, source: modelUsed });
-  } catch (error) {
-    console.error("Error analyzing interview session:", error);
-    const fallbackReport = generateFallbackReport(session, course, role);
-    return res.json({ success: true, report: fallbackReport, source: "fallback_error_recovery" });
-  }
-});
-app.post("/api/ai/analyze-resume", async (req, res) => {
-  const { resumeText = "", targetRole = "General Candidate", course = "B.Tech", fileName = "Resume.pdf" } = req.body;
-  const ai = getGeminiClient();
-  if (!ai) {
-    const fallbackResume = generateFallbackResumeAnalysis(resumeText, targetRole, course, fileName);
-    return res.json({ success: true, analysis: fallbackResume, source: "universal_offline_engine" });
-  }
-  try {
-    const prompt = `You are a Principal Technical & Corporate Talent Auditor and ATS (Applicant Tracking System) Algorithm Expert.
-Analyze the following resume for a candidate with academic background "${course}" targeting the role "${targetRole}".
-
-Resume Text:
-${resumeText.slice(0, 3500)}
-
-Extract and evaluate in strict JSON format:
-{
-  "parsedName": "string (candidate name)",
-  "parsedEmail": "string (candidate email)",
-  "extractedCourse": "string (detected degree)",
-  "extractedSpecialization": "string (detected major/branch)",
-  "extractedSkills": ["string"],
-  "skillsIdentified": ["string"],
-  "education": ["string"],
-  "experience": ["string"],
-  "projects": ["string"],
-  "certifications": ["string"],
-  "overallScore": number (0-100),
-  "atsCompatibilityScore": number (0-100),
-  "targetRole": "${targetRole}",
-  "skillMatchPercentage": number (0-100),
-  "matchingSkills": ["string"],
-  "missingSkills": ["string"],
-  "missingKeywords": ["string"],
-  "projectStrengthScore": number (0-100),
-  "experienceRelevanceScore": number (0-100),
-  "summary": "string (executive summary of candidate ATS readiness)",
-  "strengths": ["string (2-3 specific strengths with respect to ${targetRole})"],
-  "recommendedImprovements": ["string (2-3 actionable changes e.g. quantified metrics, missing industry keywords)"],
-  "formattingImprovements": ["string (actionable formatting and layout fixes)"]
-}`;
-    const { text, modelUsed } = await callGemini(ai, prompt);
-    let analysis;
-    try {
-      analysis = JSON.parse(text);
-    } catch {
-      const match = text.match(/\{[\s\S]*\}/);
-      analysis = match ? JSON.parse(match[0]) : generateFallbackResumeAnalysis(resumeText, targetRole, course, fileName);
-    }
-    analysis.id = `res_${Date.now()}`;
-    analysis.fileName = fileName || "Uploaded_Resume.pdf";
-    analysis.analyzedAt = (/* @__PURE__ */ new Date()).toISOString();
-    analysis.skillsIdentified = analysis.skillsIdentified || analysis.extractedSkills || [];
-    analysis.extractedSkills = analysis.extractedSkills || analysis.skillsIdentified || [];
-    analysis.missingKeywords = analysis.missingKeywords || analysis.missingSkills || [];
-    analysis.missingSkills = analysis.missingSkills || analysis.missingKeywords || [];
-    analysis.formattingImprovements = analysis.formattingImprovements || analysis.recommendedImprovements || [];
-    analysis.recommendedImprovements = analysis.recommendedImprovements || analysis.formattingImprovements || [];
-    analysis.summary = analysis.summary || analysis.strengths && analysis.strengths[0] || "ATS analysis complete.";
-    return res.json({ success: true, analysis, source: modelUsed });
-  } catch (error) {
-    console.error("Error analyzing resume:", error);
-    const fallbackResume = generateFallbackResumeAnalysis(resumeText, targetRole, course, fileName);
-    return res.json({ success: true, analysis: fallbackResume, source: "fallback_error_recovery" });
-  }
-});
-app.post("/api/resume/parse-document", async (req, res) => {
-  try {
-    const { fileData = "", fileName = "resume.pdf", fileType = "" } = req.body;
-    if (!fileData) {
-      return res.status(400).json({ success: false, error: "No file data received." });
-    }
-    const base64Content = fileData.includes(";base64,") ? fileData.split(";base64,")[1] : fileData.replace(/^data:.*?base64,/, "").trim();
-    const buffer = Buffer.from(base64Content, "base64");
-    const lowerName = (fileName || "").toLowerCase();
-    let extractedText = "";
-    if (lowerName.endsWith(".pdf") || fileType.includes("pdf")) {
-      try {
-        const { PDFParse } = await import("pdf-parse");
-        const parser = new PDFParse({ data: new Uint8Array(buffer) });
-        const result = await parser.getText();
-        extractedText = result.text || "";
-      } catch (pdfErr) {
-        console.warn("Primary PDFParse error, trying stream fallback:", pdfErr?.message || pdfErr);
-        const raw = buffer.toString("binary");
-        const matches = raw.match(/\(([^()]{3,})\)/g);
-        if (matches && matches.length > 5) {
-          extractedText = matches.map((m) => m.slice(1, -1)).join(" ");
-        }
-      }
-    } else if (lowerName.endsWith(".docx") || fileType.includes("wordprocessingml")) {
-      try {
-        const mammoth = (await import("mammoth")).default || await import("mammoth");
-        const result = await mammoth.extractRawText({ buffer });
-        extractedText = result.value || "";
-      } catch (docxErr) {
-        console.warn("DOCX mammoth parsing error:", docxErr?.message || docxErr);
-      }
-    } else if (lowerName.endsWith(".doc") || fileType.includes("msword")) {
-      try {
-        const mammoth = (await import("mammoth")).default || await import("mammoth");
-        const result = await mammoth.extractRawText({ buffer });
-        extractedText = result.value || "";
-      } catch {
-        const printable = buffer.toString("utf-8").replace(/[^\x20-\x7E\t\n\r]/g, " ").replace(/\s{2,}/g, " ").trim();
-        if (printable.length > 80) {
-          extractedText = printable;
-        }
-      }
-    } else {
-      extractedText = buffer.toString("utf-8");
-    }
-    extractedText = extractedText.replace(/\r\n/g, "\n").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
-    if (!extractedText || extractedText.length < 20) {
-      return res.status(422).json({
-        success: false,
-        error: "Could not extract readable text from the document. Please ensure the file contains text and is not password-protected."
-      });
-    }
-    const words = extractedText.split(/\s+/).filter(Boolean);
-    return res.json({
-      success: true,
-      text: extractedText,
-      fileName,
-      fileSize: buffer.length,
-      wordCount: words.length
-    });
-  } catch (error) {
-    console.error("Error parsing resume document:", error);
-    return res.status(500).json({ success: false, error: error?.message || "Failed to parse resume document" });
-  }
-});
-app.post("/api/ai/match-job", async (req, res) => {
-  const { resumeText = "", jobDescription = "", targetRole = "Target Role", course = "General" } = req.body;
-  const ai = getGeminiClient();
-  if (!ai) {
-    const fallbackJobMatch = generateFallbackJobMatch(resumeText, jobDescription, targetRole, course);
-    return res.json({ success: true, match: fallbackJobMatch, source: "universal_offline_engine" });
-  }
-  try {
-    const prompt = `You are an AI Semantic Talent Matcher.
-Compare this candidate's background (${course}) with the Job Description for "${targetRole}".
-
-Candidate Resume:
-${resumeText.slice(0, 2e3)}
-
-Job Description:
-${jobDescription.slice(0, 2e3)}
-
-Perform semantic vector alignment and return strict JSON:
-{
-  "jobTitle": "${targetRole}",
-  "company": "Target Company",
-  "matchScore": number (0-100),
-  "matchPercentage": number (0-100),
-  "matchingSkills": ["string"],
-  "missingSkills": ["string"],
-  "relevantExperiencePoints": ["string"],
-  "suggestedResumeBulletImprovements": ["string (rewritten candidate bullet points incorporating JD keywords with quantified impact)"],
-  "suggestedBullets": ["string"],
-  "recommendedPreparationTopics": ["string"]
-}`;
-    const { text, modelUsed } = await callGemini(ai, prompt);
-    let match;
-    try {
-      match = JSON.parse(text);
-    } catch {
-      const m = text.match(/\{[\s\S]*\}/);
-      match = m ? JSON.parse(m[0]) : generateFallbackJobMatch(resumeText, jobDescription, targetRole, course);
-    }
-    match.id = `jm_${Date.now()}`;
-    match.analyzedAt = (/* @__PURE__ */ new Date()).toISOString();
-    return res.json({ success: true, match, source: modelUsed });
-  } catch (error) {
-    console.error("Error matching job description:", error);
-    const fallbackJobMatch = generateFallbackJobMatch(resumeText, jobDescription, targetRole, course);
-    return res.json({ success: true, match: fallbackJobMatch, source: "fallback_error_recovery" });
-  }
-});
-app.post("/api/ai/explain-question", async (req, res) => {
-  const { question, category = "General", difficulty = "Medium", course = "All Courses" } = req.body;
-  const ai = getGeminiClient();
-  if (!ai) {
-    return res.json({
-      success: true,
-      explanation: generateFallbackExplanation(question, category, course),
-      source: "universal_offline_engine"
-    });
-  }
-  try {
-    const prompt = `You are a distinguished Professor and Industry Placement Mentor in ${course}.
-Question: "${question}"
-Category: ${category}
-Difficulty: ${difficulty}
-
-Explain this thoroughly in JSON format suited to the student's academic level:
-{
-  "concept": "string (clear high-level explanation of the underlying theory or principle)",
-  "approach": "string (step-by-step framework to approach this in an interview)",
-  "solutionCode": "string (clean code, formula, ledger entry, statutory citation, or clinical protocol where applicable)",
-  "complexity": "string (space/time complexity, tax penalty rate, mechanical safety factor, or physiological threshold)",
-  "commonMistakes": ["string (2-3 common traps candidates fall into)"],
-  "interviewTip": "string (insider pro-tip on how to stand out when answering this)"
-}`;
-    const { text, modelUsed } = await callGemini(ai, prompt);
-    let explanation;
-    try {
-      explanation = JSON.parse(text);
-    } catch {
-      const match = text.match(/\{[\s\S]*\}/);
-      explanation = match ? JSON.parse(match[0]) : generateFallbackExplanation(question, category, course);
-    }
-    return res.json({ success: true, explanation, source: modelUsed });
-  } catch (error) {
-    console.error("Error explaining question:", error);
-    return res.json({
-      success: true,
-      explanation: generateFallbackExplanation(question, category, course),
-      source: "fallback_error_recovery"
-    });
-  }
-});
-app.post("/api/ai/transcribe-audio", async (req, res) => {
-  const { audioBase64 = "", mimeType = "audio/webm", language = "English" } = req.body;
-  if (!audioBase64 || audioBase64.length < 50) {
-    return res.status(400).json({ success: false, error: "Valid audio data is required." });
-  }
-  const ai = getGeminiClient();
-  if (!ai) {
-    return res.json({ success: false, error: "AI client not configured." });
-  }
-  try {
-    const prompt = `You are an expert speech-to-text transcriber for a professional job interview.
+async function transcribeAudioGemini(ai, audioBase64, mimeType = "audio/webm", language = "English") {
+  const prompt = `You are an expert speech-to-text transcriber for a professional job interview.
 Language context: ${language} (accurately transcribe English, Hindi, and Hinglish technical terms verbatim).
 CRITICAL RULES:
 1. Output ONLY the exact transcribed words spoken in the audio without quotes.
@@ -1884,42 +1376,40 @@ CRITICAL RULES:
 3. If technical terms like "React", "State", "API", "Database", "Loop", "Function" are mentioned, spell them correctly.
 4. Do NOT add preamble, markdown, notes, or timestamps.
 5. If the audio has no speech or is only silence/noise, respond with nothing.`;
-    const cleanBase64 = audioBase64.includes(";base64,") ? audioBase64.split(";base64,")[1] : audioBase64.replace(/^data:.*?base64,/, "").trim();
-    const rawMime = (mimeType || "audio/webm").split(";")[0].trim();
-    const normalizedMime = rawMime || "audio/webm";
-    const candidateModels = ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.1-flash-lite"];
-    let transcribed = "";
-    let usedModel = "";
-    for (const model of candidateModels) {
-      try {
-        const response = await ai.models.generateContent({
-          model,
-          contents: [
-            {
-              role: "user",
-              parts: [
-                { inlineData: { mimeType: normalizedMime, data: cleanBase64 } },
-                { text: prompt }
-              ]
-            }
-          ]
-        });
-        if (response && response.text) {
-          transcribed = response.text.trim();
-          usedModel = model;
-          break;
-        }
-      } catch (modelErr) {
-        console.warn(`Audio transcribe with ${model} failed, trying next candidate:`, modelErr?.message || modelErr);
+  const cleanBase64 = audioBase64.includes(";base64,") ? audioBase64.split(";base64,")[1] : audioBase64.replace(/^data:.*?base64,/, "").trim();
+  const rawMime = (mimeType || "audio/webm").split(";")[0].trim();
+  const normalizedMime = rawMime || "audio/webm";
+  const candidateModels = ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.1-flash-lite"];
+  let transcribed = "";
+  let usedModel = "";
+  for (const model of candidateModels) {
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { inlineData: { mimeType: normalizedMime, data: cleanBase64 } },
+              { text: prompt }
+            ]
+          }
+        ]
+      });
+      if (response && response.text) {
+        transcribed = response.text.trim();
+        usedModel = model;
+        break;
       }
+    } catch (modelErr) {
+      console.warn(`Audio transcribe with ${model} failed, trying next candidate:`, modelErr?.message || modelErr);
     }
-    return res.json({ success: true, text: transcribed, source: usedModel || "gemini-ai-transcribe" });
-  } catch (error) {
-    console.error("Error transcribing audio with Gemini:", error?.message || error);
-    return res.status(500).json({ success: false, error: error?.message || "Audio transcription failed" });
   }
-});
-function generateFallbackQuestions(course, specialization, role, difficulty, type, language, skills = [], count) {
+  return { text: transcribed, source: usedModel || "gemini-ai-transcribe" };
+}
+
+// server/services/fallbackEngines.ts
+function generateFallbackQuestions(course, specialization, role, difficulty, type, language, skills = [], count = 4) {
   const normalizedCourse = course.toLowerCase();
   const normalizedRole = role.toLowerCase();
   if (normalizedCourse.includes("mech") || normalizedRole.includes("mech") || normalizedRole.includes("design engineer")) {
@@ -2091,7 +1581,7 @@ function generateFallbackQuestions(course, specialization, role, difficulty, typ
         questionNumber: 4,
         question: "Tell me about a time when you led a cross-functional team or project initiative. How did you align diverse team members toward a shared measurable KPI?",
         category: "Leadership & Behavioral",
-        difficulty: "Medium",
+        difficulty,
         type: "Behavioral",
         expectedKeyPoints: ["STAR format", "Empathy and delegation", "Measurable business outcome"],
         status: "pending"
@@ -2185,11 +1675,12 @@ function generateFallbackQuestions(course, specialization, role, difficulty, typ
     }
   ].slice(0, count);
 }
-function evaluateFallbackAnswer(question, userAnswer, course, role, type) {
+function evaluateFallbackAnswer(question, userAnswer, course, role, type, behaviorTelemetry) {
   const trimmed = (userAnswer || "").trim();
   const lowerAns = trimmed.toLowerCase();
   const words = trimmed.split(/\s+/).filter(Boolean);
   const wordCount = words.length;
+  const bScore = behaviorTelemetry?.overallBehaviorScore ?? 82;
   const evasionPhrases = [
     "dont know",
     "don't know",
@@ -2233,6 +1724,9 @@ function evaluateFallbackAnswer(question, userAnswer, course, role, type) {
       structure: 5,
       confidence: 5,
       problem_solving: 5,
+      behavior_score: bScore,
+      behavior_telemetry: behaviorTelemetry,
+      non_verbal_feedback: behaviorTelemetry?.behaviorNotes?.join(" ") || "Candidate exhibited minimal verbal and non-verbal engagement.",
       strengths: ["Attempted to submit an answer"],
       weaknesses: [
         "The answer is empty, evasive, or lacks technical substance.",
@@ -2312,6 +1806,9 @@ function evaluateFallbackAnswer(question, userAnswer, course, role, type) {
     structure: Math.max(5, Math.min(90, score - 2)),
     confidence: Math.max(10, Math.min(90, score - 2)),
     problem_solving: Math.max(5, Math.min(92, score + (isLow ? -4 : 2))),
+    behavior_score: bScore,
+    behavior_telemetry: behaviorTelemetry,
+    non_verbal_feedback: behaviorTelemetry?.behaviorNotes?.join(" ") || "Candidate maintained steady eye contact and natural non-verbal composure during response delivery.",
     strengths: isLow ? ["Candidate answered within the allotted time", "Spoke in clear, grammatical language"] : [
       `Demonstrated familiarity with key ${course} concepts (${matchingKw.slice(0, 3).join(", ") || "fundamentals"})`,
       "Logical progression from core statement to practical context",
@@ -2338,6 +1835,11 @@ function generateFallbackReport(session, course, role) {
   const questions = session.questions || [];
   const scores = questions.map((q) => q.evaluation?.overall_score || 80);
   const avg = scores.length > 0 ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 82;
+  const bTelemetries = questions.map((q) => q.behaviorTelemetry || q.evaluation?.behavior_telemetry).filter(Boolean);
+  const avgEye = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.eyeContactScore || 85), 0) / bTelemetries.length) : 85;
+  const avgStability = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.postureStabilityScore || 88), 0) / bTelemetries.length) : 88;
+  const avgComposure = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.facialComposureScore || 86), 0) / bTelemetries.length) : 86;
+  const overallBehavior = Math.round(avgEye * 0.4 + avgStability * 0.3 + avgComposure * 0.3);
   return {
     overallScore: avg,
     performanceLabel: avg >= 85 ? "Strong Placement-Ready Performance" : avg >= 75 ? "Solid Foundation \u2014 Ready with Minor Polish" : "Developing Baseline",
@@ -2350,6 +1852,16 @@ function generateFallbackReport(session, course, role) {
     relevanceScore: Math.min(95, avg + 3),
     structureScore: Math.min(92, avg),
     domainSpecificScore: Math.min(96, avg + 2),
+    behaviorScore: overallBehavior,
+    eyeContactAverage: avgEye,
+    postureStabilityAverage: avgStability,
+    composureAverage: avgComposure,
+    behaviorSummary: `Candidate maintained an average eye contact score of ${avgEye}%, posture stability of ${avgStability}%, and facial composure of ${avgComposure}%. Non-verbal composure demonstrated poise and focus.`,
+    nonVerbalRecommendations: [
+      "Maintain direct eye contact with the webcam when articulating the key takeaway.",
+      "Adopt an open, upright seated posture to project executive presence.",
+      "Avoid looking down when pondering difficult conceptual questions."
+    ],
     domainDimensions: [
       { dimension: "Discipline Knowledge", score: Math.min(95, avg + 2), comment: `Strong command of ${course} core curriculum` },
       { dimension: "Practical Application", score: Math.min(92, avg), comment: `Good ability to apply principles to ${role} scenarios` },
@@ -2465,6 +1977,582 @@ function generateFallbackExplanation(question, category, course) {
     interviewTip: "Always structure your answer clearly and state your assumptions before answering."
   };
 }
+
+// server/routes/aiRoutes.ts
+var router3 = Router3();
+router3.post("/generate-questions", async (req, res) => {
+  const {
+    course = "B.Tech",
+    specialization = "Computer Science",
+    role = "Software Engineer",
+    difficulty = "Medium",
+    type = "Technical",
+    language = "English",
+    skills = [],
+    resumeText = "",
+    count = 4
+  } = req.body;
+  const ai = getGeminiClient();
+  if (!ai) {
+    const fallbackQuestions = generateFallbackQuestions(course, specialization, role, difficulty, type, language, skills, count);
+    return res.json({ success: true, questions: fallbackQuestions, source: "universal_offline_engine" });
+  }
+  try {
+    const prompt = `You are a Senior Industry Bar Raiser and Dean of Academic Placements conducting an interview.
+Candidate Profile:
+- Course / Degree: ${course}
+- Specialization / Branch: ${specialization}
+- Target Career / Job Role: ${role}
+- Interview Type: ${type}
+- Difficulty Level: ${difficulty}
+- Language: ${language} (Note: if Hindi or Hinglish, keep professional domain terms accurate in English script or standard Hindi as appropriate)
+- Candidate Key Skills: ${(skills || []).join(", ") || "Standard course fundamentals"}
+- Candidate Resume Snippet: ${resumeText ? resumeText.slice(0, 800) : "None provided"}
+
+CRITICAL INSTRUCTION:
+Do NOT assume this candidate is a Computer Science or IT student unless their course explicitly specifies Computer Science / IT.
+Generate questions STRICTLY aligned with their specific discipline:
+- If Mechanical Engineering -> Thermodynamics, GD&T, CAD/CAM, Manufacturing, Machine Design, Fluid Mechanics, Materials.
+- If Commerce / B.Com -> Double Entry Accounting, GST, Balance Sheet & P&L Analysis, Auditing, Direct Tax, Banking.
+- If Medical / Pharmacy / Nursing -> Pharmacology, ADME, Clinical Safety, Patient Triage, Medication Administration, Infection Control, Pharmacovigilance. (Disclaimer: Educational interview prep only).
+- If Management / MBA / BBA -> Strategy, Porter 5 Forces, CAC/LTV, Marketing, Supply Chain, Decision Making, Business Case Studies.
+- If Law -> Constitutional Law, Contract drafting, Statutory Interpretation, IRAC Case Analysis, IPR, Criminal Procedure.
+- If Arts / English / Journalism -> Editorial Strategy, SEO Copywriting, Critical Analysis, Communication, Storytelling.
+- If Design -> User Research, Figma, Double Diamond, Visual Hierarchy, Design Systems.
+- If Agriculture -> Crop Science, Soil Fertility, Pest Management, Food Safety.
+- If HR / Behavioral -> STAR method questions on conflict, leadership, deadline pressure, and career motivation.
+
+Generate exactly ${count} realistic, challenging, and adaptive interview questions.
+Questions must become progressively nuanced based on difficulty (${difficulty}).
+
+Return ONLY a JSON array of objects with the following schema:
+[
+  {
+    "question": "string",
+    "category": "string (the specific domain concept e.g. Thermodynamics, GST & Tax, Pharmacology, Contract Law, System Design, STAR Behavioral)",
+    "difficulty": "${difficulty}",
+    "type": "${type}",
+    "expectedKeyPoints": ["key point 1", "key point 2", "key point 3"]
+  }
+]`;
+    const { text, modelUsed } = await callGemini(ai, prompt);
+    let questions = [];
+    try {
+      questions = JSON.parse(text);
+    } catch {
+      const match = text.match(/\[[\s\S]*\]/);
+      questions = match ? JSON.parse(match[0]) : [];
+    }
+    if (!Array.isArray(questions) || questions.length === 0) {
+      questions = generateFallbackQuestions(course, specialization, role, difficulty, type, language, skills, count);
+    }
+    const formatted = questions.map((q, idx) => ({
+      id: `gen_q_${Date.now()}_${idx + 1}`,
+      questionNumber: idx + 1,
+      question: q.question,
+      category: q.category || "Domain Technical",
+      difficulty: q.difficulty || difficulty,
+      type: q.type || type,
+      expectedKeyPoints: q.expectedKeyPoints || [],
+      status: "pending"
+    }));
+    return res.json({ success: true, questions: formatted, source: modelUsed });
+  } catch (error) {
+    console.error("Error generating AI questions:", error);
+    const fallbackQuestions = generateFallbackQuestions(course, specialization, role, difficulty, type, language, skills, count);
+    return res.json({ success: true, questions: fallbackQuestions, source: "fallback_error_recovery" });
+  }
+});
+router3.post("/evaluate-answer", async (req, res) => {
+  const {
+    question,
+    userAnswer,
+    course = "B.Tech",
+    specialization = "General",
+    role = "Professional",
+    difficulty = "Medium",
+    type = "Domain",
+    answerMode = "voice",
+    language = "English",
+    behaviorTelemetry
+  } = req.body;
+  if (!userAnswer || userAnswer.trim().length === 0) {
+    return res.status(400).json({ error: "User answer is required." });
+  }
+  const ai = getGeminiClient();
+  if (!ai) {
+    const fallbackEval = evaluateFallbackAnswer(question, userAnswer, course, role, type, behaviorTelemetry);
+    return res.json({ success: true, evaluation: fallbackEval, source: "universal_offline_engine" });
+  }
+  try {
+    const prompt = `You are a strict, objective, and realistic Universal AI Interview Bar Raiser evaluating a candidate's answer.
+Context:
+- Course / Degree: ${course} (${specialization})
+- Target Role: ${role}
+- Interview Type: ${type}
+- Difficulty: ${difficulty}
+- Answer Mode: ${answerMode}
+- Language: ${language}
+- Live Candidate Non-Verbal Telemetry (Webcam Computer Vision): ${behaviorTelemetry ? `Eye Contact: ${behaviorTelemetry.eyeContactScore}%, Posture Stability: ${behaviorTelemetry.postureStabilityScore}%, Composure: ${behaviorTelemetry.facialComposureScore}%, Observations: ${(behaviorTelemetry.behaviorNotes || []).join("; ") || "Natural non-verbal composure"}` : "Webcam inactive / speech evaluation only"}
+
+Question:
+"${question}"
+
+Candidate's Answer:
+"${userAnswer}"
+
+CRITICAL GRADING RIGOR RULES (DO NOT INFLATE SCORES):
+1. IF THE ANSWER IS WRONG, NONSENSE, EVASIVE, OR OFF-TOPIC:
+   - If the candidate says something factually incorrect, confuses concepts, writes gibberish, evasive phrases ("don't know", "skip", "idk", "pata nahi", "galat answer"), or talks about something completely unrelated:
+     * overall_score MUST BE BETWEEN 0 AND 20!
+     * technical_accuracy MUST BE 0 to 15!
+     * relevance MUST BE 0 to 20!
+     * In weaknesses, explicitly explain the factual error: "The provided answer is incorrect / unrelated to the question."
+     * Do NOT award generous or passing scores to wrong answers. Be completely honest and strict!
+2. IF THE ANSWER IS PARTIALLY CORRECT:
+   - If there are major conceptual gaps or shallow understanding: score 30 to 55.
+3. IF THE ANSWER IS SOLID AND ACCURATE:
+   - Solid answer with minor gaps: score 70 to 84.
+   - Comprehensive, production-ready top candidate answer: score 85 to 100.
+
+Score each dimension from 0 to 100 based on the candidate's actual accuracy:
+1. relevance (did they directly answer what was asked?)
+2. technical_accuracy (are domain facts, formulas, principles, or statutes correct?)
+3. completeness (did they address edge cases, nuances, and constraints?)
+4. clarity (is the phrasing concise and easy to understand?)
+5. communication (tone, fluency, vocabulary, professionalism)
+6. structure (logical flow e.g. STAR or Principle -> Application -> Tradeoff)
+7. confidence (assertiveness, lack of hesitation or self-doubt)
+8. problem_solving (depth of reasoning and critical thinking)
+9. behavior_score (non-verbal delivery, eye contact consistency, and posture composure: score 0-100)
+
+Return ONLY a valid JSON object matching this schema:
+{
+  "overall_score": number,
+  "technical_accuracy": number,
+  "relevance": number,
+  "completeness": number,
+  "clarity": number,
+  "communication": number,
+  "structure": number,
+  "confidence": number,
+  "problem_solving": number,
+  "behavior_score": number,
+  "non_verbal_feedback": "string (1-2 sentences assessing eye contact, body language, and non-verbal confidence)",
+  "strengths": ["specific strength 1", "specific strength 2"],
+  "weaknesses": ["actionable weakness 1", "actionable weakness 2"],
+  "missing_points": ["key domain concept omitted 1", "key domain concept omitted 2"],
+  "better_answer": "An exemplar, production-ready answer demonstrating how a top candidate would articulate it in this specific field",
+  "improvement_tip": "One memorable piece of coaching advice tailored to this discipline"
+}`;
+    const { text, modelUsed } = await callGemini(ai, prompt);
+    let evaluation;
+    try {
+      evaluation = JSON.parse(text);
+    } catch {
+      const match = text.match(/\{[\s\S]*\}/);
+      evaluation = match ? JSON.parse(match[0]) : evaluateFallbackAnswer(question, userAnswer, course, role, type, behaviorTelemetry);
+    }
+    if (evaluation) {
+      evaluation.behavior_score = evaluation.behavior_score ?? behaviorTelemetry?.overallBehaviorScore ?? 82;
+      evaluation.behavior_telemetry = behaviorTelemetry;
+      evaluation.non_verbal_feedback = evaluation.non_verbal_feedback || behaviorTelemetry?.behaviorNotes?.join(" ") || "Maintained natural non-verbal composure and consistent engagement.";
+    }
+    return res.json({ success: true, evaluation, source: modelUsed });
+  } catch (error) {
+    console.error("Error evaluating answer:", error);
+    const fallbackEval = evaluateFallbackAnswer(question, userAnswer, course, role, type, behaviorTelemetry);
+    return res.json({ success: true, evaluation: fallbackEval, source: "fallback_error_recovery" });
+  }
+});
+router3.post("/analyze-interview", async (req, res) => {
+  const { session, course = "B.Tech", role = "Candidate" } = req.body;
+  const ai = getGeminiClient();
+  if (!ai) {
+    const fallbackReport = generateFallbackReport(session, course, role);
+    return res.json({ success: true, report: fallbackReport, source: "universal_offline_engine" });
+  }
+  try {
+    const prompt = `You are a Senior Bar Raiser and Placement Dean assessing an entire mock interview for a "${course}" graduate targeting "${role}".
+Session Details:
+- Total Questions: ${session.questions?.length || 0}
+- Questions & Answers:
+${JSON.stringify(
+      session.questions?.map((q) => ({
+        question: q.question,
+        category: q.category,
+        answer: q.userAnswer || "Skipped",
+        score: q.evaluation?.overall_score || 0,
+        strengths: q.evaluation?.strengths || [],
+        weaknesses: q.evaluation?.weaknesses || []
+      })) || [],
+      null,
+      2
+    )}
+
+Provide a comprehensive, senior-level post-interview synthesis JSON tailored to ${course} and ${role}:
+{
+  "overallScore": number (0-100),
+  "performanceLabel": "string (e.g. Highly Ready / Strong Readiness / Solid Baseline / Needs Targeted Preparation)",
+  "technicalScore": number (0-100),
+  "communicationScore": number (0-100),
+  "problemSolvingScore": number (0-100),
+  "clarityScore": number (0-100),
+  "confidenceScore": number (0-100),
+  "completenessScore": number (0-100),
+  "relevanceScore": number (0-100),
+  "structureScore": number (0-100),
+  "domainSpecificScore": number (0-100),
+  "behaviorScore": number (0-100 non-verbal executive presence index),
+  "eyeContactAverage": number (0-100),
+  "postureStabilityAverage": number (0-100),
+  "composureAverage": number (0-100),
+  "behaviorSummary": "string (assessment of candidate eye contact, posture, and facial composure)",
+  "nonVerbalRecommendations": ["string"],
+  "domainDimensions": [
+    { "dimension": "string (e.g. Core Discipline Knowledge, Practical Application, Regulatory/Standard Awareness)", "score": number, "comment": "string" }
+  ],
+  "topStrengths": ["string"],
+  "topWeaknesses": ["string"],
+  "repeatedMistakes": ["string"],
+  "missingConcepts": ["string"],
+  "technicalKnowledgeGaps": ["string"],
+  "aiExecutiveSummary": "string (2-3 detailed paragraphs summarizing candidate profile and domain readiness)",
+  "personalizedImprovementPlan": ["string"]
+}`;
+    const { text, modelUsed } = await callGemini(ai, prompt);
+    let report;
+    try {
+      report = JSON.parse(text);
+    } catch {
+      const match = text.match(/\{[\s\S]*\}/);
+      report = match ? JSON.parse(match[0]) : generateFallbackReport(session, course, role);
+    }
+    const bTelemetries = (session.questions || []).map((q) => q.behaviorTelemetry || q.evaluation?.behavior_telemetry).filter(Boolean);
+    const avgEye = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.eyeContactScore || 85), 0) / bTelemetries.length) : 85;
+    const avgStab = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.postureStabilityScore || 88), 0) / bTelemetries.length) : 88;
+    const avgComp = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.facialComposureScore || 86), 0) / bTelemetries.length) : 86;
+    const compositeBehavior = Math.round(avgEye * 0.4 + avgStab * 0.3 + avgComp * 0.3);
+    if (!report.behaviorScore) {
+      report.behaviorScore = compositeBehavior;
+    }
+    if (!report.eyeContactAverage) {
+      report.eyeContactAverage = avgEye;
+    }
+    if (!report.postureStabilityAverage) {
+      report.postureStabilityAverage = avgStab;
+    }
+    if (!report.composureAverage) {
+      report.composureAverage = avgComp;
+    }
+    if (!report.behaviorSummary) {
+      report.behaviorSummary = `Candidate maintained an average eye contact score of ${avgEye}%, posture stability of ${avgStab}%, and facial composure of ${avgComp}%. Non-verbal presence was composed and focused.`;
+    }
+    if (!report.nonVerbalRecommendations || report.nonVerbalRecommendations.length === 0) {
+      report.nonVerbalRecommendations = [
+        "Maintain direct eye contact with the camera lens when presenting key conclusions.",
+        "Adopt an open, upright seated posture to project executive presence.",
+        "Allow natural micro-gestures to emphasize important structural points."
+      ];
+    }
+    report.id = `rep_${Date.now()}`;
+    report.sessionId = session.id;
+    report.userId = session.userId;
+    report.course = course;
+    report.role = role;
+    report.createdAt = (/* @__PURE__ */ new Date()).toISOString();
+    return res.json({ success: true, report, source: modelUsed });
+  } catch (error) {
+    console.error("Error analyzing interview session:", error);
+    const fallbackReport = generateFallbackReport(session, course, role);
+    return res.json({ success: true, report: fallbackReport, source: "fallback_error_recovery" });
+  }
+});
+router3.post("/analyze-resume", async (req, res) => {
+  const { resumeText = "", targetRole = "General Candidate", course = "B.Tech", fileName = "Resume.pdf" } = req.body;
+  const ai = getGeminiClient();
+  if (!ai) {
+    const fallbackResume = generateFallbackResumeAnalysis(resumeText, targetRole, course, fileName);
+    return res.json({ success: true, analysis: fallbackResume, source: "universal_offline_engine" });
+  }
+  try {
+    const prompt = `You are a Principal Technical & Corporate Talent Auditor and ATS (Applicant Tracking System) Algorithm Expert.
+Analyze the following resume for a candidate with academic background "${course}" targeting the role "${targetRole}".
+
+Resume Text:
+${resumeText.slice(0, 3500)}
+
+Extract and evaluate in strict JSON format:
+{
+  "parsedName": "string (candidate name)",
+  "parsedEmail": "string (candidate email)",
+  "extractedCourse": "string (detected degree)",
+  "extractedSpecialization": "string (detected major/branch)",
+  "extractedSkills": ["string"],
+  "skillsIdentified": ["string"],
+  "education": ["string"],
+  "experience": ["string"],
+  "projects": ["string"],
+  "certifications": ["string"],
+  "overallScore": number (0-100),
+  "atsCompatibilityScore": number (0-100),
+  "targetRole": "${targetRole}",
+  "skillMatchPercentage": number (0-100),
+  "matchingSkills": ["string"],
+  "missingSkills": ["string"],
+  "missingKeywords": ["string"],
+  "projectStrengthScore": number (0-100),
+  "experienceRelevanceScore": number (0-100),
+  "summary": "string (executive summary of candidate ATS readiness)",
+  "strengths": ["string (2-3 specific strengths with respect to ${targetRole})"],
+  "recommendedImprovements": ["string (2-3 actionable changes e.g. quantified metrics, missing industry keywords)"],
+  "formattingImprovements": ["string (actionable formatting and layout fixes)"]
+}`;
+    const { text, modelUsed } = await callGemini(ai, prompt);
+    let analysis;
+    try {
+      analysis = JSON.parse(text);
+    } catch {
+      const match = text.match(/\{[\s\S]*\}/);
+      analysis = match ? JSON.parse(match[0]) : generateFallbackResumeAnalysis(resumeText, targetRole, course, fileName);
+    }
+    analysis.id = `res_${Date.now()}`;
+    analysis.fileName = fileName || "Uploaded_Resume.pdf";
+    analysis.analyzedAt = (/* @__PURE__ */ new Date()).toISOString();
+    analysis.skillsIdentified = analysis.skillsIdentified || analysis.extractedSkills || [];
+    analysis.extractedSkills = analysis.extractedSkills || analysis.skillsIdentified || [];
+    analysis.missingKeywords = analysis.missingKeywords || analysis.missingSkills || [];
+    analysis.missingSkills = analysis.missingSkills || analysis.missingKeywords || [];
+    analysis.formattingImprovements = analysis.formattingImprovements || analysis.recommendedImprovements || [];
+    analysis.recommendedImprovements = analysis.recommendedImprovements || analysis.formattingImprovements || [];
+    analysis.summary = analysis.summary || analysis.strengths && analysis.strengths[0] || "ATS analysis complete.";
+    return res.json({ success: true, analysis, source: modelUsed });
+  } catch (error) {
+    console.error("Error analyzing resume:", error);
+    const fallbackResume = generateFallbackResumeAnalysis(resumeText, targetRole, course, fileName);
+    return res.json({ success: true, analysis: fallbackResume, source: "fallback_error_recovery" });
+  }
+});
+router3.post("/match-job", async (req, res) => {
+  const { resumeText = "", jobDescription = "", targetRole = "Target Role", course = "General" } = req.body;
+  const ai = getGeminiClient();
+  if (!ai) {
+    const fallbackJobMatch = generateFallbackJobMatch(resumeText, jobDescription, targetRole, course);
+    return res.json({ success: true, match: fallbackJobMatch, source: "universal_offline_engine" });
+  }
+  try {
+    const prompt = `You are an AI Semantic Talent Matcher.
+Compare this candidate's background (${course}) with the Job Description for "${targetRole}".
+
+Candidate Resume:
+${resumeText.slice(0, 2e3)}
+
+Job Description:
+${jobDescription.slice(0, 2e3)}
+
+Perform semantic vector alignment and return strict JSON:
+{
+  "jobTitle": "${targetRole}",
+  "company": "Target Company",
+  "matchScore": number (0-100),
+  "matchPercentage": number (0-100),
+  "matchingSkills": ["string"],
+  "missingSkills": ["string"],
+  "relevantExperiencePoints": ["string"],
+  "suggestedResumeBulletImprovements": ["string (rewritten candidate bullet points incorporating JD keywords with quantified impact)"],
+  "suggestedBullets": ["string"],
+  "recommendedPreparationTopics": ["string"]
+}`;
+    const { text, modelUsed } = await callGemini(ai, prompt);
+    let match;
+    try {
+      match = JSON.parse(text);
+    } catch {
+      const m = text.match(/\{[\s\S]*\}/);
+      match = m ? JSON.parse(m[0]) : generateFallbackJobMatch(resumeText, jobDescription, targetRole, course);
+    }
+    match.id = `jm_${Date.now()}`;
+    match.analyzedAt = (/* @__PURE__ */ new Date()).toISOString();
+    return res.json({ success: true, match, source: modelUsed });
+  } catch (error) {
+    console.error("Error matching job description:", error);
+    const fallbackJobMatch = generateFallbackJobMatch(resumeText, jobDescription, targetRole, course);
+    return res.json({ success: true, match: fallbackJobMatch, source: "fallback_error_recovery" });
+  }
+});
+router3.post("/explain-question", async (req, res) => {
+  const { question, category = "General", difficulty = "Medium", course = "All Courses" } = req.body;
+  const ai = getGeminiClient();
+  if (!ai) {
+    return res.json({
+      success: true,
+      explanation: generateFallbackExplanation(question, category, course),
+      source: "universal_offline_engine"
+    });
+  }
+  try {
+    const prompt = `You are a distinguished Professor and Industry Placement Mentor in ${course}.
+Question: "${question}"
+Category: ${category}
+Difficulty: ${difficulty}
+
+Explain this thoroughly in JSON format suited to the student's academic level:
+{
+  "concept": "string (clear high-level explanation of the underlying theory or principle)",
+  "approach": "string (step-by-step framework to approach this in an interview)",
+  "solutionCode": "string (clean code, formula, ledger entry, statutory citation, or clinical protocol where applicable)",
+  "complexity": "string (space/time complexity, tax penalty rate, mechanical safety factor, or physiological threshold)",
+  "commonMistakes": ["string (2-3 common traps candidates fall into)"],
+  "interviewTip": "string (insider pro-tip on how to stand out when answering this)"
+}`;
+    const { text, modelUsed } = await callGemini(ai, prompt);
+    let explanation;
+    try {
+      explanation = JSON.parse(text);
+    } catch {
+      const match = text.match(/\{[\s\S]*\}/);
+      explanation = match ? JSON.parse(match[0]) : generateFallbackExplanation(question, category, course);
+    }
+    return res.json({ success: true, explanation, source: modelUsed });
+  } catch (error) {
+    console.error("Error explaining question:", error);
+    return res.json({
+      success: true,
+      explanation: generateFallbackExplanation(question, category, course),
+      source: "fallback_error_recovery"
+    });
+  }
+});
+router3.post("/transcribe-audio", async (req, res) => {
+  const { audioBase64 = "", mimeType = "audio/webm", language = "English" } = req.body;
+  if (!audioBase64 || audioBase64.length < 50) {
+    return res.status(400).json({ success: false, error: "Valid audio data is required." });
+  }
+  const ai = getGeminiClient();
+  if (!ai) {
+    return res.json({ success: false, error: "AI client not configured." });
+  }
+  try {
+    const { text, source } = await transcribeAudioGemini(ai, audioBase64, mimeType, language);
+    return res.json({ success: true, text, source });
+  } catch (error) {
+    console.error("Error transcribing audio with Gemini:", error?.message || error);
+    return res.status(500).json({ success: false, error: error?.message || "Audio transcription failed" });
+  }
+});
+var aiRoutes_default = router3;
+
+// server/routes/resumeRoutes.ts
+import { Router as Router4 } from "express";
+var router4 = Router4();
+router4.post("/parse-document", async (req, res) => {
+  try {
+    const { fileData = "", fileName = "resume.pdf", fileType = "" } = req.body;
+    if (!fileData) {
+      return res.status(400).json({ success: false, error: "No file data received." });
+    }
+    const base64Content = fileData.includes(";base64,") ? fileData.split(";base64,")[1] : fileData.replace(/^data:.*?base64,/, "").trim();
+    const buffer = Buffer.from(base64Content, "base64");
+    const lowerName = (fileName || "").toLowerCase();
+    let extractedText = "";
+    if (lowerName.endsWith(".pdf") || fileType.includes("pdf")) {
+      try {
+        const { PDFParse } = await import("pdf-parse");
+        const parser = new PDFParse({ data: new Uint8Array(buffer) });
+        const result = await parser.getText();
+        extractedText = result.text || "";
+      } catch (pdfErr) {
+        console.warn("Primary PDFParse error, trying stream fallback:", pdfErr?.message || pdfErr);
+        const raw = buffer.toString("binary");
+        const matches = raw.match(/\(([^()]{3,})\)/g);
+        if (matches && matches.length > 5) {
+          extractedText = matches.map((m) => m.slice(1, -1)).join(" ");
+        }
+      }
+    } else if (lowerName.endsWith(".docx") || fileType.includes("wordprocessingml")) {
+      try {
+        const mammoth = (await import("mammoth")).default || await import("mammoth");
+        const result = await mammoth.extractRawText({ buffer });
+        extractedText = result.value || "";
+      } catch (docxErr) {
+        console.warn("DOCX mammoth parsing error:", docxErr?.message || docxErr);
+      }
+    } else if (lowerName.endsWith(".doc") || fileType.includes("msword")) {
+      try {
+        const mammoth = (await import("mammoth")).default || await import("mammoth");
+        const result = await mammoth.extractRawText({ buffer });
+        extractedText = result.value || "";
+      } catch {
+        const printable = buffer.toString("utf-8").replace(/[^\x20-\x7E\t\n\r]/g, " ").replace(/\s{2,}/g, " ").trim();
+        if (printable.length > 80) {
+          extractedText = printable;
+        }
+      }
+    } else {
+      extractedText = buffer.toString("utf-8");
+    }
+    extractedText = extractedText.replace(/\r\n/g, "\n").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+    if (!extractedText || extractedText.length < 20) {
+      return res.status(422).json({
+        success: false,
+        error: "Could not extract readable text from the document. Please ensure the file contains text and is not password-protected."
+      });
+    }
+    const words = extractedText.split(/\s+/).filter(Boolean);
+    return res.json({
+      success: true,
+      text: extractedText,
+      fileName,
+      fileSize: buffer.length,
+      wordCount: words.length
+    });
+  } catch (error) {
+    console.error("Error parsing resume document:", error);
+    return res.status(500).json({ success: false, error: error?.message || "Failed to parse resume document" });
+  }
+});
+var resumeRoutes_default = router4;
+
+// server.ts
+dotenv2.config();
+var app = express();
+app.set("trust proxy", 1);
+var PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3e3;
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+var dbInitPromise = null;
+app.use(async (req, res, next) => {
+  if (req.path.startsWith("/api")) {
+    if (!dbInitPromise) {
+      dbInitPromise = (async () => {
+        try {
+          await connectDB();
+          await seedAuthUsers();
+        } catch (err) {
+          console.error("[Database Init Error in Serverless]", err);
+          dbInitPromise = null;
+        }
+      })();
+    }
+    try {
+      await dbInitPromise;
+    } catch {
+    }
+  }
+  next();
+});
+app.use("/api/auth", authRoutes_default);
+app.use("/api/db", databaseRoutes_default);
+app.use("/api/ai", aiRoutes_default);
+app.use("/api/resume", resumeRoutes_default);
+app.get("/api/health", async (req, res) => {
+  const dbStatus = await getDatabaseStatus();
+  res.json({
+    status: "ok",
+    hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
+    database: dbStatus
+  });
+});
 app.use((err, req, res, next) => {
   console.error("[Unhandled Server Error in Express]", err);
   if (res.headersSent) {

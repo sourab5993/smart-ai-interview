@@ -29,6 +29,7 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isAiTranscribing, setIsAiTranscribing] = useState<boolean>(false);
   const [hasRecordedAudio, setHasRecordedAudio] = useState<boolean>(false);
+  const [interimLiveText, setInterimLiveText] = useState<string>('');
 
   // Default to en-IN (Hinglish/Indian English) as it understands both Indian English and Hindi terms, or hi-IN for pure Hindi
   const defaultLangCode = language === 'Hindi' ? 'hi-IN' : 'en-IN';
@@ -41,9 +42,8 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
   const restartTimeoutRef = useRef<any>(null);
   const timerRef = useRef<any>(null);
 
-  // Transcription buffer management
-  const baseTranscriptRef = useRef<string>(initialText);
-  const currentSessionFinalRef = useRef<string>('');
+  // Transcription buffer management with official resultIndex offset
+  const finalTranscriptRef = useRef<string>(initialText);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   // Web Audio Context waveform visualizer
@@ -61,7 +61,7 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
   useEffect(() => {
     if (initialText && !transcript) {
       setTranscript(initialText);
-      baseTranscriptRef.current = initialText;
+      finalTranscriptRef.current = initialText;
     }
   }, [initialText]);
 
@@ -133,31 +133,28 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
       recognition.lang = langCode;
       recognition.maxAlternatives = 1;
 
-      let sessionAccumulatedFinal = '';
-
       recognition.onresult = (event: any) => {
-        let interimTranscript = '';
-        let finalInThisSession = '';
-
-        for (let i = 0; i < event.results.length; i++) {
+        let interim = '';
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
           const res = event.results[i];
           const textPiece = res[0]?.transcript || '';
           if (res.isFinal) {
-            finalInThisSession += textPiece + ' ';
+            const trimmedPiece = textPiece.trim();
+            if (trimmedPiece) {
+              const currentFinal = finalTranscriptRef.current.trim();
+              finalTranscriptRef.current = currentFinal ? `${currentFinal} ${trimmedPiece}` : trimmedPiece;
+            }
           } else {
-            interimTranscript += textPiece;
+            interim += textPiece;
           }
         }
 
-        sessionAccumulatedFinal = finalInThisSession;
-        currentSessionFinalRef.current = finalInThisSession;
-
-        const base = baseTranscriptRef.current.trim();
-        const fullFinal = (base ? base + ' ' : '') + finalInThisSession.trim();
-        const combined = (fullFinal.trim() + (interimTranscript ? ' ' + interimTranscript.trim() : '')).trim();
+        const currentFinal = finalTranscriptRef.current.trim();
+        const combined = (currentFinal + (interim ? (currentFinal ? ' ' : '') + interim.trim() : '')).trim();
 
         setTranscript(combined);
         onTranscriptChange(combined);
+        setInterimLiveText(interim.trim());
         setErrorMessage(null);
 
         // Auto-scroll textarea as candidate speaks
@@ -180,14 +177,7 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
       };
 
       recognition.onend = () => {
-        // Commit what was confirmed in this session to baseTranscriptRef
-        if (sessionAccumulatedFinal.trim()) {
-          const base = baseTranscriptRef.current.trim();
-          baseTranscriptRef.current = (base ? base + ' ' : '') + sessionAccumulatedFinal.trim();
-          sessionAccumulatedFinal = '';
-          currentSessionFinalRef.current = '';
-        }
-
+        setInterimLiveText('');
         // Seamless auto-restart: if user is still in recording mode, instantiate fresh instance
         if (isRecordingRef.current) {
           if (restartTimeoutRef.current) clearTimeout(restartTimeoutRef.current);
@@ -195,7 +185,7 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
             if (isRecordingRef.current) {
               startSpeechRecognitionInstance(speechLangRef.current);
             }
-          }, 120);
+          }, 80);
         }
       };
 
@@ -352,9 +342,9 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
     isRecordingRef.current = true;
     setRecordingSeconds(0);
 
-    // Sync base transcript with current textarea text
-    baseTranscriptRef.current = transcript.trim();
-    currentSessionFinalRef.current = '';
+    // Sync final transcript with current textarea text
+    finalTranscriptRef.current = transcript.trim();
+    setInterimLiveText('');
 
     // 1. Start live Web Speech recognition
     startSpeechRecognitionInstance(speechLangRef.current);
@@ -377,6 +367,7 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
 
     // Await audio recorder stop to collect full audio blob
     const recordedBlob = await stopAudioCapture();
+    setInterimLiveText('');
 
     // Check words transcribed by live Web Speech API
     const currentWords = transcript.trim().split(/\s+/).filter(Boolean).length;
@@ -424,8 +415,9 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
       const data = await res.json();
       if (data.success && data.text) {
         const aiTranscribed = data.text.trim();
-        baseTranscriptRef.current = aiTranscribed;
+        finalTranscriptRef.current = aiTranscribed;
         setTranscript(aiTranscribed);
+        setInterimLiveText('');
         onTranscriptChange(aiTranscribed);
       } else if (data.error) {
         setErrorMessage(`Gemini AI Transcription: ${data.error}`);
@@ -453,9 +445,9 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
 
   const handleClear = () => {
     stopRecordingSession();
-    baseTranscriptRef.current = '';
-    currentSessionFinalRef.current = '';
+    finalTranscriptRef.current = '';
     setTranscript('');
+    setInterimLiveText('');
     onTranscriptChange('');
     setRecordingSeconds(0);
     audioChunksRef.current = [];
@@ -474,7 +466,7 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
 
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
-    baseTranscriptRef.current = val;
+    finalTranscriptRef.current = val;
     setTranscript(val);
     onTranscriptChange(val);
   };
@@ -504,32 +496,32 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
               <button
                 type="button"
                 onClick={() => handleLanguageChange('en-IN')}
-                className={`px-2 py-1 rounded-md transition-all cursor-pointer ${
-                  speechLang === 'en-IN' ? 'bg-cyan-500/20 text-cyan-300 font-bold' : 'text-slate-400 hover:text-slate-200'
+                className={`px-2.5 py-1 rounded-md transition-all cursor-pointer font-medium ${
+                  speechLang === 'en-IN' ? 'bg-cyan-500/25 text-cyan-300 font-bold border border-cyan-500/40' : 'text-slate-400 hover:text-slate-200'
                 }`}
                 title="Best for Indian English & mixed technical Hinglish terms"
               >
-                Hinglish / En (IN)
+                🇮🇳 Hinglish / En (IN)
               </button>
               <button
                 type="button"
                 onClick={() => handleLanguageChange('hi-IN')}
-                className={`px-2 py-1 rounded-md transition-all cursor-pointer ${
-                  speechLang === 'hi-IN' ? 'bg-cyan-500/20 text-cyan-300 font-bold' : 'text-slate-400 hover:text-slate-200'
+                className={`px-2.5 py-1 rounded-md transition-all cursor-pointer font-medium ${
+                  speechLang === 'hi-IN' ? 'bg-cyan-500/25 text-cyan-300 font-bold border border-cyan-500/40' : 'text-slate-400 hover:text-slate-200'
                 }`}
                 title="Hindi speech recognition"
               >
-                हिंदी (Hindi)
+                🇮🇳 हिंदी (Hindi)
               </button>
               <button
                 type="button"
                 onClick={() => handleLanguageChange('en-US')}
-                className={`px-2 py-1 rounded-md transition-all cursor-pointer ${
-                  speechLang === 'en-US' ? 'bg-cyan-500/20 text-cyan-300 font-bold' : 'text-slate-400 hover:text-slate-200'
+                className={`px-2.5 py-1 rounded-md transition-all cursor-pointer font-medium ${
+                  speechLang === 'en-US' ? 'bg-cyan-500/25 text-cyan-300 font-bold border border-cyan-500/40' : 'text-slate-400 hover:text-slate-200'
                 }`}
                 title="Standard US English"
               >
-                English (US)
+                🇺🇸 English (US)
               </button>
             </div>
           )}
@@ -619,6 +611,13 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
               <div className="absolute top-2.5 right-3 flex items-center gap-2 px-2.5 py-1 rounded-md bg-rose-500/15 border border-rose-500/30 text-rose-400 text-xs font-mono font-bold animate-pulse">
                 <span className="w-2 h-2 rounded-full bg-rose-500" />
                 <span>LISTENING {formatTimer(recordingSeconds)}</span>
+              </div>
+            )}
+
+            {isRecording && interimLiveText && (
+              <div className="absolute bottom-2 left-3 right-3 flex items-center gap-2 px-3 py-1.5 rounded-lg bg-cyan-950/90 border border-cyan-500/40 text-cyan-200 text-xs shadow-md animate-pulse">
+                <span className="shrink-0 font-bold text-cyan-400">🎙️ Speaking now:</span>
+                <span className="italic truncate text-slate-100">&quot;{interimLiveText}&quot;</span>
               </div>
             )}
           </div>
