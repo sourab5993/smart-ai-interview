@@ -1,6 +1,8 @@
 import http from 'http';
 import express, { Request, Response } from 'express';
 import path from 'path';
+import fs from 'fs';
+import { exec } from 'child_process';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
 import { connectDB, getDatabaseStatus } from './server/config/database';
@@ -1293,6 +1295,11 @@ async function startServer() {
     console.log('  ➜ Local:     http://localhost:' + PORT);
     console.log('  ➜ Network:   http://127.0.0.1:' + PORT);
     console.log('  ➜ DB Health: http://localhost:' + PORT + '/api/db/health\n');
+
+    // Automatically open in Google Chrome on local startup
+    if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+      openChromeBrowser(`http://localhost:${PORT}`);
+    }
   });
 
   httpServer.on('error', (err: any) => {
@@ -1304,6 +1311,59 @@ async function startServer() {
       console.error('Server error:', err);
     }
   });
+}
+
+/**
+ * Automatically launches Google Chrome pointing to the application URL.
+ * Works seamlessly across Windows, macOS, and Linux.
+ */
+function openChromeBrowser(url: string) {
+  if (process.env.AUTO_OPEN_BROWSER === 'false' || process.env.CI) {
+    return;
+  }
+
+  // Small delay ensures Vite HMR and server routes are fully listening
+  setTimeout(() => {
+    const platform = process.platform;
+    console.log(`  🌐 Launching Google Chrome: ${url}\n`);
+
+    if (platform === 'win32') {
+      // 1. Windows: Try 'start chrome' (resolves via Windows App Paths registry)
+      exec(`start chrome "${url}"`, (err) => {
+        if (err) {
+          // 2. Fallback to standard Google Chrome install directories on Windows
+          const chromePaths = [
+            'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+            'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+            process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
+          ];
+          const foundChrome = chromePaths.find((p) => p && fs.existsSync(p));
+          if (foundChrome) {
+            exec(`"${foundChrome}" "${url}"`, (fbErr) => {
+              if (fbErr) {
+                exec(`start "" "${url}"`);
+              }
+            });
+          } else {
+            // General fallback to system default browser
+            exec(`start "" "${url}"`);
+          }
+        }
+      });
+    } else if (platform === 'darwin') {
+      // macOS: open using Google Chrome app
+      exec(`open -a "Google Chrome" "${url}"`, (err) => {
+        if (err) exec(`open "${url}"`);
+      });
+    } else {
+      // Linux: try standard chrome binaries, fallback to xdg-open
+      exec(`google-chrome "${url}"`, (err) => {
+        if (err) {
+          exec(`google-chrome-stable "${url}" || xdg-open "${url}"`);
+        }
+      });
+    }
+  }, 400);
 }
 
 // Start HTTP server only in non-serverless environments (like local machine)
