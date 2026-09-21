@@ -8,7 +8,7 @@ async function run() {
 
   console.log('🚀 Bundling serverless API entrypoint (api/index.js)...');
   await esbuild({
-    entryPoints: ['api/index.ts'],
+    entryPoints: ['server.ts'],
     bundle: true,
     platform: 'node',
     format: 'esm',

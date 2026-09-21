@@ -2570,9 +2570,8 @@ if (!process.env.VERCEL) {
   startServer();
 }
 var server_default = app;
-
-// api/index.ts
-var index_default = server_default;
 export {
-  index_default as default
+  app,
+  server_default as default,
+  startServer
 };

@@ -36,7 +36,8 @@
     "react-dom": "^19.0.1",
     "recharts": "^3.10.1",
     "three": "^0.185.1",
-    "vite": "^6.2.3"
+    "vite": "^6.2.3",
+    "esbuild": "^0.25.0"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
@@ -46,7 +47,6 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
     "autoprefixer": "^10.4.21",
-    "esbuild": "^0.25.0",
     "mongodb-memory-server": "^11.2.0",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
