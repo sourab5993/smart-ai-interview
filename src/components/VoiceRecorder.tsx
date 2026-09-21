@@ -196,15 +196,20 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
     }
   };
 
-  // Dynamic simulated waveform when SpeechRecognition has exclusive mic control (prevents Chrome hardware driver conflict)
+  // Dynamic animated sound wave visualizer responding to voice activity
   const startSimulatedWaveform = () => {
     if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    let step = 0;
     const updateSimulated = () => {
       if (!isRecordingRef.current) return;
+      step += 0.12;
+      const baseEnergy = interimLiveText ? 68 : 38;
       const sampled: number[] = [];
       for (let i = 0; i < 16; i++) {
-        const wave = Math.sin(Date.now() / 150 + i * 0.7) * 25;
-        sampled.push(Math.max(14, Math.min(95, Math.round(38 + wave + Math.random() * 15))));
+        const wave1 = Math.sin(step + i * 0.5) * 26;
+        const wave2 = Math.cos(step * 1.4 + i * 0.35) * 14;
+        const height = Math.max(16, Math.min(98, Math.round(baseEnergy + wave1 + wave2)));
+        sampled.push(height);
       }
       setAudioLevels(sampled);
       animFrameRef.current = requestAnimationFrame(updateSimulated);
@@ -606,11 +611,10 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
             {isRecording ? (
               <div className="flex items-center justify-center gap-1.5 w-full max-w-md h-full py-2">
                 {audioLevels.map((lvl, idx) => (
-                  <motion.div
+                  <div
                     key={idx}
-                    className="flex-1 bg-gradient-to-t from-cyan-500 via-blue-500 to-violet-400 rounded-full min-h-[4px]"
+                    className="flex-1 bg-gradient-to-t from-cyan-400 via-blue-500 to-violet-400 rounded-full min-h-[6px] transition-all duration-75 ease-out shadow-sm shadow-cyan-500/20"
                     style={{ height: `${lvl}%` }}
-                    transition={{ type: 'spring', damping: 15, stiffness: 300 }}
                   />
                 ))}
               </div>
