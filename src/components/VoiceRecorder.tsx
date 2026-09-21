@@ -196,6 +196,22 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
     }
   };
 
+  // Dynamic simulated waveform when SpeechRecognition has exclusive mic control (prevents Chrome hardware driver conflict)
+  const startSimulatedWaveform = () => {
+    if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    const updateSimulated = () => {
+      if (!isRecordingRef.current) return;
+      const sampled: number[] = [];
+      for (let i = 0; i < 16; i++) {
+        const wave = Math.sin(Date.now() / 150 + i * 0.7) * 25;
+        sampled.push(Math.max(14, Math.min(95, Math.round(38 + wave + Math.random() * 15))));
+      }
+      setAudioLevels(sampled);
+      animFrameRef.current = requestAnimationFrame(updateSimulated);
+    };
+    updateSimulated();
+  };
+
   // Audio Context waveform visualizer & MediaRecorder setup
   const startAudioCapture = async () => {
     try {
@@ -346,17 +362,22 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
     finalTranscriptRef.current = transcript.trim();
     setInterimLiveText('');
 
-    // 1. Start live Web Speech recognition
-    startSpeechRecognitionInstance(speechLangRef.current);
-
-    // 2. Start audio visualizer & MediaRecorder backup
-    await startAudioCapture();
+    // 1. If Web Speech is supported (Chrome/Edge), give it 100% exclusive mic access (avoids hardware audio distortion)
+    if (speechSupported) {
+      startSpeechRecognitionInstance(speechLangRef.current);
+      startSimulatedWaveform();
+    } else {
+      // 2. Fallback for browsers without Web Speech (Brave, Firefox): record via MediaRecorder for Gemini AI
+      await startAudioCapture();
+    }
   };
 
   const handleStopRecording = async () => {
     isRecordingRef.current = false;
     setIsRecording(false);
+    setInterimLiveText('');
     if (restartTimeoutRef.current) clearTimeout(restartTimeoutRef.current);
+    if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
 
     if (recognitionRef.current) {
       try {
@@ -365,16 +386,14 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({
       recognitionRef.current = null;
     }
 
-    // Await audio recorder stop to collect full audio blob
-    const recordedBlob = await stopAudioCapture();
-    setInterimLiveText('');
-
-    // Check words transcribed by live Web Speech API
-    const currentWords = transcript.trim().split(/\s+/).filter(Boolean).length;
-
-    // If Web Speech API produced 0 words (e.g., Brave, Firefox, or network delay), auto-trigger Gemini AI STT!
-    if (currentWords === 0 && recordedBlob && recordedBlob.size > 200) {
-      await transcribeBlobWithAI(recordedBlob);
+    // Await audio recorder stop to collect full audio blob if MediaRecorder was used
+    if (!speechSupported) {
+      const recordedBlob = await stopAudioCapture();
+      if (recordedBlob && recordedBlob.size > 200) {
+        await transcribeBlobWithAI(recordedBlob);
+      }
+    } else if (streamRef.current) {
+      await stopAudioCapture();
     }
   };
 
