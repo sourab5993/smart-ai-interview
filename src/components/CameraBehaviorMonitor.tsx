@@ -65,10 +65,11 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
     const [headPose, setHeadPose] = useState<'centered' | 'turned-left' | 'turned-right' | 'looking-down' | 'looking-up'>('centered');
     const [faceBox, setFaceBox] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
     const [eyeBoxDetails, setEyeBoxDetails] = useState<{
-      left: { x: number; y: number; width: number; height: number; visible: boolean; pupilX: number; pupilY: number };
-      right: { x: number; y: number; width: number; height: number; visible: boolean; pupilX: number; pupilY: number };
+      left: { x: number; y: number; width: number; height: number; visible: boolean; openness: number; pupilX: number; pupilY: number };
+      right: { x: number; y: number; width: number; height: number; visible: boolean; openness: number; pupilX: number; pupilY: number };
       statusText: string;
     } | null>(null);
+    const smoothEyeContactRef = useRef<number>(0);
 
     // Historical samples buffer for the active question
     const samplesRef = useRef<
@@ -323,15 +324,12 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
 
                   const maxC = Math.max(r, g, b);
                   const minC = Math.min(r, g, b);
-                  const isSkin =
-                    r > 50 &&
-                    g > 35 &&
-                    b > 25 &&
-                    r > g &&
-                    r > b &&
-                    (r - g) >= 12 &&
-                    (maxC - minC) >= 14 &&
-                    Math.abs(r - g) <= 120;
+                  // Dual YCbCr (Chai-Bouzerdoum) + normalized RGB Skin Segmentation
+                  const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+                  const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+                  const isSkinYCbCr = cr >= 132 && cr <= 178 && cb >= 75 && cb <= 132;
+                  const isSkinRGB = r > 45 && g > 30 && b > 20 && r >= g && (r - b) >= 4 && (maxC - minC) >= 8;
+                  const isSkin = isSkinYCbCr || isSkinRGB;
 
                   if (isSkin) {
                     totalSkinPixels++;
@@ -352,6 +350,7 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
                 setAreEyesDetected(false);
                 setFaceBox(null);
                 setEyeBoxDetails(null);
+                smoothEyeContactRef.current = 0;
                 setEyeContactInstant(0);
                 setStabilityInstant(0);
                 setComposureInstant(0);
@@ -363,15 +362,15 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
               // 2. Validate coherent facial geometry
               const skinClusterW = maxSkinX - minSkinX;
               const skinClusterH = maxSkinY - minSkinY;
-              const minFacePixelThreshold = (width * height) / 32; // ~600 skin pixels
+              const minFacePixelThreshold = (width * height) / 48; // ~400 skin pixels
               const skinAspectRatio = skinClusterH / Math.max(1, skinClusterW);
 
               const hasValidFaceGeometry =
                 totalSkinPixels > minFacePixelThreshold &&
-                skinClusterW >= 26 &&
-                skinClusterH >= 32 &&
-                skinAspectRatio >= 0.75 &&
-                skinAspectRatio <= 2.3 &&
+                skinClusterW >= 20 &&
+                skinClusterH >= 24 &&
+                skinAspectRatio >= 0.65 &&
+                skinAspectRatio <= 2.5 &&
                 avgFrameLuminance >= 10;
 
               if (hasValidFaceGeometry) {
@@ -426,20 +425,20 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
                   curStability = Math.min(98, 88 + Math.round((4 - frameMotion) * 2.5));
                 }
 
-                // 3. Genuine Ocular & Eye Socket Detection
+                // 3. Ocular Socket Extraction & Multi-Feature Continuous Openness Analysis
                 const facePixelLeft = Math.floor((boxX / 100) * width);
                 const facePixelTop = Math.floor((boxY / 100) * height);
                 const facePixelW = Math.floor((boxW / 100) * width);
                 const facePixelH = Math.floor((boxH / 100) * height);
 
-                // Reference ambient facial skin luminance from forehead & cheek baseline
+                // Forehead and cheek skin reference luminance baseline
                 let refSkinLumSum = 0;
                 let refSkinCount = 0;
 
-                const fhYStart = Math.max(0, facePixelTop + Math.floor(facePixelH * 0.10));
+                const fhYStart = Math.max(0, facePixelTop + Math.floor(facePixelH * 0.08));
                 const fhYEnd = Math.min(height, facePixelTop + Math.floor(facePixelH * 0.20));
-                const fhXStart = Math.max(0, facePixelLeft + Math.floor(facePixelW * 0.30));
-                const fhXEnd = Math.min(width, facePixelLeft + Math.floor(facePixelW * 0.70));
+                const fhXStart = Math.max(0, facePixelLeft + Math.floor(facePixelW * 0.25));
+                const fhXEnd = Math.min(width, facePixelLeft + Math.floor(facePixelW * 0.75));
 
                 for (let y = fhYStart; y < fhYEnd; y += 2) {
                   for (let x = fhXStart; x < fhXEnd; x += 2) {
@@ -449,10 +448,10 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
                   }
                 }
 
-                const chYStart = Math.max(0, facePixelTop + Math.floor(facePixelH * 0.54));
-                const chYEnd = Math.min(height, facePixelTop + Math.floor(facePixelH * 0.64));
-                const chXStart = Math.max(0, facePixelLeft + Math.floor(facePixelW * 0.20));
-                const chXEnd = Math.min(width, facePixelLeft + Math.floor(facePixelW * 0.80));
+                const chYStart = Math.max(0, facePixelTop + Math.floor(facePixelH * 0.52));
+                const chYEnd = Math.min(height, facePixelTop + Math.floor(facePixelH * 0.66));
+                const chXStart = Math.max(0, facePixelLeft + Math.floor(facePixelW * 0.18));
+                const chXEnd = Math.min(width, facePixelLeft + Math.floor(facePixelW * 0.82));
 
                 for (let y = chYStart; y < chYEnd; y += 2) {
                   for (let x = chXStart; x < chXEnd; x += 2) {
@@ -464,8 +463,8 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
 
                 const avgSkinLum = refSkinCount > 0 ? refSkinLumSum / refSkinCount : 120;
 
-                // Eye Socket Region coordinates
-                const eyeYTop = Math.max(0, facePixelTop + Math.floor(facePixelH * 0.25));
+                // Eye Socket Coordinates
+                const eyeYTop = Math.max(0, facePixelTop + Math.floor(facePixelH * 0.23));
                 const eyeYBottom = Math.min(height, facePixelTop + Math.floor(facePixelH * 0.46));
                 const eyeBoxH = Math.max(1, eyeYBottom - eyeYTop);
 
@@ -477,23 +476,26 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
                 const rEyeRight = Math.min(width, facePixelLeft + Math.floor(facePixelW * 0.84));
                 const rEyeW = Math.max(1, rEyeRight - rEyeLeft);
 
-                // Helper to evaluate ocular visibility and pupil/iris presence
+                // Helper to evaluate continuous openness & pupil position
                 const evalEye = (xStart: number, xEnd: number, yStart: number, yEnd: number) => {
                   let minLum = 255;
                   let maxLum = 0;
-                  let darkestX = xStart;
-                  let darkestY = yStart;
+                  let darkestX = Math.floor((xStart + xEnd) / 2);
+                  let darkestY = Math.floor((yStart + yEnd) / 2);
                   let totalLum = 0;
                   let count = 0;
                   const lums: number[] = [];
+                  const rowMinLums: number[] = [];
 
                   for (let y = yStart; y < yEnd; y++) {
+                    let rowMin = 255;
                     for (let x = xStart; x < xEnd; x++) {
                       const idx = (y * width + x) * 4;
                       const lum = (data[idx] * 299 + data[idx + 1] * 587 + data[idx + 2] * 114) / 1000;
                       lums.push(lum);
                       totalLum += lum;
                       count++;
+                      if (lum < rowMin) rowMin = lum;
                       if (lum < minLum) {
                         minLum = lum;
                         darkestX = x;
@@ -503,9 +505,19 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
                         maxLum = lum;
                       }
                     }
+                    rowMinLums.push(rowMin);
                   }
 
-                  if (count === 0) return { isVisible: false, contrast: 0, pupilRelX: 0.5, pupilRelY: 0.5, darkestX, darkestY };
+                  if (count === 0) {
+                    return {
+                      openness: 0,
+                      isVisible: false,
+                      pupilRelX: 0.5,
+                      pupilRelY: 0.5,
+                      darkestX,
+                      darkestY,
+                    };
+                  }
 
                   const meanLum = totalLum / count;
                   let varSum = 0;
@@ -514,34 +526,102 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
                     varSum += d * d;
                   }
                   const stdDev = Math.sqrt(varSum / count);
-                  const irisContrast = (avgSkinLum - minLum) / Math.max(1, avgSkinLum);
-                  const internalContrast = (maxLum - minLum) / Math.max(1, maxLum);
 
-                  const marginX = (xEnd - xStart) * 0.06;
-                  const isInsideMargins = darkestX > xStart + marginX && darkestX < xEnd - marginX;
+                  // 1. Iris contrast vs ambient skin (darkness delta)
+                  const irisDelta = avgSkinLum - minLum;
+                  const darkFactor = Math.max(0, Math.min(1, (irisDelta - 4) / 24));
 
-                  // Physiological criteria for an eye open and visible to camera:
-                  // 1. Iris/pupil is significantly darker than ambient skin
-                  // 2. Ocular box exhibits high variance (contrast between sclera and pupil)
-                  // 3. Darkest pupil point is not at the extreme outer edge of the face
-                  const isVisible =
-                    irisContrast >= 0.16 &&
-                    stdDev >= 9 &&
-                    internalContrast >= 0.22 &&
-                    minLum < avgSkinLum - 14 &&
-                    isInsideMargins;
+                  // 2. Internal contrast span (sclera white vs iris dark)
+                  const span = maxLum - minLum;
+                  const contrastFactor = Math.max(0, Math.min(1, (span - 7) / 26));
 
+                  // 3. Vertical Iris Aperture (rows with distinct pupil dip)
+                  const thresholdDip = avgSkinLum - 5;
+                  const dipRowCount = rowMinLums.filter((rm) => rm < thresholdDip).length;
+                  const boxHeight = Math.max(1, yEnd - yStart);
+                  const verticalFactor = Math.max(0, Math.min(1, dipRowCount / (boxHeight * 0.42)));
+
+                  // 4. Texture / variance factor
+                  const stdDevFactor = Math.max(0, Math.min(1, (stdDev - 3.0) / 12));
+
+                  // Margin check: pupil should be inside the socket
+                  const marginX = (xEnd - xStart) * 0.05;
+                  const isInsideMargins = darkestX >= xStart + marginX && darkestX <= xEnd - marginX;
+                  const marginMultiplier = isInsideMargins ? 1.0 : 0.6;
+
+                  // Continuous eye openness calculation (0.0 to 1.0)
+                  let eyeOpenness = 0;
+                  if (irisDelta > 3 && span > 6) {
+                    const rawScore =
+                      (darkFactor * 0.38 + contrastFactor * 0.32 + verticalFactor * 0.20 + stdDevFactor * 0.10) *
+                      marginMultiplier;
+                    if (rawScore > 0.08) {
+                      eyeOpenness = Math.max(0.12, Math.min(1.0, (rawScore - 0.06) / 0.74));
+                    }
+                  }
+
+                  const isVisible = eyeOpenness >= 0.15;
                   const pupilRelX = (darkestX - xStart) / Math.max(1, xEnd - xStart);
                   const pupilRelY = (darkestY - yStart) / Math.max(1, yEnd - yStart);
 
-                  return { isVisible, contrast: irisContrast, stdDev, pupilRelX, pupilRelY, darkestX, darkestY };
+                  return {
+                    openness: Math.round(eyeOpenness * 100) / 100,
+                    isVisible,
+                    pupilRelX,
+                    pupilRelY,
+                    darkestX,
+                    darkestY,
+                  };
                 };
 
                 const leftEval = evalEye(lEyeLeft, lEyeRight, eyeYTop, eyeYBottom);
                 const rightEval = evalEye(rEyeLeft, rEyeRight, eyeYTop, eyeYBottom);
 
-                const bothVisible = leftEval.isVisible && rightEval.isVisible;
-                const oneVisible = leftEval.isVisible || rightEval.isVisible;
+                // Combined openness from both eyes
+                const avgOpenness = (leftEval.openness + rightEval.openness) / 2;
+                const maxOpenness = Math.max(leftEval.openness, rightEval.openness);
+                const effectiveOpenness = avgOpenness * 0.7 + maxOpenness * 0.3;
+
+                // 4. Proportional Eye Contact Score
+                const avgPupilX = (leftEval.pupilRelX + rightEval.pupilRelX) / 2;
+                const avgPupilY = (leftEval.pupilRelY + rightEval.pupilRelY) / 2;
+
+                const hGazeDev = Math.abs(avgPupilX - 0.50);
+                const vGazeDev = Math.abs(avgPupilY - 0.50);
+                const faceOffset = Math.abs(normCentroidX - 0.5) + Math.abs(normCentroidY - 0.45);
+
+                let gazeFactor = 1.0;
+                if (currentPose === 'looking-down' || vGazeDev > 0.22) {
+                  gazeFactor = Math.max(0.35, 0.70 - vGazeDev * 1.2);
+                } else if (currentPose !== 'centered' || hGazeDev > 0.20) {
+                  gazeFactor = Math.max(0.40, 0.75 - hGazeDev * 1.2);
+                } else {
+                  gazeFactor = Math.min(1.0, 1.02 - (hGazeDev * 0.25 + vGazeDev * 0.25 + faceOffset * 0.15));
+                }
+
+                let targetEyeContact = 0;
+                if (effectiveOpenness < 0.10) {
+                  // Eyes completely closed or covered -> strict 0%
+                  targetEyeContact = 0;
+                } else {
+                  // Proportional to how open the eyes are
+                  targetEyeContact = Math.round(
+                    Math.min(96, Math.max(15, effectiveOpenness * 100 * gazeFactor))
+                  );
+                }
+
+                // Smooth real-time transitions (EMA)
+                if (targetEyeContact === 0) {
+                  smoothEyeContactRef.current = Math.max(0, Math.round(smoothEyeContactRef.current * 0.5));
+                } else {
+                  smoothEyeContactRef.current = Math.round(
+                    smoothEyeContactRef.current * 0.65 + targetEyeContact * 0.35
+                  );
+                }
+                const curEyeContact = smoothEyeContactRef.current;
+
+                const areEyesOpen = curEyeContact > 0 && effectiveOpenness >= 0.12;
+                setAreEyesDetected(areEyesOpen);
 
                 setEyeBoxDetails({
                   left: {
@@ -550,6 +630,7 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
                     width: (lEyeW / width) * 100,
                     height: (eyeBoxH / height) * 100,
                     visible: leftEval.isVisible,
+                    openness: leftEval.openness,
                     pupilX: (leftEval.darkestX / width) * 100,
                     pupilY: (leftEval.darkestY / height) * 100,
                   },
@@ -559,57 +640,31 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
                     width: (rEyeW / width) * 100,
                     height: (eyeBoxH / height) * 100,
                     visible: rightEval.isVisible,
+                    openness: rightEval.openness,
                     pupilX: (rightEval.darkestX / width) * 100,
                     pupilY: (rightEval.darkestY / height) * 100,
                   },
-                  statusText: bothVisible ? 'Direct Eye Lock' : oneVisible ? 'Partial Eye View' : 'Eyes Not Detected (0%)',
+                  statusText:
+                    curEyeContact >= 75
+                      ? 'Direct Eye Focus'
+                      : curEyeContact >= 40
+                      ? 'Eyes Open & Active'
+                      : curEyeContact > 0
+                      ? 'Partial Eye Opening'
+                      : 'Eyes Closed / Not Visible (0%)',
                 });
-
-                // 4. Accurate Eye Contact Calculation
-                let curEyeContact = 0;
-
-                if (!oneVisible) {
-                  // CRITICAL FIX: EYES NOT VISIBLE IN CAMERA (Eyes closed, head turned, covered, or out of frame)
-                  // MUST NOT SHOW 90%! Zero eye contact!
-                  setAreEyesDetected(false);
-                  curEyeContact = 0;
-                } else if (!bothVisible) {
-                  // Partial visibility: Only one eye visible (profile view or hand partially obstructing)
-                  setAreEyesDetected(true);
-                  curEyeContact = Math.round(Math.min(38, Math.max(15, 25 + (leftEval.contrast + rightEval.contrast) * 25)));
-                } else {
-                  // Both eyes are clearly visible in the camera
-                  setAreEyesDetected(true);
-                  const avgPupilX = (leftEval.pupilRelX + rightEval.pupilRelX) / 2;
-                  const avgPupilY = (leftEval.pupilRelY + rightEval.pupilRelY) / 2;
-
-                  const hGazeDev = Math.abs(avgPupilX - 0.50);
-                  const vGazeDev = Math.abs(avgPupilY - 0.50);
-                  const faceOffset = Math.abs(normCentroidX - 0.5) + Math.abs(normCentroidY - 0.45);
-
-                  if (currentPose === 'centered' && hGazeDev < 0.18 && vGazeDev < 0.22) {
-                    // Direct camera eye contact
-                    curEyeContact = Math.round(Math.min(96, Math.max(80, 95 - (hGazeDev * 55 + vGazeDev * 45 + faceOffset * 25))));
-                  } else if (currentPose === 'looking-down' || vGazeDev >= 0.22) {
-                    // Looking downward away from camera lens
-                    curEyeContact = Math.round(Math.max(18, 46 - vGazeDev * 60));
-                  } else {
-                    // Looking sideways away from camera
-                    curEyeContact = Math.round(Math.max(22, 52 - hGazeDev * 70));
-                  }
-                }
 
                 // 5. Facial Composure & Expression
                 let curComposure = 50;
                 let curExpr: 'confident' | 'attentive' | 'neutral' | 'smiling' | 'hesitant' | 'restless' = 'attentive';
 
-                if (!oneVisible) {
+                if (curEyeContact === 0) {
                   curComposure = Math.max(20, Math.round(curStability * 0.4));
                   curExpr = 'hesitant';
                 } else if (frameMotion > 8) {
                   curExpr = 'restless';
                   curComposure = Math.max(45, 72 - Math.round(frameMotion * 2));
-                } else if (curEyeContact >= 80 && curStability >= 80) {
+                } else if (curEyeContact >= 70 && curStability >= 75) {
                   curExpr = 'confident';
                   curComposure = Math.min(96, Math.round((curEyeContact + curStability) / 2));
                 } else if (currentPose === 'looking-down') {
@@ -904,17 +959,29 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
 
                 <div
                   className={`absolute -top-6 left-1/2 -translate-x-1/2 px-2 py-0.5 rounded-md border text-[9px] font-mono whitespace-nowrap backdrop-blur-xs flex items-center gap-1 ${
-                    areEyesDetected
+                    eyeContactInstant >= 50
                       ? 'bg-slate-950/85 border-cyan-500/40 text-cyan-300'
+                      : eyeContactInstant > 0
+                      ? 'bg-slate-950/85 border-amber-500/40 text-amber-300'
                       : 'bg-rose-950/90 border-rose-500/50 text-rose-300'
                   }`}
                 >
                   <span
                     className={`w-1.5 h-1.5 rounded-full ${
-                      areEyesDetected ? 'bg-cyan-400 animate-ping' : 'bg-rose-400 animate-pulse'
+                      eyeContactInstant >= 50
+                        ? 'bg-cyan-400 animate-ping'
+                        : eyeContactInstant > 0
+                        ? 'bg-amber-400 animate-pulse'
+                        : 'bg-rose-400 animate-pulse'
                     }`}
                   />
-                  <span>{areEyesDetected ? 'AI Face & Eyes Locked' : '⚠️ Eyes Not Detected (0%)'}</span>
+                  <span>
+                    {eyeContactInstant >= 50
+                      ? `AI Eyes Focused (${eyeContactInstant}%)`
+                      : eyeContactInstant > 0
+                      ? `Partial Eye Opening (${eyeContactInstant}%)`
+                      : '⚠️ Eyes Closed / Not Visible (0%)'}
+                  </span>
                 </div>
               </div>
 
@@ -924,8 +991,10 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
                   {/* Left Eye Box */}
                   <div
                     className={`absolute pointer-events-none rounded-md border transition-all duration-150 flex items-center justify-center ${
-                      eyeBoxDetails.left.visible
+                      eyeBoxDetails.left.openness >= 0.35
                         ? 'border-cyan-400/90 bg-cyan-400/15 shadow-[0_0_8px_rgba(6,182,212,0.4)]'
+                        : eyeBoxDetails.left.openness > 0
+                        ? 'border-amber-400/80 bg-amber-400/15 shadow-[0_0_6px_rgba(245,158,11,0.3)]'
                         : 'border-rose-500/80 bg-rose-500/15 border-dashed'
                     }`}
                     style={{
@@ -939,18 +1008,25 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
                       height: `${eyeBoxDetails.left.height}%`,
                     }}
                   >
-                    {eyeBoxDetails.left.visible ? (
-                      <span className="w-1.5 h-1.5 rounded-full bg-cyan-300 shadow-sm animate-pulse" />
+                    {eyeBoxDetails.left.openness > 0 ? (
+                      <div className="flex flex-col items-center">
+                        <span className="w-1.5 h-1.5 rounded-full bg-cyan-300 shadow-sm animate-pulse" />
+                        <span className="text-[7px] font-mono font-bold text-cyan-200 mt-0.5">
+                          {Math.round(eyeBoxDetails.left.openness * 100)}%
+                        </span>
+                      </div>
                     ) : (
-                      <span className="text-[8px] text-rose-300 font-mono font-bold">✕</span>
+                      <span className="text-[7px] text-rose-300 font-mono font-bold">Closed</span>
                     )}
                   </div>
 
                   {/* Right Eye Box */}
                   <div
                     className={`absolute pointer-events-none rounded-md border transition-all duration-150 flex items-center justify-center ${
-                      eyeBoxDetails.right.visible
+                      eyeBoxDetails.right.openness >= 0.35
                         ? 'border-cyan-400/90 bg-cyan-400/15 shadow-[0_0_8px_rgba(6,182,212,0.4)]'
+                        : eyeBoxDetails.right.openness > 0
+                        ? 'border-amber-400/80 bg-amber-400/15 shadow-[0_0_6px_rgba(245,158,11,0.3)]'
                         : 'border-rose-500/80 bg-rose-500/15 border-dashed'
                     }`}
                     style={{
@@ -964,10 +1040,15 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
                       height: `${eyeBoxDetails.right.height}%`,
                     }}
                   >
-                    {eyeBoxDetails.right.visible ? (
-                      <span className="w-1.5 h-1.5 rounded-full bg-cyan-300 shadow-sm animate-pulse" />
+                    {eyeBoxDetails.right.openness > 0 ? (
+                      <div className="flex flex-col items-center">
+                        <span className="w-1.5 h-1.5 rounded-full bg-cyan-300 shadow-sm animate-pulse" />
+                        <span className="text-[7px] font-mono font-bold text-cyan-200 mt-0.5">
+                          {Math.round(eyeBoxDetails.right.openness * 100)}%
+                        </span>
+                      </div>
                     ) : (
-                      <span className="text-[8px] text-rose-300 font-mono font-bold">✕</span>
+                      <span className="text-[7px] text-rose-300 font-mono font-bold">Closed</span>
                     )}
                   </div>
                 </>
@@ -981,18 +1062,20 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
               <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-950/85 border border-slate-800 text-[10px] font-mono text-slate-300 backdrop-blur-md">
                 <span
                   className={`w-2 h-2 rounded-full ${
-                    isFaceDetected && areEyesDetected
+                    isFaceDetected && eyeContactInstant >= 50
                       ? 'bg-emerald-400 animate-pulse'
-                      : isFaceDetected
-                      ? 'bg-rose-400 animate-pulse'
-                      : 'bg-amber-400'
+                      : isFaceDetected && eyeContactInstant > 0
+                      ? 'bg-amber-400 animate-pulse'
+                      : 'bg-rose-400 animate-pulse'
                   }`}
                 />
                 <span>
-                  {isFaceDetected && areEyesDetected
-                    ? 'BEHAVIOR TRACKING LIVE'
+                  {isFaceDetected && eyeContactInstant >= 50
+                    ? 'BEHAVIOR TRACKING: EYES FOCUSED'
+                    : isFaceDetected && eyeContactInstant > 0
+                    ? `BEHAVIOR TRACKING: PARTIAL EYE CONTACT (${eyeContactInstant}%)`
                     : isFaceDetected
-                    ? '⚠️ EYES NOT VISIBLE - LOOK AT CAMERA'
+                    ? '⚠️ EYES CLOSED / NOT VISIBLE (0%)'
                     : 'ALIGN FACE IN CAMERA'}
                 </span>
               </div>
@@ -1001,7 +1084,7 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
                 <ShieldCheck className="w-3 h-3 text-cyan-400" />
                 <span>
                   INDEX:{' '}
-                  {isFaceDetected && areEyesDetected
+                  {isFaceDetected
                     ? Math.round(eyeContactInstant * 0.4 + stabilityInstant * 0.3 + composureInstant * 0.3)
                     : 0}
                   /100
@@ -1017,14 +1100,21 @@ export const CameraBehaviorMonitor = forwardRef<CameraBehaviorMonitorRef, Camera
                 {/* Eye Contact Badge */}
                 <div
                   className={`flex items-center gap-1 px-2 py-0.5 rounded-lg border text-[10px] font-mono backdrop-blur-md ${
-                    areEyesDetected
+                    eyeContactInstant > 0
                       ? getMetricColor(eyeContactInstant)
                       : 'text-rose-400 bg-rose-500/10 border-rose-500/30'
                   }`}
                 >
-                  {areEyesDetected ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
+                  {eyeContactInstant > 0 ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
                   <span>
-                    Eye: {areEyesDetected ? `${eyeContactInstant}%` : isFaceDetected ? '0% (No Eyes)' : '0%'}
+                    Eye: {eyeContactInstant}%{' '}
+                    {eyeContactInstant === 0
+                      ? isFaceDetected
+                        ? '(Closed)'
+                        : '(No Face)'
+                      : eyeContactInstant < 50
+                      ? '(Partial)'
+                      : ''}
                   </span>
                 </div>
 
