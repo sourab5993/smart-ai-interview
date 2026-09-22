@@ -20,7 +20,7 @@ export async function callGemini(
   // Ordered from fastest, active & highest-quota models
   const candidateModels = [
     'gemini-3.5-flash-lite',
-    'gemini-3.1-flash-lite',
+    'gemini-3.6-flash',
     'gemini-3.5-flash',
   ];
 
@@ -50,6 +50,59 @@ export async function callGemini(
   throw lastError || new Error('All candidate Gemini models failed.');
 }
 
+// Universal Multimodal Document & Image OCR Extractor with Gemini AI
+export async function extractDocumentTextWithGemini(
+  ai: GoogleGenAI,
+  base64Data: string,
+  mimeType: string = 'application/pdf'
+): Promise<{ text: string; modelUsed: string }> {
+  const prompt = `You are a professional ATS resume text parser and high-accuracy OCR engine.
+Extract ALL readable content, sections, and text from this document or resume image.
+RULES:
+1. Extract ALL text accurately verbatim (Candidate name, Contact info, Education, Experience, Skills, Projects, Certifications).
+2. Maintain natural reading flow and section headers.
+3. Transcribe dates, metrics, percentages, and bullet points exactly.
+4. Output ONLY the extracted clean plain text without surrounding code blocks, markdown quotes, or chat preambles.`;
+
+  const cleanBase64 = base64Data.includes(';base64,')
+    ? base64Data.split(';base64,')[1]
+    : base64Data.replace(/^data:.*?base64,/, '').trim();
+
+  const normalizedMime = (mimeType || 'application/pdf').split(';')[0].trim().toLowerCase();
+  const candidateModels = ['gemini-3.5-flash-lite', 'gemini-3.6-flash', 'gemini-3.5-flash'];
+
+  let lastError: any = null;
+  for (const model of candidateModels) {
+    try {
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`Model ${model} OCR timed out after 10000ms`)), 10000)
+      );
+
+      const requestPromise = ai.models.generateContent({
+        model,
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { inlineData: { mimeType: normalizedMime, data: cleanBase64 } },
+              { text: prompt },
+            ],
+          },
+        ],
+      });
+
+      const response: any = await Promise.race([requestPromise, timeoutPromise]);
+      if (response && response.text && response.text.trim().length > 10) {
+        return { text: response.text.trim(), modelUsed: model };
+      }
+    } catch (err: any) {
+      console.warn(`[Gemini OCR] Model "${model}" failed/timed-out: ${err?.message || err}. Trying next model...`);
+      lastError = err;
+    }
+  }
+  throw lastError || new Error('Multimodal document extraction failed across all Gemini candidate models.');
+}
+
 // High-Precision Universal Audio Transcription with Gemini AI
 export async function transcribeAudioGemini(
   ai: GoogleGenAI,
@@ -75,7 +128,7 @@ CRITICAL RULES:
   const normalizedMime = rawMime || 'audio/webm';
 
   // Try candidate models in priority order
-  const candidateModels = ['gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-3.1-flash-lite'];
+  const candidateModels = ['gemini-3.5-flash-lite', 'gemini-3.6-flash', 'gemini-3.5-flash'];
   let transcribed = '';
   let usedModel = '';
 

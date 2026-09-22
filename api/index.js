@@ -912,7 +912,7 @@ function wrapUserWithMethods(userData) {
 var UserService = {
   async findByEmail(email) {
     const normalized = email.trim().toLowerCase();
-    if (mongoose4.connection.readyState === 1) {
+    if (mongoose4.connection.readyState === 1 || mongoose4.connection.readyState === 2) {
       try {
         const user = await User.findOne({ email: normalized }).select("+passwordHash");
         if (user) return user;
@@ -923,10 +923,12 @@ var UserService = {
     return memUser ? wrapUserWithMethods(memUser) : null;
   },
   async findById(id) {
-    if (mongoose4.connection.readyState === 1) {
+    if (mongoose4.connection.readyState === 1 || mongoose4.connection.readyState === 2) {
       try {
-        const user = await User.findById(id);
-        if (user) return user;
+        if (mongoose4.isValidObjectId(id)) {
+          const user = await User.findById(id);
+          if (user) return user;
+        }
       } catch (err) {
       }
     }
@@ -1179,7 +1181,10 @@ router2.post("/login", authRateLimiter, async (req, res) => {
 });
 router2.get("/me", authenticateToken, async (req, res) => {
   try {
-    const user = await UserService.findById(req.user?.userId || "");
+    let user = await UserService.findById(req.user?.userId || "");
+    if (!user && req.user?.email) {
+      user = await UserService.findByEmail(req.user.email);
+    }
     if (!user) {
       return res.status(404).json({
         success: false,
@@ -1342,7 +1347,7 @@ function getGeminiClient() {
 async function callGemini(ai, prompt, config) {
   const candidateModels = [
     "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
+    "gemini-3.6-flash",
     "gemini-3.5-flash"
   ];
   let lastError = null;
@@ -1367,6 +1372,46 @@ async function callGemini(ai, prompt, config) {
   }
   throw lastError || new Error("All candidate Gemini models failed.");
 }
+async function extractDocumentTextWithGemini(ai, base64Data, mimeType = "application/pdf") {
+  const prompt = `You are a professional ATS resume text parser and high-accuracy OCR engine.
+Extract ALL readable content, sections, and text from this document or resume image.
+RULES:
+1. Extract ALL text accurately verbatim (Candidate name, Contact info, Education, Experience, Skills, Projects, Certifications).
+2. Maintain natural reading flow and section headers.
+3. Transcribe dates, metrics, percentages, and bullet points exactly.
+4. Output ONLY the extracted clean plain text without surrounding code blocks, markdown quotes, or chat preambles.`;
+  const cleanBase64 = base64Data.includes(";base64,") ? base64Data.split(";base64,")[1] : base64Data.replace(/^data:.*?base64,/, "").trim();
+  const normalizedMime = (mimeType || "application/pdf").split(";")[0].trim().toLowerCase();
+  const candidateModels = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.5-flash"];
+  let lastError = null;
+  for (const model of candidateModels) {
+    try {
+      const timeoutPromise = new Promise(
+        (_, reject) => setTimeout(() => reject(new Error(`Model ${model} OCR timed out after 10000ms`)), 1e4)
+      );
+      const requestPromise = ai.models.generateContent({
+        model,
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { inlineData: { mimeType: normalizedMime, data: cleanBase64 } },
+              { text: prompt }
+            ]
+          }
+        ]
+      });
+      const response = await Promise.race([requestPromise, timeoutPromise]);
+      if (response && response.text && response.text.trim().length > 10) {
+        return { text: response.text.trim(), modelUsed: model };
+      }
+    } catch (err) {
+      console.warn(`[Gemini OCR] Model "${model}" failed/timed-out: ${err?.message || err}. Trying next model...`);
+      lastError = err;
+    }
+  }
+  throw lastError || new Error("Multimodal document extraction failed across all Gemini candidate models.");
+}
 async function transcribeAudioGemini(ai, audioBase64, mimeType = "audio/webm", language = "English") {
   const prompt = `You are an expert speech-to-text transcriber for a professional job interview.
 Language context: ${language} (accurately transcribe English, Hindi, and Hinglish technical terms verbatim).
@@ -1379,7 +1424,7 @@ CRITICAL RULES:
   const cleanBase64 = audioBase64.includes(";base64,") ? audioBase64.split(";base64,")[1] : audioBase64.replace(/^data:.*?base64,/, "").trim();
   const rawMime = (mimeType || "audio/webm").split(";")[0].trim();
   const normalizedMime = rawMime || "audio/webm";
-  const candidateModels = ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.1-flash-lite"];
+  const candidateModels = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.5-flash"];
   let transcribed = "";
   let usedModel = "";
   for (const model of candidateModels) {
@@ -1678,6 +1723,8 @@ function generateFallbackQuestions(course, specialization, role, difficulty, typ
 function evaluateFallbackAnswer(question, userAnswer, course, role, type, behaviorTelemetry) {
   const trimmed = (userAnswer || "").trim();
   const lowerAns = trimmed.toLowerCase();
+  const words = trimmed.split(/\s+/).filter(Boolean);
+  const wordCount = words.length;
   const bScore = behaviorTelemetry ? behaviorTelemetry.overallBehaviorScore : 0;
   const evasionPhrases = [
     "dont know",
@@ -1840,7 +1887,7 @@ function generateFallbackReport(session, course, role) {
   const overallBehavior = Math.round(avgEye * 0.4 + avgStability * 0.3 + avgComposure * 0.3);
   return {
     overallScore: avg,
-    performanceLabel: avg >= 85 ? "Strong Placement-Ready Performance" : avg >= 75 ? "Solid Foundation — Ready with Minor Polish" : "Developing Baseline",
+    performanceLabel: avg >= 85 ? "Strong Placement-Ready Performance" : avg >= 75 ? "Solid Foundation \u2014 Ready with Minor Polish" : "Developing Baseline",
     technicalScore: Math.min(95, avg + 2),
     communicationScore: Math.min(92, avg - 1),
     problemSolvingScore: Math.min(94, avg + 1),
@@ -1854,9 +1901,7 @@ function generateFallbackReport(session, course, role) {
     eyeContactAverage: avgEye,
     postureStabilityAverage: avgStability,
     composureAverage: avgComposure,
-    behaviorSummary: bTelemetries.length > 0
-      ? `Candidate maintained an average eye contact score of ${avgEye}%, posture stability of ${avgStability}%, and facial composure of ${avgComposure}%. Non-verbal composure demonstrated poise and focus.`
-      : `Camera telemetry was not recorded during this interview session; non-verbal metrics unrecorded.`,
+    behaviorSummary: bTelemetries.length > 0 ? `Candidate maintained an average eye contact score of ${avgEye}%, posture stability of ${avgStability}%, and facial composure of ${avgComposure}%. Non-verbal composure demonstrated poise and focus.` : `Camera telemetry was not recorded during this interview session; non-verbal behavioral metrics unrecorded.`,
     nonVerbalRecommendations: [
       "Maintain direct eye contact with the webcam when articulating the key takeaway.",
       "Adopt an open, upright seated posture to project executive presence.",
@@ -2240,22 +2285,20 @@ Provide a comprehensive, senior-level post-interview synthesis JSON tailored to 
     const avgStab = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.postureStabilityScore ?? 0), 0) / bTelemetries.length) : 0;
     const avgComp = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.facialComposureScore ?? 0), 0) / bTelemetries.length) : 0;
     const compositeBehavior = Math.round(avgEye * 0.4 + avgStab * 0.3 + avgComp * 0.3);
-    if (report.behaviorScore === undefined || report.behaviorScore === null) {
+    if (report.behaviorScore === void 0 || report.behaviorScore === null) {
       report.behaviorScore = compositeBehavior;
     }
-    if (report.eyeContactAverage === undefined || report.eyeContactAverage === null) {
+    if (report.eyeContactAverage === void 0 || report.eyeContactAverage === null) {
       report.eyeContactAverage = avgEye;
     }
-    if (report.postureStabilityAverage === undefined || report.postureStabilityAverage === null) {
+    if (report.postureStabilityAverage === void 0 || report.postureStabilityAverage === null) {
       report.postureStabilityAverage = avgStab;
     }
-    if (report.composureAverage === undefined || report.composureAverage === null) {
+    if (report.composureAverage === void 0 || report.composureAverage === null) {
       report.composureAverage = avgComp;
     }
     if (!report.behaviorSummary) {
-      report.behaviorSummary = bTelemetries.length > 0
-        ? `Candidate maintained an average eye contact score of ${avgEye}%, posture stability of ${avgStab}%, and facial composure of ${avgComp}%. Non-verbal presence was composed and focused.`
-        : `Camera telemetry was not recorded during this interview session; non-verbal metrics unrecorded.`;
+      report.behaviorSummary = bTelemetries.length > 0 ? `Candidate maintained an average eye contact score of ${avgEye}%, posture stability of ${avgStab}%, and facial composure of ${avgComp}%. Non-verbal presence was composed and focused.` : `Camera telemetry was not recorded during this interview session; non-verbal metrics unrecorded.`;
     }
     if (!report.nonVerbalRecommendations || report.nonVerbalRecommendations.length === 0) {
       report.nonVerbalRecommendations = [
@@ -2453,7 +2496,23 @@ var aiRoutes_default = router3;
 
 // server/routes/resumeRoutes.ts
 import { Router as Router4 } from "express";
+import zlib from "zlib";
 var router4 = Router4();
+function detectMimeType(fileName, fileType) {
+  const lower = (fileName || "").toLowerCase();
+  if (lower.endsWith(".pdf") || fileType.includes("pdf")) return "application/pdf";
+  if (lower.endsWith(".docx") || fileType.includes("wordprocessingml")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (lower.endsWith(".doc") || fileType.includes("msword")) return "application/msword";
+  if (lower.endsWith(".png") || fileType.includes("png")) return "image/png";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg") || fileType.includes("jpeg")) return "image/jpeg";
+  if (lower.endsWith(".webp") || fileType.includes("webp")) return "image/webp";
+  if (lower.endsWith(".txt") || fileType.includes("text/plain")) return "text/plain";
+  if (lower.endsWith(".md")) return "text/markdown";
+  return fileType || "application/octet-stream";
+}
+function cleanExtractedText(raw) {
+  return (raw || "").replace(/\u0000/g, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+}
 router4.post("/parse-document", async (req, res) => {
   try {
     const { fileData = "", fileName = "resume.pdf", fileType = "" } = req.body;
@@ -2463,48 +2522,113 @@ router4.post("/parse-document", async (req, res) => {
     const base64Content = fileData.includes(";base64,") ? fileData.split(";base64,")[1] : fileData.replace(/^data:.*?base64,/, "").trim();
     const buffer = Buffer.from(base64Content, "base64");
     const lowerName = (fileName || "").toLowerCase();
+    const mimeType = detectMimeType(lowerName, fileType);
+    const isImage = mimeType.startsWith("image/");
+    const isPdf = mimeType === "application/pdf";
+    const isWord = mimeType.includes("word") || lowerName.endsWith(".docx") || lowerName.endsWith(".doc");
     let extractedText = "";
-    if (lowerName.endsWith(".pdf") || fileType.includes("pdf")) {
+    let extractionMethod = "unknown";
+    if (isPdf) {
       try {
         const { PDFParse } = await import("pdf-parse");
         const parser = new PDFParse({ data: new Uint8Array(buffer) });
         const result = await parser.getText();
-        extractedText = result.text || "";
+        const candidate = cleanExtractedText(result.text || "");
+        if (candidate.length >= 10) {
+          extractedText = candidate;
+          extractionMethod = "native-pdf";
+        }
       } catch (pdfErr) {
-        console.warn("Primary PDFParse error, trying stream fallback:", pdfErr?.message || pdfErr);
-        const raw = buffer.toString("binary");
-        const matches = raw.match(/\(([^()]{3,})\)/g);
-        if (matches && matches.length > 5) {
-          extractedText = matches.map((m) => m.slice(1, -1)).join(" ");
-        }
+        console.warn("[Resume Parser] PDFParse primary parsing error:", pdfErr?.message || pdfErr);
       }
-    } else if (lowerName.endsWith(".docx") || fileType.includes("wordprocessingml")) {
+    } else if (lowerName.endsWith(".docx") || mimeType.includes("wordprocessingml")) {
       try {
         const mammoth = (await import("mammoth")).default || await import("mammoth");
         const result = await mammoth.extractRawText({ buffer });
-        extractedText = result.value || "";
+        const candidate = cleanExtractedText(result.value || "");
+        if (candidate.length >= 10) {
+          extractedText = candidate;
+          extractionMethod = "docx-mammoth";
+        }
       } catch (docxErr) {
-        console.warn("DOCX mammoth parsing error:", docxErr?.message || docxErr);
+        console.warn("[Resume Parser] DOCX mammoth parsing error:", docxErr?.message || docxErr);
       }
-    } else if (lowerName.endsWith(".doc") || fileType.includes("msword")) {
+    } else if (lowerName.endsWith(".doc") || mimeType.includes("msword")) {
       try {
         const mammoth = (await import("mammoth")).default || await import("mammoth");
         const result = await mammoth.extractRawText({ buffer });
-        extractedText = result.value || "";
+        const candidate = cleanExtractedText(result.value || "");
+        if (candidate.length >= 10) {
+          extractedText = candidate;
+          extractionMethod = "doc-mammoth";
+        }
       } catch {
-        const printable = buffer.toString("utf-8").replace(/[^\x20-\x7E\t\n\r]/g, " ").replace(/\s{2,}/g, " ").trim();
-        if (printable.length > 80) {
+        const printable = cleanExtractedText(
+          buffer.toString("utf-8").replace(/[^\x20-\x7E\t\n\r]/g, " ")
+        );
+        if (printable.length >= 15) {
           extractedText = printable;
+          extractionMethod = "doc-printable";
         }
       }
-    } else {
-      extractedText = buffer.toString("utf-8");
+    } else if (!isImage) {
+      const candidate = cleanExtractedText(buffer.toString("utf-8"));
+      if (candidate.length >= 10) {
+        extractedText = candidate;
+        extractionMethod = "plain-text";
+      }
     }
-    extractedText = extractedText.replace(/\r\n/g, "\n").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
-    if (!extractedText || extractedText.length < 20) {
+    const wordCountSoFar = extractedText.split(/\s+/).filter(Boolean).length;
+    if ((wordCountSoFar < 30 || isImage) && (isPdf || isImage)) {
+      const ai = getGeminiClient();
+      if (ai) {
+        try {
+          console.log(`[Resume Parser] Running Gemini Multimodal OCR on "${fileName}" (${mimeType})...`);
+          const { text: ocrText, modelUsed } = await extractDocumentTextWithGemini(ai, base64Content, mimeType);
+          const candidate = cleanExtractedText(ocrText);
+          if (candidate.length >= 10 && (candidate.length > extractedText.length || wordCountSoFar < 15)) {
+            extractedText = candidate;
+            extractionMethod = `gemini-ocr (${modelUsed})`;
+          }
+        } catch (ocrErr) {
+          console.warn("[Resume Parser] Gemini Multimodal OCR failed:", ocrErr?.message || ocrErr);
+        }
+      }
+    }
+    if (isPdf && (!extractedText || extractedText.length < 15)) {
+      try {
+        const raw = buffer.toString("binary");
+        const streamRegex = /stream[\r\n]+([\s\S]*?)[\r\n]+endstream/g;
+        let streamMatch;
+        let combinedText = "";
+        while ((streamMatch = streamRegex.exec(raw)) !== null) {
+          const streamBuffer = Buffer.from(streamMatch[1], "binary");
+          try {
+            const decompressed = zlib.inflateSync(streamBuffer).toString("utf-8");
+            const printable = decompressed.replace(/[^\x20-\x7E\t\n\r]/g, " ");
+            combinedText += " " + printable;
+          } catch {
+            const printable = streamMatch[1].replace(/[^\x20-\x7E\t\n\r]/g, " ");
+            combinedText += " " + printable;
+          }
+        }
+        const tokenMatches = combinedText.match(/\(([^()]{2,})\)/g);
+        if (tokenMatches && tokenMatches.length > 3) {
+          const streamCandidate = cleanExtractedText(tokenMatches.map((m) => m.slice(1, -1)).join(" "));
+          if (streamCandidate.length >= 10) {
+            extractedText = streamCandidate;
+            extractionMethod = "pdf-stream-decompressed";
+          }
+        }
+      } catch (streamErr) {
+        console.warn("[Resume Parser] Stream fallback error:", streamErr);
+      }
+    }
+    extractedText = cleanExtractedText(extractedText);
+    if (!extractedText || extractedText.length < 10) {
       return res.status(422).json({
         success: false,
-        error: "Could not extract readable text from the document. Please ensure the file contains text and is not password-protected."
+        error: isImage ? "Could not extract text from the image resume. Please verify the image is clear and contains readable text." : "Could not extract readable text from the document. Please ensure the file contains text and is not password-protected."
       });
     }
     const words = extractedText.split(/\s+/).filter(Boolean);
@@ -2513,11 +2637,15 @@ router4.post("/parse-document", async (req, res) => {
       text: extractedText,
       fileName,
       fileSize: buffer.length,
-      wordCount: words.length
+      wordCount: words.length,
+      method: extractionMethod
     });
   } catch (error) {
-    console.error("Error parsing resume document:", error);
-    return res.status(500).json({ success: false, error: error?.message || "Failed to parse resume document" });
+    console.error("[Resume Parser] Critical error parsing resume document:", error);
+    return res.status(500).json({
+      success: false,
+      error: error?.message || "Failed to parse resume document"
+    });
   }
 });
 var resumeRoutes_default = router4;
@@ -2527,8 +2655,8 @@ dotenv2.config();
 var app = express();
 app.set("trust proxy", 1);
 var PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3e3;
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+app.use(express.json({ limit: "25mb" }));
+app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 var dbInitPromise = null;
 app.use(async (req, res, next) => {
   if (req.path.startsWith("/api")) {

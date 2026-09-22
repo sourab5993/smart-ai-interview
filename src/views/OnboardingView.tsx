@@ -379,7 +379,7 @@ export const OnboardingView: React.FC = () => {
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept=".pdf,.docx,.doc,.txt,.md"
+                  accept=".pdf,.docx,.doc,.txt,.md,.png,.jpg,.jpeg,.webp,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg,image/webp"
                   onChange={async (e) => {
                     const file = e.target.files?.[0];
                     if (!file) return;

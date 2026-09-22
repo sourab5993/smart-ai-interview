@@ -99,23 +99,30 @@ export const ResumeView: React.FC = () => {
     try {
       const parsed = await parseResumeDocumentFile(file);
       setResumeText(parsed.text);
-      setExtractSuccess(`Successfully extracted ${parsed.wordCount} words from ${file.name}`);
+      setExtractSuccess(`Extracted ${parsed.wordCount} words from ${file.name}. Running ATS compliance analysis for ${selectedRole}...`);
+      setIsExtractingDoc(false);
+
+      // Automatically trigger comprehensive ATS scan immediately upon extraction
+      await analyzeResumeText(parsed.text, selectedRole, currentCourse.name, file.name);
+      setExtractSuccess(`Resume parsed & ATS analysis completed successfully for ${selectedRole}!`);
       setTimeout(() => setExtractSuccess(null), 6000);
     } catch (err: any) {
       console.warn('Backend document extraction failed, attempting client text fallback:', err);
       if (file.name.endsWith('.txt') || file.name.endsWith('.md') || file.type.includes('text')) {
         const reader = new FileReader();
-        reader.onload = (event) => {
+        reader.onload = async (event) => {
           const content = event.target?.result;
           if (typeof content === 'string') {
             setResumeText(content);
-            setExtractSuccess(`Loaded ${file.name} (${sizeKb} KB)`);
+            setExtractSuccess(`Loaded ${file.name} (${sizeKb} KB). Running ATS scan...`);
+            await analyzeResumeText(content, selectedRole, currentCourse.name, file.name);
+            setExtractSuccess(`Loaded ${file.name} & ATS analysis completed!`);
             setTimeout(() => setExtractSuccess(null), 5000);
           }
         };
         reader.readAsText(file);
       } else {
-        setExtractError(err?.message || 'Could not extract text from document. Please ensure the file contains readable text.');
+        setExtractError(err?.message || 'Could not extract text from document. Please ensure the file contains readable text or upload a clear PDF/image.');
       }
     } finally {
       setIsExtractingDoc(false);
@@ -253,7 +260,7 @@ export const ResumeView: React.FC = () => {
           <input
             ref={fileInputRef}
             type="file"
-            accept=".pdf,.docx,.doc,.txt,.md,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            accept=".pdf,.docx,.doc,.txt,.md,.png,.jpg,.jpeg,.webp,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg,image/webp"
             onChange={handleFileUpload}
             className="hidden"
             id="resume-file-input"
@@ -284,13 +291,13 @@ export const ResumeView: React.FC = () => {
               </div>
               <div>
                 <div className="text-xs font-bold text-slate-200 flex items-center gap-2">
-                  <span>{isExtractingDoc ? 'Parsing Document & Extracting Text...' : 'Upload Resume Document (PDF, DOC, DOCX, TXT)'}</span>
+                  <span>{isExtractingDoc ? 'Parsing Document & Extracting Text (OCR)...' : 'Upload Resume Document (PDF, DOCX, Scanned, Images, TXT)'}</span>
                   {isExtractingDoc && <span className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 font-mono animate-pulse">Processing</span>}
                 </div>
                 <div className="text-[10px] text-slate-500 mt-0.5">
                   {isExtractingDoc
-                    ? 'Native text extraction underway. Structured sections and bullet points will populate automatically.'
-                    : 'Click to select your PDF or Word resume. Native parser extracts clean text for ATS & interview evaluation.'}
+                    ? 'Universal text & AI OCR extraction underway. ATS scan will run automatically upon completion.'
+                    : 'Select your PDF, Word, or image resume. Multi-layer parser & Gemini OCR extracts clean text for instant ATS scoring.'}
                 </div>
               </div>
             </div>
@@ -313,9 +320,17 @@ export const ResumeView: React.FC = () => {
                       ? 'bg-rose-500/20 border-rose-500/40 text-rose-400'
                       : uploadedFileName.toLowerCase().endsWith('.docx') || uploadedFileName.toLowerCase().endsWith('.doc')
                       ? 'bg-blue-500/20 border-blue-500/40 text-blue-400'
+                      : /\.(png|jpe?g|webp)$/i.test(uploadedFileName)
+                      ? 'bg-amber-500/20 border-amber-500/40 text-amber-400'
                       : 'bg-emerald-500/20 border-emerald-500/40 text-emerald-400'
                   }`}>
-                    {uploadedFileName.toLowerCase().endsWith('.pdf') ? 'PDF' : uploadedFileName.toLowerCase().endsWith('.docx') || uploadedFileName.toLowerCase().endsWith('.doc') ? 'DOC' : 'TXT'}
+                    {uploadedFileName.toLowerCase().endsWith('.pdf')
+                      ? 'PDF'
+                      : uploadedFileName.toLowerCase().endsWith('.docx') || uploadedFileName.toLowerCase().endsWith('.doc')
+                      ? 'DOC'
+                      : /\.(png|jpe?g|webp)$/i.test(uploadedFileName)
+                      ? 'IMG'
+                      : 'TXT'}
                   </div>
                   <div>
                     <div className="text-xs sm:text-sm font-bold text-slate-100 flex items-center gap-2">
@@ -382,6 +397,14 @@ export const ResumeView: React.FC = () => {
                       className="w-full h-80 rounded-xl border border-slate-800 bg-slate-900"
                       title="Resume PDF Document Preview"
                     />
+                  ) : /\.(png|jpe?g|webp)$/i.test(uploadedFileName) ? (
+                    <div className="p-2 bg-slate-950 rounded-xl border border-slate-800 flex justify-center">
+                      <img
+                        src={uploadedFileData}
+                        alt="Resume Preview"
+                        className="max-h-80 w-auto rounded-lg object-contain shadow-md"
+                      />
+                    </div>
                   ) : (
                     <div className="p-3.5 rounded-xl bg-slate-900 border border-slate-800 max-h-60 overflow-y-auto font-mono text-[11px] text-slate-300 whitespace-pre-wrap">
                       {resumeText}
