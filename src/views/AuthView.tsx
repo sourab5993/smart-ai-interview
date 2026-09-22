@@ -56,8 +56,6 @@ export const AuthView: React.FC<AuthViewProps> = ({ redirectReason }) => {
           name,
           targetRole,
         });
-        setRegSuccess('Registration successful! Please sign in with your password to access your dashboard.');
-        setMode('login');
       } else {
         await login(email, password);
       }

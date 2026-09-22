@@ -113,14 +113,6 @@ function safeJsonParse<T>(key: string, fallback: T): T {
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<UserProfile>(() => {
     const parsed = safeJsonParse<UserProfile>('smart_interview_user', INITIAL_USER);
-    if (parsed && (parsed.email === 'sourabstar786@gmail.com' || parsed.name === 'Sourab' || parsed.name === 'Sourab Sharma')) {
-      parsed.name = 'Candidate User';
-      parsed.email = 'candidate@evaluator.edu';
-      parsed.resumeFileName = 'Candidate_Resume.pdf';
-      try {
-        localStorage.setItem('smart_interview_user', JSON.stringify(parsed));
-      } catch {}
-    }
     return parsed || INITIAL_USER;
   });
 
@@ -139,21 +131,47 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     fetch('/api/auth/me', {
       headers: { Authorization: `Bearer ${token}` },
     })
-      .then((res) => (res.ok ? res.json().catch(() => null) : null))
+      .then((res) => {
+        // ONLY clear auth credentials if explicitly rejected with 401 Unauthorized (expired or invalid JWT)
+        if (res.status === 401) {
+          console.warn('[Auth] Token is invalid or expired. Logging out.');
+          localStorage.removeItem('smart_interview_token');
+          localStorage.removeItem('smart_interview_user');
+          setAuthToken(null);
+          setIsAuthenticated(false);
+          setCurrentView('landing');
+          return null;
+        }
+        return res.ok ? res.json().catch(() => null) : null;
+      })
       .then((data) => {
         if (data && data.success && data.user) {
           setUser((prev) => ({ ...prev, ...data.user }));
           setIsAuthenticated(true);
-        } else {
-          localStorage.removeItem('smart_interview_token');
-          setAuthToken(null);
-          setIsAuthenticated(false);
         }
       })
-      .catch(() => {});
+      .catch((err) => {
+        // Network failure / temporary server hiccup: retain active session with cached profile
+        console.warn('[Auth] Could not reach server for session validation, retaining local session:', err);
+      });
   }, []);
 
-  const [currentView, setCurrentView] = useState<string>('landing');
+  const [currentView, setCurrentView] = useState<string>(() => {
+    const token = localStorage.getItem('smart_interview_token');
+    const savedView = localStorage.getItem('smart_interview_view');
+    if (token) {
+      // If user has a valid active token, restore their previous view or default to dashboard
+      if (savedView && !['landing', 'auth', 'login', 'signup', 'forgot-password'].includes(savedView)) {
+        return savedView;
+      }
+      return 'dashboard';
+    }
+    // If not authenticated, allow public informational views or default to landing
+    if (savedView && ['contact', 'project-insights'].includes(savedView)) {
+      return savedView;
+    }
+    return 'landing';
+  });
   const [selectedReportId, setSelectedReportId] = useState<string | null>('rep_001');
   const [pastSessions, setPastSessions] = useState<InterviewSession[]>(() => {
     return safeJsonParse<InterviewSession[]>('smart_interview_sessions', DEMO_PAST_SESSIONS);
@@ -223,6 +241,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     localStorage.setItem('smart_interview_roles', JSON.stringify(jobRolesCatalog));
   }, [jobRolesCatalog]);
 
+  // Persist current active view so user stays on the same page across page refreshes
+  useEffect(() => {
+    if (currentView) {
+      localStorage.setItem('smart_interview_view', currentView);
+    }
+  }, [currentView]);
+
   // Dynamic ML Readiness recalculation when past interviews change
   useEffect(() => {
     const features = extractUserFeatures(pastSessions);
@@ -267,6 +292,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     if (data.token) {
       localStorage.setItem('smart_interview_token', data.token);
+      localStorage.setItem('smart_interview_view', 'dashboard');
       setAuthToken(data.token);
       setIsAuthenticated(true);
     }
@@ -298,6 +324,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     if (data.token) {
       localStorage.setItem('smart_interview_token', data.token);
+      localStorage.setItem('smart_interview_view', 'dashboard');
       setAuthToken(data.token);
       setIsAuthenticated(true);
     }
@@ -315,6 +342,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
     localStorage.removeItem('smart_interview_token');
     localStorage.removeItem('smart_interview_user');
+    localStorage.removeItem('smart_interview_view');
     setAuthToken(null);
     setIsAuthenticated(false);
     setUser(INITIAL_USER);

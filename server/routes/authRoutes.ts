@@ -239,7 +239,10 @@ router.post('/login', authRateLimiter, async (req: Request, res: Response) => {
  */
 router.get('/me', authenticateToken, async (req: Request, res: Response) => {
   try {
-    const user = await UserService.findById(req.user?.userId || '');
+    let user = await UserService.findById(req.user?.userId || '');
+    if (!user && req.user?.email) {
+      user = await UserService.findByEmail(req.user.email);
+    }
     if (!user) {
       return res.status(404).json({
         success: false,

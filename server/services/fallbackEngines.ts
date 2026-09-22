@@ -302,7 +302,7 @@ export function evaluateFallbackAnswer(
   const words = trimmed.split(/\s+/).filter(Boolean);
   const wordCount = words.length;
 
-  const bScore = behaviorTelemetry?.overallBehaviorScore ?? 82;
+  const bScore = behaviorTelemetry ? behaviorTelemetry.overallBehaviorScore : 0;
 
   // 1. Detect empty, gibberish or obvious evasion / refusal / ignorance
   const evasionPhrases = [
@@ -439,14 +439,14 @@ export function generateFallbackReport(session: any, course: string, role: strin
 
   const bTelemetries = questions.map((q: any) => q.behaviorTelemetry || q.evaluation?.behavior_telemetry).filter(Boolean);
   const avgEye = bTelemetries.length > 0
-    ? Math.round(bTelemetries.reduce((acc: number, t: any) => acc + (t.eyeContactScore || 85), 0) / bTelemetries.length)
-    : 85;
+    ? Math.round(bTelemetries.reduce((acc: number, t: any) => acc + (t.eyeContactScore ?? 0), 0) / bTelemetries.length)
+    : 0;
   const avgStability = bTelemetries.length > 0
-    ? Math.round(bTelemetries.reduce((acc: number, t: any) => acc + (t.postureStabilityScore || 88), 0) / bTelemetries.length)
-    : 88;
+    ? Math.round(bTelemetries.reduce((acc: number, t: any) => acc + (t.postureStabilityScore ?? 0), 0) / bTelemetries.length)
+    : 0;
   const avgComposure = bTelemetries.length > 0
-    ? Math.round(bTelemetries.reduce((acc: number, t: any) => acc + (t.facialComposureScore || 86), 0) / bTelemetries.length)
-    : 86;
+    ? Math.round(bTelemetries.reduce((acc: number, t: any) => acc + (t.facialComposureScore ?? 0), 0) / bTelemetries.length)
+    : 0;
   const overallBehavior = Math.round(avgEye * 0.4 + avgStability * 0.3 + avgComposure * 0.3);
 
   return {
@@ -465,7 +465,9 @@ export function generateFallbackReport(session: any, course: string, role: strin
     eyeContactAverage: avgEye,
     postureStabilityAverage: avgStability,
     composureAverage: avgComposure,
-    behaviorSummary: `Candidate maintained an average eye contact score of ${avgEye}%, posture stability of ${avgStability}%, and facial composure of ${avgComposure}%. Non-verbal composure demonstrated poise and focus.`,
+    behaviorSummary: bTelemetries.length > 0
+      ? `Candidate maintained an average eye contact score of ${avgEye}%, posture stability of ${avgStability}%, and facial composure of ${avgComposure}%. Non-verbal composure demonstrated poise and focus.`
+      : `Camera telemetry was not recorded during this interview session; non-verbal behavioral metrics unrecorded.`,
     nonVerbalRecommendations: [
       'Maintain direct eye contact with the webcam when articulating the key takeaway.',
       'Adopt an open, upright seated posture to project executive presence.',

@@ -105,7 +105,7 @@ export async function evaluateAIAnswer(params: {
     const wordCount = words.length;
 
     const bTelemetry = params.behaviorTelemetry;
-    const behaviorScore = bTelemetry?.overallBehaviorScore ?? 82;
+    const behaviorScore = bTelemetry ? bTelemetry.overallBehaviorScore : 0;
 
     const isEvasive = ['dont know', "don't know", 'idk', 'no idea', 'pata nahi', 'galat', 'skip', 'wrong', 'xyz', 'test', 'banana'].some(
       (p) => lower === p || lower.includes(p)
@@ -191,14 +191,14 @@ export async function analyzeFullInterview(params: {
     // Calculate behavioral metrics from questions
     const telemetries = questions.map((q) => q.behaviorTelemetry).filter(Boolean) as BehaviorTelemetry[];
     const avgEye = telemetries.length > 0
-      ? Math.round(telemetries.reduce((acc, t) => acc + t.eyeContactScore, 0) / telemetries.length)
-      : 84;
+      ? Math.round(telemetries.reduce((acc, t) => acc + (t.eyeContactScore ?? 0), 0) / telemetries.length)
+      : 0;
     const avgStability = telemetries.length > 0
-      ? Math.round(telemetries.reduce((acc, t) => acc + t.postureStabilityScore, 0) / telemetries.length)
-      : 88;
+      ? Math.round(telemetries.reduce((acc, t) => acc + (t.postureStabilityScore ?? 0), 0) / telemetries.length)
+      : 0;
     const avgComposure = telemetries.length > 0
-      ? Math.round(telemetries.reduce((acc, t) => acc + t.facialComposureScore, 0) / telemetries.length)
-      : 86;
+      ? Math.round(telemetries.reduce((acc, t) => acc + (t.facialComposureScore ?? 0), 0) / telemetries.length)
+      : 0;
     const overallBehavior = Math.round(avgEye * 0.4 + avgStability * 0.3 + avgComposure * 0.3);
 
     return {
@@ -212,7 +212,9 @@ export async function analyzeFullInterview(params: {
       eyeContactAverage: avgEye,
       postureStabilityAverage: avgStability,
       composureAverage: avgComposure,
-      behaviorSummary: `Candidate maintained an average eye contact score of ${avgEye}%, posture stability of ${avgStability}%, and facial composure of ${avgComposure}%. Non-verbal presence projected professionalism and focus.`,
+      behaviorSummary: telemetries.length > 0
+        ? `Candidate maintained an average eye contact score of ${avgEye}%, posture stability of ${avgStability}%, and facial composure of ${avgComposure}%. Non-verbal presence projected professionalism and focus.`
+        : `Camera monitoring was not active for this session; non-verbal behavioral metrics are unrecorded.`,
       nonVerbalRecommendations: [
         'Maintain direct eye contact with the camera lens when presenting key conclusions.',
         'Keep upper body posture open and relaxed to project executive presence.',

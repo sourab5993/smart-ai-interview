@@ -12,7 +12,8 @@ import {
   ExternalLink,
   Shield,
   Sliders,
-  Mail
+  Mail,
+  ArrowRight
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 
@@ -29,7 +30,8 @@ export const Navbar: React.FC<NavbarProps> = ({ isLanding = false }) => {
     markAllNotificationsRead,
     globalSearchQuery,
     setGlobalSearchQuery,
-    logout 
+    logout,
+    isAuthenticated
   } = useApp();
 
   const [showNotifMenu, setShowNotifMenu] = useState(false);
@@ -85,21 +87,43 @@ export const Navbar: React.FC<NavbarProps> = ({ isLanding = false }) => {
 
           {/* CTA Buttons */}
           <div className="flex items-center gap-3">
-            <button
-              onClick={() => setCurrentView('login')}
-              className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-300 hover:text-white hover:bg-slate-800/80 transition-all cursor-pointer"
-              id="nav-btn-signin"
-            >
-              Sign In
-            </button>
-            <button
-              onClick={() => setCurrentView('signup')}
-              className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white text-xs font-bold shadow-md shadow-cyan-500/25 transition-all transform active:scale-95 cursor-pointer"
-              id="nav-btn-getstarted"
-            >
-              <span>Get Started</span>
-              <Sparkles className="w-3.5 h-3.5" />
-            </button>
+            {isAuthenticated ? (
+              <>
+                <button
+                  onClick={() => setCurrentView('dashboard')}
+                  className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white text-xs font-bold shadow-md shadow-cyan-500/25 transition-all transform active:scale-95 cursor-pointer"
+                  id="nav-btn-dashboard"
+                >
+                  <span>Go to Dashboard</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  onClick={() => logout()}
+                  className="px-3.5 py-2 rounded-xl text-xs font-semibold text-rose-400 hover:text-rose-300 hover:bg-rose-950/30 transition-all cursor-pointer"
+                  id="nav-btn-logout"
+                >
+                  Sign Out
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  onClick={() => setCurrentView('login')}
+                  className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-300 hover:text-white hover:bg-slate-800/80 transition-all cursor-pointer"
+                  id="nav-btn-signin"
+                >
+                  Sign In
+                </button>
+                <button
+                  onClick={() => setCurrentView('signup')}
+                  className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white text-xs font-bold shadow-md shadow-cyan-500/25 transition-all transform active:scale-95 cursor-pointer"
+                  id="nav-btn-getstarted"
+                >
+                  <span>Get Started</span>
+                  <Sparkles className="w-3.5 h-3.5" />
+                </button>
+              </>
+            )}
           </div>
         </div>
       </header>

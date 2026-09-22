@@ -226,7 +226,7 @@ function wrapUserWithMethods(userData: any): any {
 export const UserService = {
   async findByEmail(email: string): Promise<any> {
     const normalized = email.trim().toLowerCase();
-    if (mongoose.connection.readyState === 1) {
+    if (mongoose.connection.readyState === 1 || mongoose.connection.readyState === 2) {
       try {
         const user = await User.findOne({ email: normalized }).select('+passwordHash');
         if (user) return user;
@@ -239,10 +239,12 @@ export const UserService = {
   },
 
   async findById(id: string): Promise<any> {
-    if (mongoose.connection.readyState === 1) {
+    if (mongoose.connection.readyState === 1 || mongoose.connection.readyState === 2) {
       try {
-        const user = await User.findById(id);
-        if (user) return user;
+        if (mongoose.isValidObjectId(id)) {
+          const user = await User.findById(id);
+          if (user) return user;
+        }
       } catch (err) {
         // Fallback to memory store if query fails
       }

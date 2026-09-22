@@ -349,18 +349,20 @@ export const ReportView: React.FC = () => {
                 <Eye className="w-3.5 h-3.5 text-cyan-400" />
                 Eye Contact & Focus
               </span>
-              <span className="font-mono font-bold text-cyan-300">{report.eyeContactAverage ?? 86}%</span>
+              <span className="font-mono font-bold text-cyan-300">{report.eyeContactAverage ?? 0}%</span>
             </div>
             <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
               <div
                 className="h-full bg-gradient-to-r from-cyan-500 to-blue-500 rounded-full transition-all"
-                style={{ width: `${report.eyeContactAverage ?? 86}%` }}
+                style={{ width: `${report.eyeContactAverage ?? 0}%` }}
               />
             </div>
             <p className="text-[10px] text-slate-400">
-              {(report.eyeContactAverage ?? 86) >= 80
+              {(report.eyeContactAverage ?? 0) === 0
+                ? 'No direct eye contact detected. Ensure eyes are clearly visible in the camera frame.'
+                : (report.eyeContactAverage ?? 0) >= 80
                 ? 'Strong direct gaze towards the interviewer.'
-                : 'Occasional downward glances; focus on camera lens.'}
+                : 'Occasional downward or sideways glances; focus on camera lens.'}
             </p>
           </div>
 
@@ -438,7 +440,7 @@ export const ReportView: React.FC = () => {
             </div>
             <p className="text-xs text-slate-300 leading-relaxed">
               {report.behaviorSummary ||
-                `Candidate maintained an average eye contact score of ${report.eyeContactAverage ?? 86}%, posture stability of ${report.postureStabilityAverage ?? 88}%, and facial composure of ${report.composureAverage ?? 85}%. Non-verbal presence projected professionalism and focus.`}
+                `Candidate maintained an average eye contact score of ${report.eyeContactAverage ?? 0}%, posture stability of ${report.postureStabilityAverage ?? 0}%, and facial composure of ${report.composureAverage ?? 0}%. Non-verbal presence projected professionalism and focus.`}
             </p>
           </div>
 

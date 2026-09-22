@@ -1678,9 +1678,7 @@ function generateFallbackQuestions(course, specialization, role, difficulty, typ
 function evaluateFallbackAnswer(question, userAnswer, course, role, type, behaviorTelemetry) {
   const trimmed = (userAnswer || "").trim();
   const lowerAns = trimmed.toLowerCase();
-  const words = trimmed.split(/\s+/).filter(Boolean);
-  const wordCount = words.length;
-  const bScore = behaviorTelemetry?.overallBehaviorScore ?? 82;
+  const bScore = behaviorTelemetry ? behaviorTelemetry.overallBehaviorScore : 0;
   const evasionPhrases = [
     "dont know",
     "don't know",
@@ -1836,13 +1834,13 @@ function generateFallbackReport(session, course, role) {
   const scores = questions.map((q) => q.evaluation?.overall_score || 80);
   const avg = scores.length > 0 ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 82;
   const bTelemetries = questions.map((q) => q.behaviorTelemetry || q.evaluation?.behavior_telemetry).filter(Boolean);
-  const avgEye = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.eyeContactScore || 85), 0) / bTelemetries.length) : 85;
-  const avgStability = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.postureStabilityScore || 88), 0) / bTelemetries.length) : 88;
-  const avgComposure = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.facialComposureScore || 86), 0) / bTelemetries.length) : 86;
+  const avgEye = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.eyeContactScore ?? 0), 0) / bTelemetries.length) : 0;
+  const avgStability = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.postureStabilityScore ?? 0), 0) / bTelemetries.length) : 0;
+  const avgComposure = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.facialComposureScore ?? 0), 0) / bTelemetries.length) : 0;
   const overallBehavior = Math.round(avgEye * 0.4 + avgStability * 0.3 + avgComposure * 0.3);
   return {
     overallScore: avg,
-    performanceLabel: avg >= 85 ? "Strong Placement-Ready Performance" : avg >= 75 ? "Solid Foundation \u2014 Ready with Minor Polish" : "Developing Baseline",
+    performanceLabel: avg >= 85 ? "Strong Placement-Ready Performance" : avg >= 75 ? "Solid Foundation — Ready with Minor Polish" : "Developing Baseline",
     technicalScore: Math.min(95, avg + 2),
     communicationScore: Math.min(92, avg - 1),
     problemSolvingScore: Math.min(94, avg + 1),
@@ -1856,7 +1854,9 @@ function generateFallbackReport(session, course, role) {
     eyeContactAverage: avgEye,
     postureStabilityAverage: avgStability,
     composureAverage: avgComposure,
-    behaviorSummary: `Candidate maintained an average eye contact score of ${avgEye}%, posture stability of ${avgStability}%, and facial composure of ${avgComposure}%. Non-verbal composure demonstrated poise and focus.`,
+    behaviorSummary: bTelemetries.length > 0
+      ? `Candidate maintained an average eye contact score of ${avgEye}%, posture stability of ${avgStability}%, and facial composure of ${avgComposure}%. Non-verbal composure demonstrated poise and focus.`
+      : `Camera telemetry was not recorded during this interview session; non-verbal metrics unrecorded.`,
     nonVerbalRecommendations: [
       "Maintain direct eye contact with the webcam when articulating the key takeaway.",
       "Adopt an open, upright seated posture to project executive presence.",
@@ -2154,9 +2154,16 @@ Return ONLY a valid JSON object matching this schema:
       evaluation = match ? JSON.parse(match[0]) : evaluateFallbackAnswer(question, userAnswer, course, role, type, behaviorTelemetry);
     }
     if (evaluation) {
-      evaluation.behavior_score = evaluation.behavior_score ?? behaviorTelemetry?.overallBehaviorScore ?? 82;
-      evaluation.behavior_telemetry = behaviorTelemetry;
-      evaluation.non_verbal_feedback = evaluation.non_verbal_feedback || behaviorTelemetry?.behaviorNotes?.join(" ") || "Maintained natural non-verbal composure and consistent engagement.";
+      if (behaviorTelemetry) {
+        evaluation.behavior_score = behaviorTelemetry.overallBehaviorScore;
+        evaluation.behavior_telemetry = behaviorTelemetry;
+        if (behaviorTelemetry.behaviorNotes && behaviorTelemetry.behaviorNotes.length > 0) {
+          evaluation.non_verbal_feedback = behaviorTelemetry.behaviorNotes.join(" ");
+        }
+      } else {
+        evaluation.behavior_score = evaluation.behavior_score ?? 0;
+        evaluation.non_verbal_feedback = evaluation.non_verbal_feedback || "Webcam monitoring was inactive during this answer.";
+      }
     }
     return res.json({ success: true, evaluation, source: modelUsed });
   } catch (error) {
@@ -2229,24 +2236,26 @@ Provide a comprehensive, senior-level post-interview synthesis JSON tailored to 
       report = match ? JSON.parse(match[0]) : generateFallbackReport(session, course, role);
     }
     const bTelemetries = (session.questions || []).map((q) => q.behaviorTelemetry || q.evaluation?.behavior_telemetry).filter(Boolean);
-    const avgEye = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.eyeContactScore || 85), 0) / bTelemetries.length) : 85;
-    const avgStab = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.postureStabilityScore || 88), 0) / bTelemetries.length) : 88;
-    const avgComp = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.facialComposureScore || 86), 0) / bTelemetries.length) : 86;
+    const avgEye = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.eyeContactScore ?? 0), 0) / bTelemetries.length) : 0;
+    const avgStab = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.postureStabilityScore ?? 0), 0) / bTelemetries.length) : 0;
+    const avgComp = bTelemetries.length > 0 ? Math.round(bTelemetries.reduce((acc, t) => acc + (t.facialComposureScore ?? 0), 0) / bTelemetries.length) : 0;
     const compositeBehavior = Math.round(avgEye * 0.4 + avgStab * 0.3 + avgComp * 0.3);
-    if (!report.behaviorScore) {
+    if (report.behaviorScore === undefined || report.behaviorScore === null) {
       report.behaviorScore = compositeBehavior;
     }
-    if (!report.eyeContactAverage) {
+    if (report.eyeContactAverage === undefined || report.eyeContactAverage === null) {
       report.eyeContactAverage = avgEye;
     }
-    if (!report.postureStabilityAverage) {
+    if (report.postureStabilityAverage === undefined || report.postureStabilityAverage === null) {
       report.postureStabilityAverage = avgStab;
     }
-    if (!report.composureAverage) {
+    if (report.composureAverage === undefined || report.composureAverage === null) {
       report.composureAverage = avgComp;
     }
     if (!report.behaviorSummary) {
-      report.behaviorSummary = `Candidate maintained an average eye contact score of ${avgEye}%, posture stability of ${avgStab}%, and facial composure of ${avgComp}%. Non-verbal presence was composed and focused.`;
+      report.behaviorSummary = bTelemetries.length > 0
+        ? `Candidate maintained an average eye contact score of ${avgEye}%, posture stability of ${avgStab}%, and facial composure of ${avgComp}%. Non-verbal presence was composed and focused.`
+        : `Camera telemetry was not recorded during this interview session; non-verbal metrics unrecorded.`;
     }
     if (!report.nonVerbalRecommendations || report.nonVerbalRecommendations.length === 0) {
       report.nonVerbalRecommendations = [

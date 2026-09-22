@@ -196,12 +196,18 @@ export const LandingView: React.FC = () => {
 
                 <button
                   type="button"
-                  onClick={() => setCurrentView('login')}
+                  onClick={() => {
+                    if (isAuthenticated) {
+                      setCurrentView('dashboard');
+                    } else {
+                      setCurrentView('login');
+                    }
+                  }}
                   className="w-full sm:w-auto flex items-center justify-center gap-2 px-6 py-3.5 rounded-xl bg-slate-900/90 hover:bg-slate-800 border border-slate-800 text-slate-200 font-semibold text-sm transition-all cursor-pointer"
                   id="hero-btn-explore-demo"
                 >
                   <Sparkles className="w-4 h-4 text-cyan-400" />
-                  <span>Explore Live Demo</span>
+                  <span>{isAuthenticated ? 'Open Dashboard' : 'Explore Live Demo'}</span>
                 </button>
               </div>
 
@@ -420,7 +426,11 @@ export const LandingView: React.FC = () => {
               <div
                 key={role.id}
                 onClick={() => {
-                  setCurrentView('login');
+                  if (isAuthenticated) {
+                    setCurrentView('practice');
+                  } else {
+                    setCurrentView('login');
+                  }
                 }}
                 className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 hover:border-cyan-500/40 hover:bg-slate-800/70 transition-all cursor-pointer group"
               >
