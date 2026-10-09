@@ -4,7 +4,10 @@ import bcrypt from 'bcryptjs';
 export interface IUser extends Document {
   name: string;
   email: string;
-  passwordHash: string;
+  passwordHash?: string;
+  authProvider?: 'local' | 'google';
+  googleId?: string;
+  isVerified?: boolean;
   role: 'Candidate' | 'Admin' | 'Interviewer';
   isAdmin: boolean;
   avatar?: string;
@@ -56,8 +59,22 @@ const UserSchema = new Schema<IUser>(
     },
     passwordHash: {
       type: String,
-      required: [true, 'Password hash is required'],
+      required: false,
       select: false, // Do not return by default in queries
+    },
+    authProvider: {
+      type: String,
+      enum: ['local', 'google'],
+      default: 'local',
+    },
+    googleId: {
+      type: String,
+      sparse: true,
+      index: true,
+    },
+    isVerified: {
+      type: Boolean,
+      default: false,
     },
     role: {
       type: String,
@@ -210,6 +227,8 @@ function wrapUserWithMethods(userData: any): any {
   const user = { ...userData };
   user._id = user._id || new mongoose.Types.ObjectId();
   user.id = user._id.toString();
+  user.isVerified = user.isVerified !== undefined ? Boolean(user.isVerified) : true;
+  user.authProvider = user.authProvider || 'local';
   user.comparePassword = async (candidatePassword: string) => {
     if (!user.passwordHash) return false;
     return bcrypt.compare(candidatePassword, user.passwordHash);

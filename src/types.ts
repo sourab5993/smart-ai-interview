@@ -96,6 +96,8 @@ export interface UserProfile {
   currentStreak: number;
   createdAt: string;
   isAdmin?: boolean;
+  authProvider?: 'local' | 'google';
+  isVerified?: boolean;
 }
 
 export interface SkillItem {

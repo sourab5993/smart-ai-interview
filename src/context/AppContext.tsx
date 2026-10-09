@@ -67,6 +67,9 @@ interface AppContextType {
   // Actions
   login: (email?: string, passwordOrAsAdmin?: string | boolean) => Promise<any>;
   register: (name: string, email: string, password: string, targetRole?: string) => Promise<any>;
+  sendOtp: (email: string) => Promise<{ success: boolean; message: string; devOtp?: string; expiresInSeconds?: number; deliveryMode?: string }>;
+  verifyOtpAndRegister: (data: { email: string; otp: string; name: string; password: string; targetRole?: string }) => Promise<any>;
+  loginWithGoogle: (credential: string, targetRole?: string) => Promise<any>;
   logout: () => void;
   updateProfile: (profile: Partial<UserProfile>) => void;
   changeUserCourse: (courseId: string, specialization?: string, targetRoleId?: string) => void;
@@ -320,6 +323,98 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     if (!res.ok || !data.success) {
       throw new Error(data.message || 'Registration failed');
+    }
+
+    if (data.token) {
+      localStorage.setItem('smart_interview_token', data.token);
+      localStorage.setItem('smart_interview_view', 'dashboard');
+      setAuthToken(data.token);
+      setIsAuthenticated(true);
+    }
+    if (data.user) {
+      setUser((prev) => ({ ...prev, ...data.user }));
+    }
+    setCurrentView('dashboard');
+    return data;
+  };
+
+  const sendOtp = async (email: string) => {
+    const res = await fetch('/api/auth/send-otp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    });
+
+    const responseText = await res.text();
+    let data: any = {};
+    try {
+      data = JSON.parse(responseText);
+    } catch {
+      throw new Error(`Server returned status ${res.status}: ${responseText.slice(0, 120)}`);
+    }
+
+    if (!res.ok || !data.success) {
+      throw new Error(data.message || 'Failed to send verification code');
+    }
+
+    return data;
+  };
+
+  const verifyOtpAndRegister = async (payload: {
+    name: string;
+    email: string;
+    otp: string;
+    password: string;
+    targetRole?: string;
+  }) => {
+    const res = await fetch('/api/auth/verify-otp-and-register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    const responseText = await res.text();
+    let data: any = {};
+    try {
+      data = JSON.parse(responseText);
+    } catch {
+      throw new Error(`Server returned status ${res.status}: ${responseText.slice(0, 120)}`);
+    }
+
+    if (!res.ok || !data.success) {
+      throw new Error(data.message || 'OTP verification failed');
+    }
+
+    if (data.token) {
+      localStorage.setItem('smart_interview_token', data.token);
+      localStorage.setItem('smart_interview_view', 'dashboard');
+      setAuthToken(data.token);
+      setIsAuthenticated(true);
+    }
+    if (data.user) {
+      setUser((prev) => ({ ...prev, ...data.user }));
+    }
+    setCurrentView('dashboard');
+    return data;
+  };
+
+  const loginWithGoogle = async (credential: string, targetRole?: string) => {
+    const res = await fetch('/api/auth/google', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ credential, targetRole }),
+    });
+
+    const responseText = await res.text();
+    let data: any = {};
+    try {
+      data = JSON.parse(responseText);
+    } catch {
+      throw new Error(`Server returned status ${res.status}: ${responseText.slice(0, 120)}`);
+    }
+
+    if (!res.ok || !data.success) {
+      throw new Error(data.message || 'Google authentication failed');
     }
 
     if (data.token) {
@@ -835,6 +930,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         isAuthenticated,
         login,
         register,
+        sendOtp,
+        verifyOtpAndRegister,
+        loginWithGoogle,
         logout,
         updateProfile,
         changeUserCourse,

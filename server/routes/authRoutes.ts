@@ -9,6 +9,8 @@ import {
   JWT_EXPIRES_IN,
   AuthenticatedUserPayload,
 } from '../middleware/authMiddleware';
+import { EmailVerificationService } from '../services/emailVerificationService';
+import { GoogleAuthService } from '../services/googleAuthService';
 
 const router = Router();
 
@@ -48,7 +50,259 @@ function generateToken(user: any): string {
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /**
- * 1. REGISTER NEW USER
+ * 0A. SEND EMAIL VERIFICATION OTP
+ * POST /api/auth/send-otp
+ * Verifies email syntax + disposable domain + DNS MX records, then dispatches 6-digit OTP
+ */
+router.post('/send-otp', authRateLimiter, async (req: Request, res: Response) => {
+  try {
+    const { email } = req.body;
+
+    if (!email || typeof email !== 'string' || !email.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide a valid email address.',
+      });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    // 1. Strict syntax check
+    if (!EmailVerificationService.isValidEmailFormat(normalizedEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid email address format. Please enter a genuine email.',
+      });
+    }
+
+    // 2. Reject disposable / burner email domains
+    if (EmailVerificationService.isDisposableDomain(normalizedEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Temporary or disposable email addresses are not permitted. Please use your real email.',
+      });
+    }
+
+    // 3. Verify DNS MX records on the internet to ensure domain actually exists & receives mail
+    const domainCheck = await EmailVerificationService.verifyDomainMx(normalizedEmail);
+    if (!domainCheck.valid) {
+      return res.status(400).json({
+        success: false,
+        message: domainCheck.reason || 'This email domain does not exist or cannot receive mail.',
+      });
+    }
+
+    // 4. Duplicate check in database
+    const existingUser = await UserService.findByEmail(normalizedEmail);
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        message: 'An account with this email address already exists. Please sign in instead.',
+      });
+    }
+
+    // 5. Send secure 6-digit OTP
+    const result = await EmailVerificationService.sendVerificationOtp(normalizedEmail);
+
+    return res.status(200).json({
+      success: true,
+      message: result.message,
+      expiresInSeconds: result.expiresInSeconds,
+      devOtp: result.devOtp,
+      deliveryMode: result.deliveryMode,
+    });
+  } catch (error: any) {
+    console.error('[Auth Service] Send OTP error:', error?.message);
+    return res.status(400).json({
+      success: false,
+      message: error?.message || 'Unable to send verification code. Please check your email and try again.',
+    });
+  }
+});
+
+/**
+ * 0B. VERIFY OTP AND COMPLETE REGISTRATION
+ * POST /api/auth/verify-otp-and-register
+ */
+router.post('/verify-otp-and-register', authRateLimiter, async (req: Request, res: Response) => {
+  try {
+    const {
+      email,
+      otp,
+      name,
+      password,
+      role = 'Candidate',
+      degree,
+      courseCategory,
+      specialization,
+      targetRole,
+      skills,
+    } = req.body;
+
+    if (!email || !otp) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email address and verification code are required.',
+      });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    // 1. Verify OTP code
+    const otpResult = EmailVerificationService.verifyOtp(normalizedEmail, otp);
+    if (!otpResult.success) {
+      return res.status(400).json({
+        success: false,
+        message: otpResult.message || 'Invalid or expired verification code.',
+      });
+    }
+
+    // 2. Validate password
+    if (!password || typeof password !== 'string' || password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 6 characters long.',
+      });
+    }
+
+    // 3. Ensure account does not already exist
+    const existingUser = await UserService.findByEmail(normalizedEmail);
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        message: 'An account with this email address already exists.',
+      });
+    }
+
+    // 4. Bcrypt password hashing
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(password, salt);
+
+    const candidateName =
+      name && typeof name === 'string' && name.trim()
+        ? name.trim()
+        : normalizedEmail.split('@')[0].replace('.', ' ');
+
+    const isAdmin = Boolean(normalizedEmail === 'sourabstar786@gmail.com');
+
+    // 5. Create verified user
+    const savedUser = await UserService.create({
+      name: candidateName,
+      email: normalizedEmail,
+      passwordHash,
+      authProvider: 'local',
+      isVerified: true,
+      role: isAdmin ? 'Admin' : 'Candidate',
+      isAdmin,
+      degree: degree || 'B.Tech',
+      courseCategory: courseCategory || 'Engineering & Technology',
+      specialization: specialization || 'Computer Science & Engineering',
+      targetRole: targetRole || 'Full Stack Developer',
+      skills: Array.isArray(skills) && skills.length > 0 ? skills : undefined,
+    });
+
+    const token = generateToken(savedUser);
+
+    return res.status(201).json({
+      success: true,
+      message: 'Account verified and registered successfully.',
+      token,
+      user: savedUser.toSafeJSON(),
+    });
+  } catch (error: any) {
+    console.error('[Auth Service] OTP Registration error:', error?.message);
+    return res.status(500).json({
+      success: false,
+      message: 'An error occurred during account verification. Please try again.',
+      error: error?.message,
+    });
+  }
+});
+
+/**
+ * 0C. GOOGLE OAUTH LOGIN & REGISTRATION
+ * POST /api/auth/google
+ * Verifies real Google account via Google's cryptographically signed ID token
+ */
+router.post('/google', authRateLimiter, async (req: Request, res: Response) => {
+  try {
+    const { credential, targetRole, degree, specialization } = req.body;
+
+    if (!credential || typeof credential !== 'string') {
+      return res.status(400).json({
+        success: false,
+        message: 'Google identity credential token is required.',
+      });
+    }
+
+    // 1. Verify ID token with Google
+    const googleUser = await GoogleAuthService.verifyGoogleIdToken(credential);
+
+    const normalizedEmail = googleUser.email.toLowerCase().trim();
+    const isAdmin = Boolean(normalizedEmail === 'sourabstar786@gmail.com');
+
+    // 2. Check if user already exists
+    let user = await UserService.findByEmail(normalizedEmail);
+
+    if (user) {
+      // Existing user: Link Google ID, update profile image, ensure isVerified is true
+      const updates: any = {
+        isVerified: true,
+        authProvider: user.authProvider || 'google',
+      };
+      if (googleUser.avatar && !user.avatar) {
+        updates.avatar = googleUser.avatar;
+      }
+      if (googleUser.googleId) {
+        updates.googleId = googleUser.googleId;
+      }
+
+      const updatedUser = await UserService.updateById(user._id || user.id, updates);
+      const token = generateToken(updatedUser || user);
+
+      return res.status(200).json({
+        success: true,
+        message: `Welcome back, ${googleUser.name}! Signed in via Google.`,
+        token,
+        user: (updatedUser || user).toSafeJSON(),
+      });
+    }
+
+    // 3. New candidate signing in via Google: Auto-create verified profile
+    const savedUser = await UserService.create({
+      name: googleUser.name,
+      email: normalizedEmail,
+      googleId: googleUser.googleId,
+      avatar: googleUser.avatar || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
+      authProvider: 'google',
+      isVerified: true,
+      role: isAdmin ? 'Admin' : 'Candidate',
+      isAdmin,
+      degree: degree || 'B.Tech',
+      courseCategory: 'Engineering & Technology',
+      specialization: specialization || 'Computer Science & Engineering',
+      targetRole: targetRole || 'Full Stack Developer',
+    });
+
+    const token = generateToken(savedUser);
+
+    return res.status(201).json({
+      success: true,
+      message: `Account created successfully with verified Google account: ${normalizedEmail}`,
+      token,
+      user: savedUser.toSafeJSON(),
+    });
+  } catch (error: any) {
+    console.error('[Auth Service] Google Sign-In error:', error?.message);
+    return res.status(401).json({
+      success: false,
+      message: error?.message || 'Google authentication failed. Please try again.',
+    });
+  }
+});
+
+/**
+ * 1. REGISTER NEW USER (With Domain & MX Verification)
  * POST /api/auth/register
  */
 router.post('/register', authRateLimiter, async (req: Request, res: Response) => {
@@ -75,10 +329,25 @@ router.post('/register', authRateLimiter, async (req: Request, res: Response) =>
 
     const normalizedEmail = email.trim().toLowerCase();
 
-    if (!EMAIL_REGEX.test(normalizedEmail)) {
+    if (!EmailVerificationService.isValidEmailFormat(normalizedEmail)) {
       return res.status(400).json({
         success: false,
-        message: 'Please enter a valid email address.',
+        message: 'Please enter a valid, real email address.',
+      });
+    }
+
+    if (EmailVerificationService.isDisposableDomain(normalizedEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Disposable or temporary email services are not allowed. Please use your genuine email.',
+      });
+    }
+
+    const domainCheck = await EmailVerificationService.verifyDomainMx(normalizedEmail);
+    if (!domainCheck.valid) {
+      return res.status(400).json({
+        success: false,
+        message: domainCheck.reason || 'This email domain does not exist on the internet.',
       });
     }
 
@@ -122,6 +391,8 @@ router.post('/register', authRateLimiter, async (req: Request, res: Response) =>
       name: candidateName,
       email: normalizedEmail,
       passwordHash,
+      authProvider: 'local',
+      isVerified: true,
       role: isAdmin ? 'Admin' : 'Candidate',
       isAdmin,
       degree: degree || 'B.Tech',
@@ -363,6 +634,8 @@ export async function seedAuthUsers(): Promise<void> {
         name: 'Candidate User',
         email: candidateEmail,
         passwordHash,
+        authProvider: 'local',
+        isVerified: true,
         role: 'Candidate',
         isAdmin: false,
         degree: 'B.Tech',
@@ -386,6 +659,7 @@ export async function seedAuthUsers(): Promise<void> {
         passwordHash,
         role: 'Admin',
         isAdmin: true,
+        isVerified: true,
         name: 'Sourab (Administrator)',
       });
       console.log(`  [Auth Seeder] Synchronized authorized admin: ${adminEmail}`);
@@ -394,6 +668,8 @@ export async function seedAuthUsers(): Promise<void> {
         name: 'Sourab (Administrator)',
         email: adminEmail,
         passwordHash,
+        authProvider: 'local',
+        isVerified: true,
         role: 'Admin',
         isAdmin: true,
         degree: 'B.Tech',

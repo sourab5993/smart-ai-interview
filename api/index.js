@@ -753,9 +753,23 @@ var UserSchema = new Schema2(
     },
     passwordHash: {
       type: String,
-      required: [true, "Password hash is required"],
+      required: false,
       select: false
       // Do not return by default in queries
+    },
+    authProvider: {
+      type: String,
+      enum: ["local", "google"],
+      default: "local"
+    },
+    googleId: {
+      type: String,
+      sparse: true,
+      index: true
+    },
+    isVerified: {
+      type: Boolean,
+      default: false
     },
     role: {
       type: String,
@@ -897,6 +911,8 @@ function wrapUserWithMethods(userData) {
   const user = { ...userData };
   user._id = user._id || new mongoose4.Types.ObjectId();
   user.id = user._id.toString();
+  user.isVerified = user.isVerified !== void 0 ? Boolean(user.isVerified) : true;
+  user.authProvider = user.authProvider || "local";
   user.comparePassword = async (candidatePassword) => {
     if (!user.passwordHash) return false;
     return bcrypt.compare(candidatePassword, user.passwordHash);
@@ -1011,6 +1027,373 @@ var UserService = {
   }
 };
 
+// server/services/emailVerificationService.ts
+import dns from "dns";
+import crypto from "crypto";
+import nodemailer from "nodemailer";
+var DISPOSABLE_EMAIL_DOMAINS = /* @__PURE__ */ new Set([
+  "mailinator.com",
+  "10minutemail.com",
+  "10minutemail.net",
+  "guerrillamail.com",
+  "guerrillamail.net",
+  "guerrillamail.biz",
+  "guerrillamail.org",
+  "tempmail.com",
+  "temp-mail.org",
+  "temp-mail.io",
+  "throwawaymail.com",
+  "sharklasers.com",
+  "getairmail.com",
+  "yopmail.com",
+  "yopmail.net",
+  "yopmail.fr",
+  "dispostable.com",
+  "fakemail.net",
+  "burnermail.io",
+  "nada.ltd",
+  "trashmail.com",
+  "trashmail.net",
+  "trashmail.me",
+  "maildrop.cc",
+  "inboxkitten.com",
+  "crazymailing.com",
+  "mohmal.com",
+  "generator.email",
+  "tempmailaddress.com",
+  "getnada.com",
+  "fakeinbox.com",
+  "mytemp.email",
+  "mytempemail.com",
+  "emailondeck.com",
+  "luxusmail.org",
+  "mailsac.com",
+  "dropmail.me",
+  "minuteinbox.com"
+]);
+var otpStore = /* @__PURE__ */ new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [email, record] of otpStore.entries()) {
+    if (record.expiresAt < now) {
+      otpStore.delete(email);
+    }
+  }
+}, 5 * 60 * 1e3);
+var EmailVerificationService = class {
+  /**
+   * 1. Check if email format is RFC 5322 compliant
+   */
+  static isValidEmailFormat(email) {
+    if (!email || typeof email !== "string") return false;
+    const trimmed = email.trim();
+    if (trimmed.length > 254) return false;
+    const emailRegex = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
+    return emailRegex.test(trimmed);
+  }
+  /**
+   * 2. Check if email domain is a known burner / disposable service
+   */
+  static isDisposableDomain(email) {
+    const domain = email.split("@")[1]?.toLowerCase().trim();
+    if (!domain) return true;
+    return DISPOSABLE_EMAIL_DOMAINS.has(domain);
+  }
+  /**
+   * 3. Check if email domain actually has live Mail Exchange (MX) records
+   * Rejects non-existent domains like @fakexyz12349876.com
+   */
+  static async verifyDomainMx(email) {
+    const domain = email.split("@")[1]?.toLowerCase().trim();
+    if (!domain) {
+      return { valid: false, reason: "Invalid email domain format." };
+    }
+    if (this.isDisposableDomain(email)) {
+      return {
+        valid: false,
+        reason: "Temporary or disposable email addresses are not allowed. Please use your real email."
+      };
+    }
+    try {
+      const records = await dns.promises.resolveMx(domain);
+      if (!records || records.length === 0) {
+        return {
+          valid: false,
+          reason: `The domain "@${domain}" does not appear to have active mail servers to receive emails.`
+        };
+      }
+      return { valid: true };
+    } catch (error) {
+      if (error?.code === "ENOTFOUND" || error?.code === "ENODATA" || error?.code === "SERVFAIL") {
+        return {
+          valid: false,
+          reason: `The domain "@${domain}" does not exist on the internet. Please provide a real email address.`
+        };
+      }
+      console.warn(`[DNS MX Check] Warning checking MX for domain ${domain}:`, error?.message);
+      return { valid: true };
+    }
+  }
+  /**
+   * 4. Generate cryptographically secure 6-digit numeric OTP
+   */
+  static generateOtp() {
+    return crypto.randomInt(1e5, 999999).toString();
+  }
+  /**
+   * 5. Create nodemailer transporter based on environment configuration
+   */
+  static getTransporter() {
+    const smtpHost = process.env.SMTP_HOST;
+    const smtpPort = Number(process.env.SMTP_PORT) || 587;
+    const smtpUser = process.env.SMTP_USER;
+    const smtpPass = process.env.SMTP_PASS;
+    if (smtpUser && smtpPass) {
+      if (smtpHost) {
+        return nodemailer.createTransport({
+          host: smtpHost,
+          port: smtpPort,
+          secure: smtpPort === 465,
+          auth: {
+            user: smtpUser,
+            pass: smtpPass
+          }
+        });
+      } else {
+        return nodemailer.createTransport({
+          service: "gmail",
+          auth: {
+            user: smtpUser,
+            pass: smtpPass
+          }
+        });
+      }
+    }
+    return null;
+  }
+  /**
+   * 6. Generate, store, and dispatch OTP to recipient
+   */
+  static async sendVerificationOtp(email, metadata) {
+    const normalizedEmail = email.toLowerCase().trim();
+    const existing = otpStore.get(normalizedEmail);
+    if (existing && Date.now() - existing.createdAt < 45 * 1e3) {
+      const waitRemaining = Math.ceil((45 * 1e3 - (Date.now() - existing.createdAt)) / 1e3);
+      throw new Error(`Please wait ${waitRemaining} seconds before requesting a new verification code.`);
+    }
+    const otp = this.generateOtp();
+    const expiresInSeconds = 10 * 60;
+    const expiresAt = Date.now() + expiresInSeconds * 1e3;
+    otpStore.set(normalizedEmail, {
+      email: normalizedEmail,
+      otp,
+      expiresAt,
+      attempts: 0,
+      createdAt: Date.now(),
+      metadata
+    });
+    const transporter = this.getTransporter();
+    if (transporter) {
+      try {
+        const senderName = process.env.SMTP_FROM_NAME || "Smart AI Interview Platform";
+        const senderEmail = process.env.SMTP_USER;
+        const htmlContent = `
+          <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 580px; margin: 0 auto; background-color: #020617; color: #f8fafc; border-radius: 16px; overflow: hidden; border: 1px solid #1e293b; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);">
+            <div style="background: linear-gradient(135deg, #0ea5e9, #6366f1); padding: 32px 24px; text-align: center;">
+              <h1 style="margin: 0; font-size: 24px; font-weight: 800; color: #ffffff; letter-spacing: -0.5px;">SMART AI INTERVIEW</h1>
+              <p style="margin: 6px 0 0 0; font-size: 13px; color: rgba(255, 255, 255, 0.9); font-weight: 500;">Email Identity Verification</p>
+            </div>
+            
+            <div style="padding: 32px 28px; background-color: #0f172a;">
+              <p style="font-size: 15px; line-height: 1.6; color: #cbd5e1; margin-top: 0;">Hello Candidate,</p>
+              <p style="font-size: 14px; line-height: 1.6; color: #94a3b8;">
+                You are registering or authenticating an account on the <strong>Smart AI Interview Preparation & Evaluation Platform</strong>.
+                Please enter the following 6-digit verification code to confirm that this real email address belongs to you:
+              </p>
+
+              <div style="margin: 28px 0; text-align: center;">
+                <div style="display: inline-block; background-color: #020617; border: 2px solid #06b6d4; border-radius: 12px; padding: 16px 36px;">
+                  <span style="font-family: monospace; font-size: 34px; font-weight: 800; letter-spacing: 8px; color: #38bdf8;">${otp}</span>
+                </div>
+                <p style="margin-top: 10px; font-size: 12px; color: #64748b;">This code will expire in <strong>10 minutes</strong>.</p>
+              </div>
+
+              <div style="padding: 14px 18px; background-color: rgba(6, 182, 212, 0.08); border-left: 4px solid #06b6d4; border-radius: 6px; margin: 24px 0;">
+                <p style="margin: 0; font-size: 12px; color: #7dd3fc; line-height: 1.5;">
+                  \u{1F512} <strong>Security Warning:</strong> Never share this OTP with anyone. Our administrators will never ask for your verification code.
+                </p>
+              </div>
+
+              <p style="font-size: 12px; color: #64748b; line-height: 1.5; margin-bottom: 0;">
+                If you did not request this verification code, please ignore this email. No account will be created without this verification step.
+              </p>
+            </div>
+
+            <div style="background-color: #020617; padding: 20px 24px; text-align: center; border-top: 1px solid #1e293b; font-size: 11px; color: #475569;">
+              &copy; ${(/* @__PURE__ */ new Date()).getFullYear()} Smart AI Interview Preparation System. All rights reserved.
+            </div>
+          </div>
+        `;
+        await transporter.sendMail({
+          from: `"${senderName}" <${senderEmail}>`,
+          to: normalizedEmail,
+          subject: `${otp} is your Smart AI Interview verification code`,
+          text: `Your Smart AI Interview verification code is: ${otp}. It will expire in 10 minutes.`,
+          html: htmlContent
+        });
+        console.log(`[Email Verification] Successfully dispatched OTP email to ${normalizedEmail}`);
+        return {
+          success: true,
+          message: `Verification code sent to ${normalizedEmail}. Please check your inbox.`,
+          expiresInSeconds,
+          deliveryMode: "smtp"
+        };
+      } catch (err) {
+        console.error("[Email Verification] SMTP Delivery failed:", err?.message || err);
+      }
+    }
+    console.log("\n============================================================");
+    console.log(`[EMAIL VERIFICATION OTP DISPATCHED]`);
+    console.log(`Recipient Email: ${normalizedEmail}`);
+    console.log(`Verification Code (OTP):  \u{1F449}  ${otp}  \u{1F448}`);
+    console.log(`Expires in: 10 minutes`);
+    console.log(`Note: To send to real inboxes, configure SMTP_USER & SMTP_PASS in .env`);
+    console.log("============================================================\n");
+    const isDev = process.env.NODE_ENV !== "production";
+    return {
+      success: true,
+      message: `Verification code generated for ${normalizedEmail}. ${isDev ? "(Development mode: Code logged in terminal)" : "Please check your email."}`,
+      expiresInSeconds,
+      devOtp: isDev ? otp : void 0,
+      deliveryMode: "console_development"
+    };
+  }
+  /**
+   * 7. Validate submitted OTP against store
+   */
+  static verifyOtp(email, submittedOtp) {
+    const normalizedEmail = email.toLowerCase().trim();
+    const record = otpStore.get(normalizedEmail);
+    if (!record) {
+      return {
+        success: false,
+        message: "No active verification code found for this email. Please request a new code."
+      };
+    }
+    if (Date.now() > record.expiresAt) {
+      otpStore.delete(normalizedEmail);
+      return {
+        success: false,
+        message: "Verification code has expired. Please request a new one."
+      };
+    }
+    record.attempts += 1;
+    if (record.attempts > 5) {
+      otpStore.delete(normalizedEmail);
+      return {
+        success: false,
+        message: "Too many incorrect attempts. Please request a new verification code."
+      };
+    }
+    const cleanInputOtp = submittedOtp.trim().replace(/\s+/g, "");
+    if (cleanInputOtp !== record.otp) {
+      const remaining = 5 - record.attempts;
+      return {
+        success: false,
+        message: `Incorrect verification code. ${remaining} attempt${remaining === 1 ? "" : "s"} remaining.`
+      };
+    }
+    const metadata = record.metadata;
+    otpStore.delete(normalizedEmail);
+    return {
+      success: true,
+      metadata
+    };
+  }
+};
+
+// server/services/googleAuthService.ts
+import { OAuth2Client } from "google-auth-library";
+var GoogleAuthService = class {
+  static {
+    this.client = null;
+  }
+  static getClient() {
+    if (!this.client) {
+      const clientId = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || "";
+      this.client = new OAuth2Client(clientId);
+    }
+    return this.client;
+  }
+  /**
+   * Cryptographically verifies Google ID Token either via google-auth-library
+   * or Google's official public tokeninfo API endpoint.
+   */
+  static async verifyGoogleIdToken(idToken) {
+    if (!idToken || typeof idToken !== "string") {
+      throw new Error("Google ID token is required.");
+    }
+    const clientId = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || "";
+    if (clientId) {
+      try {
+        const client = this.getClient();
+        const ticket = await client.verifyIdToken({
+          idToken,
+          audience: clientId
+        });
+        const payload = ticket.getPayload();
+        if (!payload) {
+          throw new Error("Google verification failed: Missing token payload.");
+        }
+        if (!payload.email) {
+          throw new Error("Google account does not have an associated email address.");
+        }
+        if (!payload.email_verified) {
+          throw new Error("This Google email has not been verified by Google. Unverified emails cannot be accepted.");
+        }
+        return {
+          googleId: payload.sub,
+          email: payload.email.toLowerCase().trim(),
+          name: payload.name || payload.email.split("@")[0],
+          avatar: payload.picture,
+          emailVerified: Boolean(payload.email_verified)
+        };
+      } catch (err) {
+        console.warn("[GoogleAuthService] google-auth-library verification notice:", err?.message);
+      }
+    }
+    try {
+      const response = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`);
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(
+          errorData?.error_description || errorData?.error || "Google rejected this identity token as invalid or expired."
+        );
+      }
+      const info = await response.json();
+      if (!info.email) {
+        throw new Error("Google account does not contain a valid email address.");
+      }
+      const isVerified = info.email_verified === "true" || info.email_verified === true;
+      if (!isVerified) {
+        throw new Error("This Google email address is unverified. Only verified real Google accounts are permitted.");
+      }
+      if (clientId && info.aud && info.aud !== clientId) {
+        console.warn(`[GoogleAuthService] Audience mismatch: expected ${clientId}, received ${info.aud}`);
+      }
+      return {
+        googleId: info.sub,
+        email: info.email.toLowerCase().trim(),
+        name: info.name || info.email.split("@")[0],
+        avatar: info.picture,
+        emailVerified: true
+      };
+    } catch (err) {
+      throw new Error(`Google Sign-In failed: ${err?.message || "Invalid Google credential"}`);
+    }
+  }
+};
+
 // server/routes/authRoutes.ts
 var router2 = Router2();
 var authRateLimiter = rateLimit({
@@ -1043,6 +1426,195 @@ function generateToken(user) {
   });
 }
 var EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+router2.post("/send-otp", authRateLimiter, async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email || typeof email !== "string" || !email.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a valid email address."
+      });
+    }
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!EmailVerificationService.isValidEmailFormat(normalizedEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid email address format. Please enter a genuine email."
+      });
+    }
+    if (EmailVerificationService.isDisposableDomain(normalizedEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: "Temporary or disposable email addresses are not permitted. Please use your real email."
+      });
+    }
+    const domainCheck = await EmailVerificationService.verifyDomainMx(normalizedEmail);
+    if (!domainCheck.valid) {
+      return res.status(400).json({
+        success: false,
+        message: domainCheck.reason || "This email domain does not exist or cannot receive mail."
+      });
+    }
+    const existingUser = await UserService.findByEmail(normalizedEmail);
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        message: "An account with this email address already exists. Please sign in instead."
+      });
+    }
+    const result = await EmailVerificationService.sendVerificationOtp(normalizedEmail);
+    return res.status(200).json({
+      success: true,
+      message: result.message,
+      expiresInSeconds: result.expiresInSeconds,
+      devOtp: result.devOtp,
+      deliveryMode: result.deliveryMode
+    });
+  } catch (error) {
+    console.error("[Auth Service] Send OTP error:", error?.message);
+    return res.status(400).json({
+      success: false,
+      message: error?.message || "Unable to send verification code. Please check your email and try again."
+    });
+  }
+});
+router2.post("/verify-otp-and-register", authRateLimiter, async (req, res) => {
+  try {
+    const {
+      email,
+      otp,
+      name,
+      password,
+      role = "Candidate",
+      degree,
+      courseCategory,
+      specialization,
+      targetRole,
+      skills
+    } = req.body;
+    if (!email || !otp) {
+      return res.status(400).json({
+        success: false,
+        message: "Email address and verification code are required."
+      });
+    }
+    const normalizedEmail = email.trim().toLowerCase();
+    const otpResult = EmailVerificationService.verifyOtp(normalizedEmail, otp);
+    if (!otpResult.success) {
+      return res.status(400).json({
+        success: false,
+        message: otpResult.message || "Invalid or expired verification code."
+      });
+    }
+    if (!password || typeof password !== "string" || password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 6 characters long."
+      });
+    }
+    const existingUser = await UserService.findByEmail(normalizedEmail);
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        message: "An account with this email address already exists."
+      });
+    }
+    const salt = await bcrypt2.genSalt(10);
+    const passwordHash = await bcrypt2.hash(password, salt);
+    const candidateName = name && typeof name === "string" && name.trim() ? name.trim() : normalizedEmail.split("@")[0].replace(".", " ");
+    const isAdmin = Boolean(normalizedEmail === "sourabstar786@gmail.com");
+    const savedUser = await UserService.create({
+      name: candidateName,
+      email: normalizedEmail,
+      passwordHash,
+      authProvider: "local",
+      isVerified: true,
+      role: isAdmin ? "Admin" : "Candidate",
+      isAdmin,
+      degree: degree || "B.Tech",
+      courseCategory: courseCategory || "Engineering & Technology",
+      specialization: specialization || "Computer Science & Engineering",
+      targetRole: targetRole || "Full Stack Developer",
+      skills: Array.isArray(skills) && skills.length > 0 ? skills : void 0
+    });
+    const token = generateToken(savedUser);
+    return res.status(201).json({
+      success: true,
+      message: "Account verified and registered successfully.",
+      token,
+      user: savedUser.toSafeJSON()
+    });
+  } catch (error) {
+    console.error("[Auth Service] OTP Registration error:", error?.message);
+    return res.status(500).json({
+      success: false,
+      message: "An error occurred during account verification. Please try again.",
+      error: error?.message
+    });
+  }
+});
+router2.post("/google", authRateLimiter, async (req, res) => {
+  try {
+    const { credential, targetRole, degree, specialization } = req.body;
+    if (!credential || typeof credential !== "string") {
+      return res.status(400).json({
+        success: false,
+        message: "Google identity credential token is required."
+      });
+    }
+    const googleUser = await GoogleAuthService.verifyGoogleIdToken(credential);
+    const normalizedEmail = googleUser.email.toLowerCase().trim();
+    const isAdmin = Boolean(normalizedEmail === "sourabstar786@gmail.com");
+    let user = await UserService.findByEmail(normalizedEmail);
+    if (user) {
+      const updates = {
+        isVerified: true,
+        authProvider: user.authProvider || "google"
+      };
+      if (googleUser.avatar && !user.avatar) {
+        updates.avatar = googleUser.avatar;
+      }
+      if (googleUser.googleId) {
+        updates.googleId = googleUser.googleId;
+      }
+      const updatedUser = await UserService.updateById(user._id || user.id, updates);
+      const token2 = generateToken(updatedUser || user);
+      return res.status(200).json({
+        success: true,
+        message: `Welcome back, ${googleUser.name}! Signed in via Google.`,
+        token: token2,
+        user: (updatedUser || user).toSafeJSON()
+      });
+    }
+    const savedUser = await UserService.create({
+      name: googleUser.name,
+      email: normalizedEmail,
+      googleId: googleUser.googleId,
+      avatar: googleUser.avatar || "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80",
+      authProvider: "google",
+      isVerified: true,
+      role: isAdmin ? "Admin" : "Candidate",
+      isAdmin,
+      degree: degree || "B.Tech",
+      courseCategory: "Engineering & Technology",
+      specialization: specialization || "Computer Science & Engineering",
+      targetRole: targetRole || "Full Stack Developer"
+    });
+    const token = generateToken(savedUser);
+    return res.status(201).json({
+      success: true,
+      message: `Account created successfully with verified Google account: ${normalizedEmail}`,
+      token,
+      user: savedUser.toSafeJSON()
+    });
+  } catch (error) {
+    console.error("[Auth Service] Google Sign-In error:", error?.message);
+    return res.status(401).json({
+      success: false,
+      message: error?.message || "Google authentication failed. Please try again."
+    });
+  }
+});
 router2.post("/register", authRateLimiter, async (req, res) => {
   try {
     const {
@@ -1063,10 +1635,23 @@ router2.post("/register", authRateLimiter, async (req, res) => {
       });
     }
     const normalizedEmail = email.trim().toLowerCase();
-    if (!EMAIL_REGEX.test(normalizedEmail)) {
+    if (!EmailVerificationService.isValidEmailFormat(normalizedEmail)) {
       return res.status(400).json({
         success: false,
-        message: "Please enter a valid email address."
+        message: "Please enter a valid, real email address."
+      });
+    }
+    if (EmailVerificationService.isDisposableDomain(normalizedEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: "Disposable or temporary email services are not allowed. Please use your genuine email."
+      });
+    }
+    const domainCheck = await EmailVerificationService.verifyDomainMx(normalizedEmail);
+    if (!domainCheck.valid) {
+      return res.status(400).json({
+        success: false,
+        message: domainCheck.reason || "This email domain does not exist on the internet."
       });
     }
     if (!password || typeof password !== "string" || !password.trim()) {
@@ -1096,6 +1681,8 @@ router2.post("/register", authRateLimiter, async (req, res) => {
       name: candidateName,
       email: normalizedEmail,
       passwordHash,
+      authProvider: "local",
+      isVerified: true,
       role: isAdmin ? "Admin" : "Candidate",
       isAdmin,
       degree: degree || "B.Tech",
@@ -1280,6 +1867,8 @@ async function seedAuthUsers() {
         name: "Candidate User",
         email: candidateEmail,
         passwordHash: passwordHash2,
+        authProvider: "local",
+        isVerified: true,
         role: "Candidate",
         isAdmin: false,
         degree: "B.Tech",
@@ -1300,6 +1889,7 @@ async function seedAuthUsers() {
         passwordHash,
         role: "Admin",
         isAdmin: true,
+        isVerified: true,
         name: "Sourab (Administrator)"
       });
       console.log(`  [Auth Seeder] Synchronized authorized admin: ${adminEmail}`);
@@ -1308,6 +1898,8 @@ async function seedAuthUsers() {
         name: "Sourab (Administrator)",
         email: adminEmail,
         passwordHash,
+        authProvider: "local",
+        isVerified: true,
         role: "Admin",
         isAdmin: true,
         degree: "B.Tech",
