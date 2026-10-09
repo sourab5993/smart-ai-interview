@@ -147,21 +147,6 @@ async function runTests() {
     assert(loginData.success === true, 'Login has success: true');
     assert(Boolean(loginData.token), 'Login token received');
 
-    console.log('\n--- TEST 8: Google Auth Endpoint Validation ---');
-    const googleEmptyRes = await fetch(`${baseUrl}/api/auth/google`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ credential: '' }),
-    });
-    assert(googleEmptyRes.status === 400, `Empty Google token rejected with 400 (Got: ${googleEmptyRes.status})`);
-
-    const googleInvalidRes = await fetch(`${baseUrl}/api/auth/google`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ credential: 'fake_jwt_google_credential_token' }),
-    });
-    assert(googleInvalidRes.status === 401, `Fake Google token rejected by Google verification with 401 (Got: ${googleInvalidRes.status})`);
-
     console.log('\n====================================================');
     console.log(`📊 REAL-ID SECURITY RESULTS: ${passed} PASSED, ${failed} FAILED`);
     console.log('====================================================');

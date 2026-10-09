@@ -16,7 +16,6 @@ import {
   UserPlus,
   LogIn,
   RotateCw,
-  ExternalLink,
   Shield
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
@@ -28,7 +27,7 @@ interface AuthViewProps {
 }
 
 export const AuthView: React.FC<AuthViewProps> = ({ redirectReason }) => {
-  const { currentView, setCurrentView, login, sendOtp, verifyOtpAndRegister, loginWithGoogle, updateProfile } = useApp();
+  const { currentView, setCurrentView, login, sendOtp, verifyOtpAndRegister, updateProfile } = useApp();
   const [mode, setMode] = useState<'login' | 'signup' | 'otp_verify' | 'forgot'>(
     currentView === 'login' ? 'login' : currentView === 'forgot-password' ? 'forgot' : 'signup'
   );
@@ -49,8 +48,6 @@ export const AuthView: React.FC<AuthViewProps> = ({ redirectReason }) => {
   const [authError, setAuthError] = useState<string | null>(null);
   const [regSuccess, setRegSuccess] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [isGoogleLoading, setIsGoogleLoading] = useState(false);
-  const [showGoogleConfigModal, setShowGoogleConfigModal] = useState(false);
 
   // Cooldown timer for OTP resend
   useEffect(() => {
@@ -62,70 +59,6 @@ export const AuthView: React.FC<AuthViewProps> = ({ redirectReason }) => {
     }
     return () => clearTimeout(timer);
   }, [resendCooldown]);
-
-  // Initialize Google Identity Services (GIS) if client id is configured
-  useEffect(() => {
-    const googleClientId = (import.meta as any).env?.VITE_GOOGLE_CLIENT_ID || '';
-    if (googleClientId && (window as any).google?.accounts?.id) {
-      try {
-        (window as any).google.accounts.id.initialize({
-          client_id: googleClientId,
-          callback: async (response: any) => {
-            if (response?.credential) {
-              await handleGoogleCredential(response.credential);
-            }
-          },
-        });
-      } catch (err) {
-        console.warn('[Google Auth] GIS Initialization notice:', err);
-      }
-    }
-  }, []);
-
-  const handleGoogleCredential = async (credential: string) => {
-    setIsGoogleLoading(true);
-    setAuthError(null);
-    try {
-      await loginWithGoogle(credential, targetRole);
-    } catch (err: any) {
-      setAuthError(err.message || 'Google authentication failed');
-    } finally {
-      setIsGoogleLoading(false);
-    }
-  };
-
-  const handleGoogleClick = () => {
-    setAuthError(null);
-    const googleClientId = (import.meta as any).env?.VITE_GOOGLE_CLIENT_ID || '';
-    const google = (window as any).google;
-
-    if (googleClientId && google?.accounts?.id) {
-      setIsGoogleLoading(true);
-      try {
-        google.accounts.id.initialize({
-          client_id: googleClientId,
-          callback: async (response: any) => {
-            if (response?.credential) {
-              await handleGoogleCredential(response.credential);
-            } else {
-              setIsGoogleLoading(false);
-            }
-          },
-        });
-        google.accounts.id.prompt((notification: any) => {
-          if (notification.isNotDisplayed() || notification.isSkippedMoment()) {
-            setIsGoogleLoading(false);
-          }
-        });
-      } catch (e: any) {
-        setIsGoogleLoading(false);
-        setAuthError(e?.message || 'Failed to open Google Sign-In prompt');
-      }
-    } else {
-      // Show informational config guide or demo login
-      setShowGoogleConfigModal(true);
-    }
-  };
 
   // Step 1: Initiate registration by validating email domain & dispatching OTP
   const handleInitiateRegistration = async (e: React.FormEvent) => {
@@ -282,7 +215,7 @@ export const AuthView: React.FC<AuthViewProps> = ({ redirectReason }) => {
       {/* Security Status Badge at Top Right */}
       <div className="absolute top-4 sm:top-6 right-4 sm:right-6 z-20 hidden sm:flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-slate-900/90 border border-emerald-500/30 text-[11px] text-emerald-400 backdrop-blur-md shadow-lg">
         <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-        <span className="font-semibold tracking-wide">Real-Identity Protection Active</span>
+        <span className="font-semibold tracking-wide">Email Identity Verification Active</span>
       </div>
 
       {/* Background Radial Glow */}
@@ -334,9 +267,9 @@ export const AuthView: React.FC<AuthViewProps> = ({ redirectReason }) => {
               {mode === 'forgot' && 'Reset Password'}
             </h1>
             <p className="text-xs text-slate-400 mt-1 font-sans">
-              {mode === 'signup' && 'Register with your genuine email or use 1-click Google Sign-In'}
+              {mode === 'signup' && 'Register with your genuine email to receive a 6-digit verification code'}
               {mode === 'otp_verify' && 'Enter the 6-digit verification code sent to your real inbox'}
-              {mode === 'login' && 'Sign in with your verified credentials or Google account'}
+              {mode === 'login' && 'Sign in with your verified email and password'}
               {mode === 'forgot' && 'Enter your email to receive recovery instructions'}
             </p>
           </div>
@@ -396,61 +329,7 @@ export const AuthView: React.FC<AuthViewProps> = ({ redirectReason }) => {
             </div>
           )}
 
-          {/* 1. GOOGLE SIGN-IN BUTTON (Displayed in login & signup modes) */}
-          {(mode === 'login' || mode === 'signup') && (
-            <div className="mb-5">
-              <button
-                type="button"
-                onClick={handleGoogleClick}
-                disabled={isGoogleLoading || isLoading}
-                className="w-full flex items-center justify-center gap-3 py-2.5 px-4 rounded-xl bg-slate-950 hover:bg-slate-800/80 border border-slate-700/80 hover:border-cyan-500/50 text-slate-100 font-semibold text-xs shadow-md transition-all cursor-pointer group disabled:opacity-50"
-                id="btn-google-auth"
-                title="Sign in with your verified Google account"
-              >
-                {isGoogleLoading ? (
-                  <Loader2 className="w-4 h-4 text-cyan-400 animate-spin" />
-                ) : (
-                  <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24">
-                    <path
-                      fill="#4285F4"
-                      d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
-                    />
-                    <path
-                      fill="#34A853"
-                      d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
-                    />
-                    <path
-                      fill="#FBBC05"
-                      d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"
-                    />
-                    <path
-                      fill="#EA4335"
-                      d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"
-                    />
-                  </svg>
-                )}
-                <span>
-                  {isGoogleLoading
-                    ? 'Verifying Google Account...'
-                    : mode === 'signup'
-                    ? 'Sign up with Google (Real ID)'
-                    : 'Sign in with Google'}
-                </span>
-                <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
-                  Verified
-                </span>
-              </button>
-
-              <div className="relative my-4 flex items-center justify-center">
-                <div className="w-full border-t border-slate-800" />
-                <span className="absolute bg-slate-900 px-3 text-[10px] uppercase tracking-wider text-slate-500 font-semibold">
-                  Or continue with email
-                </span>
-              </div>
-            </div>
-          )}
-
-          {/* 2. OTP VERIFICATION SCREEN */}
+          {/* 1. OTP VERIFICATION SCREEN */}
           {mode === 'otp_verify' && (
             <form className="space-y-5" onSubmit={handleVerifyOtpAndRegister}>
               <div className="p-3.5 rounded-xl bg-cyan-950/40 border border-cyan-800/40 text-xs text-cyan-200">
@@ -512,12 +391,12 @@ export const AuthView: React.FC<AuthViewProps> = ({ redirectReason }) => {
                 {isLoading ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    <span>Verifying Code & Creating Account...</span>
+                    <span>Verifying Code &amp; Creating Account...</span>
                   </>
                 ) : (
                   <>
                     <ShieldCheck className="w-4 h-4 text-emerald-300" />
-                    <span>Confirm Real Email & Activate</span>
+                    <span>Confirm Real Email &amp; Activate</span>
                   </>
                 )}
               </button>
@@ -548,7 +427,7 @@ export const AuthView: React.FC<AuthViewProps> = ({ redirectReason }) => {
             </form>
           )}
 
-          {/* 3. SIGNUP FORM */}
+          {/* 2. SIGNUP FORM */}
           {mode === 'signup' && (
             <form className="space-y-4" onSubmit={handleInitiateRegistration}>
               <div>
@@ -649,7 +528,7 @@ export const AuthView: React.FC<AuthViewProps> = ({ redirectReason }) => {
             </form>
           )}
 
-          {/* 4. LOGIN FORM */}
+          {/* 3. LOGIN FORM */}
           {mode === 'login' && (
             <form className="space-y-4" onSubmit={handleLoginSubmit}>
               <div>
@@ -718,7 +597,7 @@ export const AuthView: React.FC<AuthViewProps> = ({ redirectReason }) => {
             </form>
           )}
 
-          {/* 5. FORGOT PASSWORD */}
+          {/* 4. FORGOT PASSWORD */}
           {mode === 'forgot' && (
             <>
               {resetSent ? (
@@ -819,7 +698,7 @@ export const AuthView: React.FC<AuthViewProps> = ({ redirectReason }) => {
         <div className="mt-4 p-3 rounded-xl bg-slate-900/60 border border-slate-800/80 flex items-center gap-2.5 text-[11px] text-slate-400">
           <Shield className="w-4 h-4 text-emerald-400 shrink-0" />
           <span>
-            <strong>Zero Fake Account Policy:</strong> Every account is validated against active mail exchange (MX) servers or Google OAuth.
+            <strong>Zero Fake Account Policy:</strong> Every account is validated against active mail exchange (MX) servers and 6-digit email OTP.
           </span>
         </div>
 
@@ -836,57 +715,6 @@ export const AuthView: React.FC<AuthViewProps> = ({ redirectReason }) => {
           </button>
         </div>
       </div>
-
-      {/* Google OAuth Configuration / Demo Modal */}
-      {showGoogleConfigModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4">
-            <div className="flex items-start justify-between">
-              <div className="flex items-center gap-2.5">
-                <div className="w-9 h-9 rounded-xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center">
-                  <ShieldCheck className="w-5 h-5 text-cyan-400" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-bold text-slate-100">Google OAuth 2.0 Integration</h3>
-                  <p className="text-[11px] text-slate-400">Secure Real Google Account Verification</p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowGoogleConfigModal(false)}
-                className="text-slate-400 hover:text-slate-200 text-lg leading-none cursor-pointer"
-              >
-                &times;
-              </button>
-            </div>
-
-            <p className="text-xs text-slate-300 leading-relaxed">
-              Google Sign-In uses official <strong>Google Identity Services (GIS)</strong> to guarantee only real, active Google accounts can sign in.
-            </p>
-
-            <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-2 text-xs font-mono text-slate-300">
-              <div className="text-[10px] uppercase font-sans font-bold text-cyan-400">Setup Instructions:</div>
-              <p className="text-[11px] font-sans text-slate-400">
-                To connect your Google Client ID, add this to your <code className="text-cyan-300 font-mono">.env</code> file:
-              </p>
-              <div className="bg-slate-900 p-2 rounded text-[11px] text-emerald-400 overflow-x-auto">
-                GOOGLE_CLIENT_ID=your_id.apps.googleusercontent.com<br />
-                VITE_GOOGLE_CLIENT_ID=your_id.apps.googleusercontent.com
-              </div>
-            </div>
-
-            <div className="pt-2 flex flex-col sm:flex-row gap-2">
-              <button
-                type="button"
-                onClick={() => setShowGoogleConfigModal(false)}
-                className="flex-1 py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs transition-all cursor-pointer"
-              >
-                Close &amp; Use Email OTP
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 };

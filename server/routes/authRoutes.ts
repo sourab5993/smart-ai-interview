@@ -10,7 +10,6 @@ import {
   AuthenticatedUserPayload,
 } from '../middleware/authMiddleware';
 import { EmailVerificationService } from '../services/emailVerificationService';
-import { GoogleAuthService } from '../services/googleAuthService';
 
 const router = Router();
 
@@ -215,88 +214,6 @@ router.post('/verify-otp-and-register', authRateLimiter, async (req: Request, re
       success: false,
       message: 'An error occurred during account verification. Please try again.',
       error: error?.message,
-    });
-  }
-});
-
-/**
- * 0C. GOOGLE OAUTH LOGIN & REGISTRATION
- * POST /api/auth/google
- * Verifies real Google account via Google's cryptographically signed ID token
- */
-router.post('/google', authRateLimiter, async (req: Request, res: Response) => {
-  try {
-    const { credential, targetRole, degree, specialization } = req.body;
-
-    if (!credential || typeof credential !== 'string') {
-      return res.status(400).json({
-        success: false,
-        message: 'Google identity credential token is required.',
-      });
-    }
-
-    // 1. Verify ID token with Google
-    const googleUser = await GoogleAuthService.verifyGoogleIdToken(credential);
-
-    const normalizedEmail = googleUser.email.toLowerCase().trim();
-    const isAdmin = Boolean(normalizedEmail === 'sourabstar786@gmail.com');
-
-    // 2. Check if user already exists
-    let user = await UserService.findByEmail(normalizedEmail);
-
-    if (user) {
-      // Existing user: Link Google ID, update profile image, ensure isVerified is true
-      const updates: any = {
-        isVerified: true,
-        authProvider: user.authProvider || 'google',
-      };
-      if (googleUser.avatar && !user.avatar) {
-        updates.avatar = googleUser.avatar;
-      }
-      if (googleUser.googleId) {
-        updates.googleId = googleUser.googleId;
-      }
-
-      const updatedUser = await UserService.updateById(user._id || user.id, updates);
-      const token = generateToken(updatedUser || user);
-
-      return res.status(200).json({
-        success: true,
-        message: `Welcome back, ${googleUser.name}! Signed in via Google.`,
-        token,
-        user: (updatedUser || user).toSafeJSON(),
-      });
-    }
-
-    // 3. New candidate signing in via Google: Auto-create verified profile
-    const savedUser = await UserService.create({
-      name: googleUser.name,
-      email: normalizedEmail,
-      googleId: googleUser.googleId,
-      avatar: googleUser.avatar || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
-      authProvider: 'google',
-      isVerified: true,
-      role: isAdmin ? 'Admin' : 'Candidate',
-      isAdmin,
-      degree: degree || 'B.Tech',
-      courseCategory: 'Engineering & Technology',
-      specialization: specialization || 'Computer Science & Engineering',
-      targetRole: targetRole || 'Full Stack Developer',
-    });
-
-    const token = generateToken(savedUser);
-
-    return res.status(201).json({
-      success: true,
-      message: `Account created successfully with verified Google account: ${normalizedEmail}`,
-      token,
-      user: savedUser.toSafeJSON(),
-    });
-  } catch (error: any) {
-    console.error('[Auth Service] Google Sign-In error:', error?.message);
-    return res.status(401).json({
-      success: false,
-      message: error?.message || 'Google authentication failed. Please try again.',
     });
   }
 });
