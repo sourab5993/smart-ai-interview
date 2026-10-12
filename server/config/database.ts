@@ -1,5 +1,6 @@
 import mongoose from 'mongoose';
 import dotenv from 'dotenv';
+import { isSupabaseConfigured, testSupabaseConnection } from './supabase';
 
 dotenv.config();
 
@@ -30,12 +31,14 @@ export function getMongoUri(): string {
 
 export interface DatabaseStatus {
   isConnected: boolean;
+  provider: 'supabase' | 'mongodb' | 'in-memory';
   state: 'disconnected' | 'connected' | 'connecting' | 'disconnecting' | 'uninitialized';
   host?: string;
   databaseName?: string;
   pingMs?: number;
   uriMasked?: string;
   isInMemory?: boolean;
+  supabaseConfigured?: boolean;
   error?: string;
 }
 
@@ -54,6 +57,23 @@ export function getMaskedUri(uri: string): string {
  * Returns the current database connection health and status
  */
 export async function getDatabaseStatus(): Promise<DatabaseStatus> {
+  const supabaseActive = isSupabaseConfigured();
+
+  if (supabaseActive) {
+    const supabaseHealth = await testSupabaseConnection();
+    return {
+      isConnected: supabaseHealth.ok,
+      provider: 'supabase',
+      state: supabaseHealth.ok ? 'connected' : 'disconnected',
+      host: process.env.SUPABASE_URL || 'supabase-cloud',
+      databaseName: 'supabase-postgresql',
+      pingMs: supabaseHealth.latencyMs || 0,
+      supabaseConfigured: true,
+      isInMemory: false,
+      error: supabaseHealth.ok ? undefined : supabaseHealth.message,
+    };
+  }
+
   const readyState = mongoose.connection.readyState;
   const stateMap: Record<number, DatabaseStatus['state']> = {
     0: 'disconnected',
@@ -66,11 +86,13 @@ export async function getDatabaseStatus(): Promise<DatabaseStatus> {
 
   const status: DatabaseStatus = {
     isConnected,
+    provider: isInMemoryFallbackActive ? 'in-memory' : 'mongodb',
     state: isConnected ? 'connected' : stateMap[readyState] || 'uninitialized',
     host: mongoose.connection.host || (isInMemoryFallbackActive ? 'in-memory-engine' : undefined),
     databaseName: mongoose.connection.name || 'smart_ai_interview',
     uriMasked: getMaskedUri(getMongoUri()),
     isInMemory: isInMemoryFallbackActive,
+    supabaseConfigured: false,
   };
 
   if (readyState === 1 && mongoose.connection.db) {
@@ -89,6 +111,9 @@ export async function getDatabaseStatus(): Promise<DatabaseStatus> {
 }
 
 export function isDbConnected(): boolean {
+  if (isSupabaseConfigured()) {
+    return true;
+  }
   return mongoose.connection.readyState === 1 || isInMemoryFallbackActive;
 }
 
@@ -132,9 +157,20 @@ function registerConnectionLifecycle(): void {
 }
 
 /**
- * Connects to MongoDB with resilient timeout options and automatic in-memory fallback.
+ * Connects to database (Supabase if configured, otherwise MongoDB with in-memory fallback).
  */
 export async function connectDB(): Promise<boolean> {
+  if (isSupabaseConfigured()) {
+    console.log(`  [Database] ⚡ Supabase provider detected: ${process.env.SUPABASE_URL}`);
+    const check = await testSupabaseConnection();
+    if (check.ok) {
+      console.log(`  [Database] ✅ Supabase PostgreSQL active (${check.message}) [${check.latencyMs || 0}ms]`);
+      return true;
+    } else {
+      console.warn(`  [Database] ⚠️ Supabase connection warning: ${check.message}. Checking MongoDB fallback...`);
+    }
+  }
+
   if (mongoose.connection.readyState === 1) {
     return true;
   }
@@ -173,9 +209,9 @@ export async function connectDB(): Promise<boolean> {
       }
     }
 
-    // Activate lightning-fast in-memory document engine fallback
-    console.log(`  [Database] 🚀 Activating lightning-fast in-memory database engine.`);
-    console.log(`  [Database] All authentication, bcrypt password hashing, and user session storage are 100% active!`);
+    // Activate in-memory fallback if neither Supabase nor MongoDB is working
+    console.log(`  [Database] 🚀 Activating in-memory database engine.`);
+    console.log(`  [Database] All authentication, bcrypt hashing, and user sessions are 100% active!`);
     isInMemoryFallbackActive = true;
     return true;
   }

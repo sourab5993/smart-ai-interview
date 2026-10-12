@@ -1,4 +1,5 @@
 import mongoose, { Document, Schema, Model } from 'mongoose';
+import { getSupabaseClient, isSupabaseConfigured } from '../config/supabase';
 
 export interface IQuestionRecord {
   question: string;
@@ -24,7 +25,7 @@ export interface IRubricScores {
 }
 
 export interface IInterviewSession extends Document {
-  userId?: mongoose.Types.ObjectId;
+  userId?: any;
   candidateName: string;
   candidateEmail?: string;
   course: string;
@@ -186,11 +187,99 @@ export const InterviewSession: Model<IInterviewSession> =
   mongoose.models.InterviewSession ||
   mongoose.model<IInterviewSession>('InterviewSession', InterviewSessionSchema);
 
-// In-Memory fallback store for interview sessions if MongoDB cluster is unreachable
+// In-Memory fallback store for interview sessions
 const memorySessions = new Map<string, any>();
+
+export function mapSupabaseToSession(row: any): any {
+  if (!row) return null;
+  return {
+    id: row.id,
+    _id: row.id,
+    userId: row.user_id,
+    candidateName: row.candidate_name,
+    candidateEmail: row.candidate_email,
+    course: row.course,
+    specialization: row.specialization,
+    targetRole: row.target_role,
+    difficulty: row.difficulty,
+    interviewType: row.interview_type,
+    language: row.language,
+    status: row.status,
+    overallScore: Number(row.overall_score || 0),
+    behaviorScore: row.behavior_score !== null ? Number(row.behavior_score) : 80,
+    readinessLevel: row.readiness_level,
+    placementProbability: row.placement_probability,
+    feedbackSummary: row.feedback_summary || '',
+    strengths: Array.isArray(row.strengths) ? row.strengths : [],
+    improvements: Array.isArray(row.improvements) ? row.improvements : [],
+    rubricScores: row.rubric_scores || {},
+    questions: Array.isArray(row.questions) ? row.questions : [],
+    notes: row.notes || '',
+    createdAt: row.created_at ? new Date(row.created_at) : new Date(),
+    updatedAt: row.updated_at ? new Date(row.updated_at) : new Date(),
+  };
+}
+
+export function mapSessionToSupabase(session: any): Record<string, any> {
+  const row: Record<string, any> = {};
+  if (session.userId !== undefined) {
+    const rawId = session.userId?.toString ? session.userId.toString() : String(session.userId);
+    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawId);
+    if (isUUID) {
+      row.user_id = rawId;
+    }
+  }
+  if (session.candidateName !== undefined) row.candidate_name = session.candidateName;
+  if (session.candidateEmail !== undefined) row.candidate_email = session.candidateEmail;
+  if (session.course !== undefined) row.course = session.course;
+  if (session.specialization !== undefined) row.specialization = session.specialization;
+  if (session.targetRole !== undefined) row.target_role = session.targetRole;
+  if (session.difficulty !== undefined) row.difficulty = session.difficulty;
+  if (session.interviewType !== undefined) row.interview_type = session.interviewType;
+  if (session.language !== undefined) row.language = session.language;
+  if (session.status !== undefined) row.status = session.status;
+  if (session.overallScore !== undefined) row.overall_score = session.overallScore;
+  if (session.behaviorScore !== undefined) row.behavior_score = session.behaviorScore;
+  if (session.readinessLevel !== undefined) row.readiness_level = session.readinessLevel;
+  if (session.placementProbability !== undefined) row.placement_probability = session.placementProbability;
+  if (session.feedbackSummary !== undefined) row.feedback_summary = session.feedbackSummary;
+  if (session.strengths !== undefined) row.strengths = session.strengths;
+  if (session.improvements !== undefined) row.improvements = session.improvements;
+  if (session.rubricScores !== undefined) row.rubric_scores = session.rubricScores;
+  if (session.questions !== undefined) row.questions = session.questions;
+  if (session.notes !== undefined) row.notes = session.notes;
+  return row;
+}
 
 export const SessionService = {
   async create(data: any): Promise<any> {
+    // 1. Supabase PostgreSQL Provider
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const row = mapSessionToSupabase(data);
+          const { data: savedRow, error } = await client
+            .from('interview_sessions')
+            .insert(row)
+            .select()
+            .single();
+
+          if (!error && savedRow) {
+            const mapped = mapSupabaseToSession(savedRow);
+            memorySessions.set(mapped.id, mapped);
+            return mapped;
+          }
+          if (error) {
+            console.warn('[SessionService] Supabase insert warning:', error.message);
+          }
+        }
+      } catch (err: any) {
+        console.warn('[SessionService] Supabase create session fallback:', err?.message);
+      }
+    }
+
+    // 2. MongoDB Provider
     if (mongoose.connection.readyState === 1) {
       try {
         const session = new InterviewSession(data);
@@ -203,6 +292,7 @@ export const SessionService = {
       }
     }
 
+    // 3. In-Memory Fallback
     const _id = new mongoose.Types.ObjectId();
     const memSession = {
       ...data,
@@ -216,6 +306,51 @@ export const SessionService = {
   },
 
   async find(filter: any, skip = 0, limit = 10): Promise<{ total: number; data: any[] }> {
+    // 1. Supabase PostgreSQL Provider
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          let query = client.from('interview_sessions').select('*', { count: 'exact' });
+
+          // Filter by candidate email or user ID if provided
+          if (filter.$or && Array.isArray(filter.$or)) {
+            const emailCond = filter.$or.find((c: any) => c.candidateEmail);
+            const userCond = filter.$or.find((c: any) => c.userId);
+            const email = emailCond?.candidateEmail;
+            const uid = userCond?.userId?.toString ? userCond.userId.toString() : userCond?.userId;
+            const isUUID = uid && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(uid);
+
+            if (isUUID && email) {
+              query = query.or(`user_id.eq.${uid},candidate_email.ilike.${email}`);
+            } else if (email) {
+              query = query.ilike('candidate_email', email);
+            } else if (isUUID) {
+              query = query.eq('user_id', uid);
+            }
+          }
+
+          if (filter.course) query = query.eq('course', filter.course);
+          if (filter.targetRole) query = query.eq('target_role', filter.targetRole);
+          if (filter.difficulty) query = query.eq('difficulty', filter.difficulty);
+
+          const { data, count, error } = await query
+            .order('created_at', { ascending: false })
+            .range(skip, skip + limit - 1);
+
+          if (!error && data) {
+            return {
+              total: count !== null ? count : data.length,
+              data: data.map(mapSupabaseToSession),
+            };
+          }
+        }
+      } catch (err: any) {
+        console.warn('[SessionService] Supabase find fallback:', err?.message);
+      }
+    }
+
+    // 2. MongoDB Provider
     if (mongoose.connection.readyState === 1) {
       try {
         const [total, sessions] = await Promise.all([
@@ -228,6 +363,7 @@ export const SessionService = {
       }
     }
 
+    // 3. In-Memory Fallback
     let all = Array.from(memorySessions.values());
     if (filter.$or && Array.isArray(filter.$or)) {
       all = all.filter((s) => {
@@ -257,30 +393,83 @@ export const SessionService = {
   },
 
   async findById(id: string): Promise<any> {
-    if (mongoose.connection.readyState === 1) {
+    // 1. Supabase PostgreSQL Provider
+    if (isSupabaseConfigured()) {
       try {
-        const session = await InterviewSession.findById(id);
-        if (session) return session;
-      } catch (err) {
-        // Fallback
+        const client = getSupabaseClient();
+        if (client) {
+          const { data, error } = await client
+            .from('interview_sessions')
+            .select('*')
+            .eq('id', id)
+            .maybeSingle();
+
+          if (!error && data) {
+            return mapSupabaseToSession(data);
+          }
+        }
+      } catch (err: any) {
+        console.warn('[SessionService] Supabase findById fallback:', err?.message);
       }
     }
-    return memorySessions.get(id) || null;
-  },
 
-  async findByIdAndUpdate(id: string, updates: any): Promise<any> {
+    // 2. MongoDB Provider
     if (mongoose.connection.readyState === 1) {
       try {
-        const updated = await InterviewSession.findByIdAndUpdate(id, { $set: updates }, { new: true, runValidators: true });
-        if (updated) {
-          memorySessions.set(id, updated.toObject ? updated.toObject() : updated);
-          return updated;
+        if (mongoose.isValidObjectId(id)) {
+          const session = await InterviewSession.findById(id);
+          if (session) return session;
         }
       } catch (err) {
         // Fallback
       }
     }
 
+    // 3. In-Memory Fallback
+    return memorySessions.get(id) || null;
+  },
+
+  async findByIdAndUpdate(id: string, updates: any): Promise<any> {
+    // 1. Supabase PostgreSQL Provider
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const row = mapSessionToSupabase(updates);
+          const { data, error } = await client
+            .from('interview_sessions')
+            .update(row)
+            .eq('id', id)
+            .select()
+            .single();
+
+          if (!error && data) {
+            const mapped = mapSupabaseToSession(data);
+            memorySessions.set(id, mapped);
+            return mapped;
+          }
+        }
+      } catch (err: any) {
+        console.warn('[SessionService] Supabase findByIdAndUpdate fallback:', err?.message);
+      }
+    }
+
+    // 2. MongoDB Provider
+    if (mongoose.connection.readyState === 1) {
+      try {
+        if (mongoose.isValidObjectId(id)) {
+          const updated = await InterviewSession.findByIdAndUpdate(id, { $set: updates }, { returnDocument: 'after', runValidators: true });
+          if (updated) {
+            memorySessions.set(id, updated.toObject ? updated.toObject() : updated);
+            return updated;
+          }
+        }
+      } catch (err) {
+        // Fallback
+      }
+    }
+
+    // 3. In-Memory Fallback
     const existing = memorySessions.get(id);
     if (!existing) return null;
     const updated = { ...existing, ...updates, updatedAt: new Date() };
@@ -289,16 +478,38 @@ export const SessionService = {
   },
 
   async findByIdAndDelete(id: string): Promise<any> {
+    // 1. Supabase PostgreSQL Provider
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const { error } = await client
+            .from('interview_sessions')
+            .delete()
+            .eq('id', id);
+
+          memorySessions.delete(id);
+          if (!error) return { id };
+        }
+      } catch (err: any) {
+        console.warn('[SessionService] Supabase delete fallback:', err?.message);
+      }
+    }
+
+    // 2. MongoDB Provider
     if (mongoose.connection.readyState === 1) {
       try {
-        const deleted = await InterviewSession.findByIdAndDelete(id);
-        memorySessions.delete(id);
-        if (deleted) return deleted;
+        if (mongoose.isValidObjectId(id)) {
+          const deleted = await InterviewSession.findByIdAndDelete(id);
+          memorySessions.delete(id);
+          if (deleted) return deleted;
+        }
       } catch (err) {
         // Fallback
       }
     }
 
+    // 3. In-Memory Fallback
     const existing = memorySessions.get(id);
     if (existing) {
       memorySessions.delete(id);
@@ -307,4 +518,3 @@ export const SessionService = {
     return null;
   },
 };
-

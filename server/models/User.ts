@@ -1,5 +1,6 @@
 import mongoose, { Document, Schema, Model } from 'mongoose';
 import bcrypt from 'bcryptjs';
+import { getSupabaseClient, isSupabaseConfigured } from '../config/supabase';
 
 export interface IUser extends Document {
   name: string;
@@ -147,7 +148,7 @@ const UserSchema = new Schema<IUser>(
     },
     skills: {
       type: [String],
-      default: ['JavaScript', 'TypeScript', 'React.js', 'Node.js', 'MongoDB', 'REST APIs', 'Data Structures & Algorithms'],
+      default: ['JavaScript', 'TypeScript', 'React.js', 'Node.js', 'PostgreSQL', 'REST APIs', 'Data Structures & Algorithms'],
     },
     topSkills: {
       type: [String],
@@ -219,32 +220,138 @@ UserSchema.set('toJSON', {
 export const User: Model<IUser> =
   mongoose.models.User || mongoose.model<IUser>('User', UserSchema);
 
-// In-Memory fallback store if MongoDB cluster is unreachable (e.g. offline or IP whitelist)
+// In-Memory fallback store if cloud databases are unreachable
 const memoryUsers = new Map<string, any>();
 
-function wrapUserWithMethods(userData: any): any {
+export function wrapUserWithMethods(userData: any): any {
   if (!userData) return null;
   const user = { ...userData };
-  user._id = user._id || new mongoose.Types.ObjectId();
-  user.id = user._id.toString();
+  user.id = user.id || user._id?.toString();
+  user._id = user._id || user.id;
   user.isVerified = user.isVerified !== undefined ? Boolean(user.isVerified) : true;
+  user.isAdmin = Boolean(user.isAdmin);
   user.authProvider = user.authProvider || 'local';
+  user.skills = Array.isArray(user.skills) ? user.skills : [];
   user.comparePassword = async (candidatePassword: string) => {
-    if (!user.passwordHash) return false;
-    return bcrypt.compare(candidatePassword, user.passwordHash);
+    const hash = user.passwordHash || user.password_hash;
+    if (!hash) return false;
+    return bcrypt.compare(candidatePassword, hash);
   };
   user.toSafeJSON = () => {
     const copy = { ...user };
     delete copy.passwordHash;
+    delete copy.password_hash;
     delete copy.__v;
     return copy;
   };
   return user;
 }
 
+export function mapSupabaseToUser(row: any): any {
+  if (!row) return null;
+  return {
+    id: row.id,
+    _id: row.id,
+    name: row.name,
+    email: row.email,
+    passwordHash: row.password_hash,
+    authProvider: row.auth_provider,
+    googleId: row.google_id,
+    isVerified: row.is_verified,
+    role: row.role,
+    isAdmin: row.is_admin,
+    avatar: row.avatar,
+    college: row.college,
+    degree: row.degree,
+    courseId: row.course_id,
+    courseName: row.course_name,
+    courseCategory: row.course_category,
+    specialization: row.specialization,
+    semester: row.semester,
+    graduationYear: row.graduation_year,
+    targetRole: row.target_role,
+    targetIndustry: row.target_industry,
+    experienceLevel: row.experience_level,
+    preferredIndustry: row.preferred_industry,
+    interviewPreference: row.interview_preference,
+    preferredLanguage: row.preferred_language,
+    skills: row.skills || [],
+    topSkills: row.top_skills || [],
+    readinessScore: row.readiness_score,
+    readinessLevel: row.readiness_level,
+    totalInterviews: row.total_interviews,
+    avgScore: Number(row.avg_score || 0),
+    bestScore: Number(row.best_score || 0),
+    questionsAnswered: row.questions_answered,
+    currentStreak: row.current_streak,
+    createdAt: row.created_at ? new Date(row.created_at) : new Date(),
+    updatedAt: row.updated_at ? new Date(row.updated_at) : new Date(),
+  };
+}
+
+export function mapUserToSupabase(user: any): Record<string, any> {
+  const row: Record<string, any> = {};
+  if (user.name !== undefined) row.name = user.name;
+  if (user.email !== undefined) row.email = user.email.toLowerCase().trim();
+  if (user.passwordHash !== undefined) row.password_hash = user.passwordHash;
+  if (user.password_hash !== undefined) row.password_hash = user.password_hash;
+  if (user.authProvider !== undefined) row.auth_provider = user.authProvider;
+  if (user.googleId !== undefined) row.google_id = user.googleId;
+  if (user.isVerified !== undefined) row.is_verified = user.isVerified;
+  if (user.role !== undefined) row.role = user.role;
+  if (user.isAdmin !== undefined) row.is_admin = user.isAdmin;
+  if (user.avatar !== undefined) row.avatar = user.avatar;
+  if (user.college !== undefined) row.college = user.college;
+  if (user.degree !== undefined) row.degree = user.degree;
+  if (user.courseId !== undefined) row.course_id = user.courseId;
+  if (user.courseName !== undefined) row.course_name = user.courseName;
+  if (user.courseCategory !== undefined) row.course_category = user.courseCategory;
+  if (user.specialization !== undefined) row.specialization = user.specialization;
+  if (user.semester !== undefined) row.semester = user.semester;
+  if (user.graduationYear !== undefined) row.graduation_year = user.graduationYear;
+  if (user.targetRole !== undefined) row.target_role = user.targetRole;
+  if (user.targetIndustry !== undefined) row.target_industry = user.targetIndustry;
+  if (user.experienceLevel !== undefined) row.experience_level = user.experienceLevel;
+  if (user.preferredIndustry !== undefined) row.preferred_industry = user.preferredIndustry;
+  if (user.interviewPreference !== undefined) row.interview_preference = user.interviewPreference;
+  if (user.preferredLanguage !== undefined) row.preferred_language = user.preferredLanguage;
+  if (user.skills !== undefined) row.skills = user.skills;
+  if (user.topSkills !== undefined) row.top_skills = user.topSkills;
+  if (user.readinessScore !== undefined) row.readiness_score = user.readinessScore;
+  if (user.readinessLevel !== undefined) row.readiness_level = user.readinessLevel;
+  if (user.totalInterviews !== undefined) row.total_interviews = user.totalInterviews;
+  if (user.avgScore !== undefined) row.avg_score = user.avgScore;
+  if (user.bestScore !== undefined) row.best_score = user.bestScore;
+  if (user.questionsAnswered !== undefined) row.questions_answered = user.questionsAnswered;
+  if (user.currentStreak !== undefined) row.current_streak = user.currentStreak;
+  return row;
+}
+
 export const UserService = {
   async findByEmail(email: string): Promise<any> {
     const normalized = email.trim().toLowerCase();
+
+    // 1. Supabase PostgreSQL Provider (High priority if configured)
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const { data, error } = await client
+            .from('users')
+            .select('*')
+            .eq('email', normalized)
+            .maybeSingle();
+
+          if (!error && data) {
+            return wrapUserWithMethods(mapSupabaseToUser(data));
+          }
+        }
+      } catch (err: any) {
+        console.warn('[UserService] Supabase findByEmail failed, checking fallback:', err?.message);
+      }
+    }
+
+    // 2. MongoDB Provider
     if (mongoose.connection.readyState === 1 || mongoose.connection.readyState === 2) {
       try {
         const user = await User.findOne({ email: normalized }).select('+passwordHash');
@@ -253,11 +360,34 @@ export const UserService = {
         // Fallback to memory store if query fails
       }
     }
+
+    // 3. In-Memory Fallback
     const memUser = memoryUsers.get(normalized);
     return memUser ? wrapUserWithMethods(memUser) : null;
   },
 
   async findById(id: string): Promise<any> {
+    // 1. Supabase PostgreSQL Provider
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const { data, error } = await client
+            .from('users')
+            .select('*')
+            .eq('id', id)
+            .maybeSingle();
+
+          if (!error && data) {
+            return wrapUserWithMethods(mapSupabaseToUser(data));
+          }
+        }
+      } catch (err: any) {
+        console.warn('[UserService] Supabase findById fallback:', err?.message);
+      }
+    }
+
+    // 2. MongoDB Provider
     if (mongoose.connection.readyState === 1 || mongoose.connection.readyState === 2) {
       try {
         if (mongoose.isValidObjectId(id)) {
@@ -268,6 +398,8 @@ export const UserService = {
         // Fallback to memory store if query fails
       }
     }
+
+    // 3. In-Memory Fallback
     for (const u of memoryUsers.values()) {
       if (u._id?.toString() === id || u.id === id) {
         return wrapUserWithMethods(u);
@@ -278,6 +410,41 @@ export const UserService = {
 
   async create(userData: any): Promise<any> {
     const normalized = userData.email.trim().toLowerCase();
+
+    // 1. Supabase PostgreSQL Provider
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const row = mapUserToSupabase(userData);
+          const { data, error } = await client
+            .from('users')
+            .insert(row)
+            .select()
+            .single();
+
+          if (error) {
+            if (error.code === '23505') {
+              const err: any = new Error('An account with this email address already exists.');
+              err.code = 11000;
+              throw err;
+            }
+            throw error;
+          }
+
+          if (data) {
+            const mapped = wrapUserWithMethods(mapSupabaseToUser(data));
+            memoryUsers.set(normalized, mapped);
+            return mapped;
+          }
+        }
+      } catch (err: any) {
+        if (err.code === 11000 || err.code === '23505') throw err;
+        console.warn('[UserService] Supabase create user fallback:', err?.message);
+      }
+    }
+
+    // 2. MongoDB Provider
     if (memoryUsers.has(normalized)) {
       const err: any = new Error('Duplicate key');
       err.code = 11000;
@@ -295,6 +462,7 @@ export const UserService = {
       }
     }
 
+    // 3. In-Memory Fallback
     const memUser = {
       ...userData,
       _id: new mongoose.Types.ObjectId(),
@@ -307,18 +475,46 @@ export const UserService = {
   },
 
   async updateById(id: string, updates: any): Promise<any> {
+    // 1. Supabase PostgreSQL Provider
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const row = mapUserToSupabase(updates);
+          const { data, error } = await client
+            .from('users')
+            .update(row)
+            .eq('id', id)
+            .select()
+            .single();
+
+          if (!error && data) {
+            const mapped = wrapUserWithMethods(mapSupabaseToUser(data));
+            if (mapped.email) memoryUsers.set(mapped.email, mapped);
+            return mapped;
+          }
+        }
+      } catch (err: any) {
+        console.warn('[UserService] Supabase updateById fallback:', err?.message);
+      }
+    }
+
+    // 2. MongoDB Provider
     if (mongoose.connection.readyState === 1) {
       try {
-        const user = await User.findByIdAndUpdate(id, { $set: updates }, { new: true, runValidators: true });
-        if (user) {
-          memoryUsers.set(user.email, user.toObject ? user.toObject() : user);
-          return user;
+        if (mongoose.isValidObjectId(id)) {
+          const user = await User.findByIdAndUpdate(id, { $set: updates }, { returnDocument: 'after', runValidators: true });
+          if (user) {
+            memoryUsers.set(user.email, user.toObject ? user.toObject() : user);
+            return user;
+          }
         }
       } catch (err) {
         // Fallback
       }
     }
 
+    // 3. In-Memory Fallback
     for (const [email, u] of memoryUsers.entries()) {
       if (u._id?.toString() === id || u.id === id) {
         const updated = { ...u, ...updates, updatedAt: new Date() };
@@ -330,17 +526,45 @@ export const UserService = {
   },
 
   async count(): Promise<number> {
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const { count, error } = await client
+            .from('users')
+            .select('*', { count: 'exact', head: true });
+          if (!error && count !== null) return count;
+        }
+      } catch {}
+    }
+
     if (mongoose.connection.readyState === 1) {
       try {
         return await User.countDocuments();
-      } catch {
-        // Fallback
-      }
+      } catch {}
     }
     return memoryUsers.size;
   },
 
   async findAll(): Promise<any[]> {
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const { data, error } = await client
+            .from('users')
+            .select('*')
+            .order('created_at', { ascending: false });
+
+          if (!error && data) {
+            return data.map((r) => wrapUserWithMethods(mapSupabaseToUser(r)).toSafeJSON());
+          }
+        }
+      } catch (err: any) {
+        console.warn('[UserService] Supabase findAll fallback:', err?.message);
+      }
+    }
+
     if (mongoose.connection.readyState === 1) {
       try {
         const users = await User.find({}).sort({ createdAt: -1 });
@@ -349,6 +573,7 @@ export const UserService = {
         // Fallback
       }
     }
+
     const list: any[] = [];
     for (const u of memoryUsers.values()) {
       list.push(wrapUserWithMethods(u).toSafeJSON());

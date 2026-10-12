@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import zlib from 'zlib';
 import { getGeminiClient, extractDocumentTextWithGemini } from '../services/geminiService';
+import { isSupabaseConfigured, uploadResumeToSupabase } from '../config/supabase';
 
 const router = Router();
 
@@ -172,6 +173,19 @@ router.post('/parse-document', async (req: Request, res: Response) => {
 
     const words = extractedText.split(/\s+/).filter(Boolean);
 
+    // Optional Supabase Storage persistence for resumes
+    let fileUrl: string | undefined;
+    if (isSupabaseConfigured()) {
+      try {
+        const uploadRes = await uploadResumeToSupabase(fileName, buffer, mimeType);
+        if (uploadRes.url) {
+          fileUrl = uploadRes.url;
+        }
+      } catch (uploadErr) {
+        console.warn('[Resume Parser] Supabase storage upload skipped:', uploadErr);
+      }
+    }
+
     return res.json({
       success: true,
       text: extractedText,
@@ -179,6 +193,7 @@ router.post('/parse-document', async (req: Request, res: Response) => {
       fileSize: buffer.length,
       wordCount: words.length,
       method: extractionMethod,
+      fileUrl,
     });
   } catch (error: any) {
     console.error('[Resume Parser] Critical error parsing resume document:', error);

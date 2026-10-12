@@ -89,8 +89,13 @@ router.post('/sessions', authenticateToken, async (req: Request, res: Response) 
     const authenticatedEmail = req.user?.email;
     const effectiveName = candidateName || req.user?.name || 'Candidate';
 
+    // Safely assign user ID whether it is a MongoDB ObjectId or Supabase UUID
+    const sessionUserId = authenticatedUserId && mongoose.Types.ObjectId.isValid(authenticatedUserId)
+      ? new mongoose.Types.ObjectId(authenticatedUserId)
+      : authenticatedUserId || undefined;
+
     const sessionPayload = {
-      userId: authenticatedUserId ? new mongoose.Types.ObjectId(authenticatedUserId) : undefined,
+      userId: sessionUserId,
       candidateName: effectiveName,
       candidateEmail: authenticatedEmail,
       course,
@@ -116,7 +121,7 @@ router.post('/sessions', authenticateToken, async (req: Request, res: Response) 
 
     res.status(201).json({
       success: true,
-      message: 'Interview session record created successfully in MongoDB',
+      message: 'Interview session record created successfully',
       data: savedSession,
     });
   } catch (error: any) {
@@ -156,8 +161,11 @@ router.get('/sessions', authenticateToken, async (req: Request, res: Response) =
     // Strict user isolation: Regular users can NEVER access another user's sessions
     if (!req.user?.isAdmin) {
       const userConditions: any[] = [];
-      if (req.user?.userId && mongoose.Types.ObjectId.isValid(req.user.userId)) {
-        userConditions.push({ userId: new mongoose.Types.ObjectId(req.user.userId) });
+      if (req.user?.userId) {
+        if (mongoose.Types.ObjectId.isValid(req.user.userId)) {
+          userConditions.push({ userId: new mongoose.Types.ObjectId(req.user.userId) });
+        }
+        userConditions.push({ userId: req.user.userId });
       }
       if (req.user?.email) {
         userConditions.push({ candidateEmail: req.user.email.toLowerCase() });
@@ -338,8 +346,12 @@ router.post('/seed-sample', authenticateToken, async (req: Request, res: Respons
       });
     }
 
+    const sampleUserId = req.user?.userId && mongoose.Types.ObjectId.isValid(req.user.userId)
+      ? new mongoose.Types.ObjectId(req.user.userId)
+      : req.user?.userId || undefined;
+
     const sample = await SessionService.create({
-      userId: req.user?.userId ? new mongoose.Types.ObjectId(req.user.userId) : undefined,
+      userId: sampleUserId,
       candidateName: req.user?.name || 'Test Candidate',
       candidateEmail: req.user?.email || 'candidate@example.com',
       course: 'B.Tech',
@@ -380,7 +392,7 @@ router.post('/seed-sample', authenticateToken, async (req: Request, res: Respons
 
     res.status(201).json({
       success: true,
-      message: 'Sample test document created successfully in MongoDB',
+      message: 'Sample test document created successfully',
       data: sample,
     });
   } catch (error: any) {

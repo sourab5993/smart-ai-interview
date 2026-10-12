@@ -4,12 +4,111 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import { exec } from "child_process";
-import dotenv2 from "dotenv";
+import dotenv3 from "dotenv";
 
 // server/config/database.ts
 import mongoose from "mongoose";
+import dotenv2 from "dotenv";
+
+// server/config/supabase.ts
+import { createClient } from "@supabase/supabase-js";
 import dotenv from "dotenv";
 dotenv.config();
+var supabaseUrl = (process.env.SUPABASE_URL || "").trim();
+var supabaseServiceKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "").trim();
+function isSupabaseConfigured() {
+  return Boolean(
+    supabaseUrl && supabaseUrl.startsWith("https://") && supabaseServiceKey && supabaseServiceKey.length > 10 && !supabaseUrl.includes("your-project-id")
+  );
+}
+var _supabaseClient = null;
+function getSupabaseClient() {
+  if (!isSupabaseConfigured()) {
+    return null;
+  }
+  if (!_supabaseClient) {
+    _supabaseClient = createClient(supabaseUrl, supabaseServiceKey, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false
+      }
+    });
+  }
+  return _supabaseClient;
+}
+var supabase = getSupabaseClient();
+async function testSupabaseConnection() {
+  if (!isSupabaseConfigured()) {
+    return {
+      ok: false,
+      message: "Supabase credentials not configured in .env"
+    };
+  }
+  const client = getSupabaseClient();
+  if (!client) {
+    return { ok: false, message: "Failed to initialize Supabase client." };
+  }
+  const start = Date.now();
+  try {
+    const { error } = await client.from("users").select("id", { count: "exact", head: true });
+    const latencyMs = Date.now() - start;
+    if (error) {
+      if (error.code === "42P01" || error.code === "PGRST205") {
+        return {
+          ok: true,
+          tablesCreated: false,
+          message: "Supabase connected! Tables not created yet. Run supabase_schema.sql in Supabase SQL Editor.",
+          latencyMs
+        };
+      }
+      return {
+        ok: false,
+        tablesCreated: false,
+        message: error.message || "Supabase query failed",
+        latencyMs
+      };
+    }
+    return {
+      ok: true,
+      tablesCreated: true,
+      message: "Supabase PostgreSQL connected and tables ready!",
+      latencyMs
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      message: err?.message || "Failed to reach Supabase",
+      latencyMs: Date.now() - start
+    };
+  }
+}
+async function uploadResumeToSupabase(fileName, buffer, contentType) {
+  const client = getSupabaseClient();
+  if (!client) {
+    return { error: "Supabase not configured" };
+  }
+  try {
+    const safeName = `${Date.now()}-${fileName.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+    const storagePath = `resumes/${safeName}`;
+    const { error: uploadError } = await client.storage.from("resumes").upload(storagePath, buffer, {
+      contentType,
+      upsert: true
+    });
+    if (uploadError) {
+      return { error: uploadError.message };
+    }
+    const { data: publicUrlData } = client.storage.from("resumes").getPublicUrl(storagePath);
+    return {
+      url: publicUrlData?.publicUrl,
+      path: storagePath
+    };
+  } catch (err) {
+    return { error: err?.message || "Storage upload error" };
+  }
+}
+
+// server/config/database.ts
+dotenv2.config();
 var isInMemoryFallbackActive = false;
 function getMongoUri() {
   if (process.env.MONGODB_URI && process.env.MONGODB_URI.trim().length > 0) {
@@ -34,6 +133,21 @@ function getMaskedUri(uri) {
   }
 }
 async function getDatabaseStatus() {
+  const supabaseActive = isSupabaseConfigured();
+  if (supabaseActive) {
+    const supabaseHealth = await testSupabaseConnection();
+    return {
+      isConnected: supabaseHealth.ok,
+      provider: "supabase",
+      state: supabaseHealth.ok ? "connected" : "disconnected",
+      host: process.env.SUPABASE_URL || "supabase-cloud",
+      databaseName: "supabase-postgresql",
+      pingMs: supabaseHealth.latencyMs || 0,
+      supabaseConfigured: true,
+      isInMemory: false,
+      error: supabaseHealth.ok ? void 0 : supabaseHealth.message
+    };
+  }
   const readyState = mongoose.connection.readyState;
   const stateMap = {
     0: "disconnected",
@@ -44,11 +158,13 @@ async function getDatabaseStatus() {
   const isConnected = readyState === 1 || isInMemoryFallbackActive;
   const status = {
     isConnected,
+    provider: isInMemoryFallbackActive ? "in-memory" : "mongodb",
     state: isConnected ? "connected" : stateMap[readyState] || "uninitialized",
     host: mongoose.connection.host || (isInMemoryFallbackActive ? "in-memory-engine" : void 0),
     databaseName: mongoose.connection.name || "smart_ai_interview",
     uriMasked: getMaskedUri(getMongoUri()),
-    isInMemory: isInMemoryFallbackActive
+    isInMemory: isInMemoryFallbackActive,
+    supabaseConfigured: false
   };
   if (readyState === 1 && mongoose.connection.db) {
     try {
@@ -64,6 +180,9 @@ async function getDatabaseStatus() {
   return status;
 }
 function isDbConnected() {
+  if (isSupabaseConfigured()) {
+    return true;
+  }
   return mongoose.connection.readyState === 1 || isInMemoryFallbackActive;
 }
 var isLifecycleRegistered = false;
@@ -98,6 +217,16 @@ function registerConnectionLifecycle() {
   process.once("SIGTERM", () => handleAppTermination("SIGTERM"));
 }
 async function connectDB() {
+  if (isSupabaseConfigured()) {
+    console.log(`  [Database] \u26A1 Supabase provider detected: ${process.env.SUPABASE_URL}`);
+    const check = await testSupabaseConnection();
+    if (check.ok) {
+      console.log(`  [Database] \u2705 Supabase PostgreSQL active (${check.message}) [${check.latencyMs || 0}ms]`);
+      return true;
+    } else {
+      console.warn(`  [Database] \u26A0\uFE0F Supabase connection warning: ${check.message}. Checking MongoDB fallback...`);
+    }
+  }
   if (mongoose.connection.readyState === 1) {
     return true;
   }
@@ -129,8 +258,8 @@ async function connectDB() {
       } catch {
       }
     }
-    console.log(`  [Database] \u{1F680} Activating lightning-fast in-memory database engine.`);
-    console.log(`  [Database] All authentication, bcrypt password hashing, and user session storage are 100% active!`);
+    console.log(`  [Database] \u{1F680} Activating in-memory database engine.`);
+    console.log(`  [Database] All authentication, bcrypt hashing, and user sessions are 100% active!`);
     isInMemoryFallbackActive = true;
     return true;
   }
@@ -273,8 +402,86 @@ InterviewSessionSchema.index({ candidateName: 1, createdAt: -1 });
 InterviewSessionSchema.index({ targetRole: 1, createdAt: -1 });
 var InterviewSession = mongoose2.models.InterviewSession || mongoose2.model("InterviewSession", InterviewSessionSchema);
 var memorySessions = /* @__PURE__ */ new Map();
+function mapSupabaseToSession(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    _id: row.id,
+    userId: row.user_id,
+    candidateName: row.candidate_name,
+    candidateEmail: row.candidate_email,
+    course: row.course,
+    specialization: row.specialization,
+    targetRole: row.target_role,
+    difficulty: row.difficulty,
+    interviewType: row.interview_type,
+    language: row.language,
+    status: row.status,
+    overallScore: Number(row.overall_score || 0),
+    behaviorScore: row.behavior_score !== null ? Number(row.behavior_score) : 80,
+    readinessLevel: row.readiness_level,
+    placementProbability: row.placement_probability,
+    feedbackSummary: row.feedback_summary || "",
+    strengths: Array.isArray(row.strengths) ? row.strengths : [],
+    improvements: Array.isArray(row.improvements) ? row.improvements : [],
+    rubricScores: row.rubric_scores || {},
+    questions: Array.isArray(row.questions) ? row.questions : [],
+    notes: row.notes || "",
+    createdAt: row.created_at ? new Date(row.created_at) : /* @__PURE__ */ new Date(),
+    updatedAt: row.updated_at ? new Date(row.updated_at) : /* @__PURE__ */ new Date()
+  };
+}
+function mapSessionToSupabase(session) {
+  const row = {};
+  if (session.userId !== void 0) {
+    const rawId = session.userId?.toString ? session.userId.toString() : String(session.userId);
+    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawId);
+    if (isUUID) {
+      row.user_id = rawId;
+    }
+  }
+  if (session.candidateName !== void 0) row.candidate_name = session.candidateName;
+  if (session.candidateEmail !== void 0) row.candidate_email = session.candidateEmail;
+  if (session.course !== void 0) row.course = session.course;
+  if (session.specialization !== void 0) row.specialization = session.specialization;
+  if (session.targetRole !== void 0) row.target_role = session.targetRole;
+  if (session.difficulty !== void 0) row.difficulty = session.difficulty;
+  if (session.interviewType !== void 0) row.interview_type = session.interviewType;
+  if (session.language !== void 0) row.language = session.language;
+  if (session.status !== void 0) row.status = session.status;
+  if (session.overallScore !== void 0) row.overall_score = session.overallScore;
+  if (session.behaviorScore !== void 0) row.behavior_score = session.behaviorScore;
+  if (session.readinessLevel !== void 0) row.readiness_level = session.readinessLevel;
+  if (session.placementProbability !== void 0) row.placement_probability = session.placementProbability;
+  if (session.feedbackSummary !== void 0) row.feedback_summary = session.feedbackSummary;
+  if (session.strengths !== void 0) row.strengths = session.strengths;
+  if (session.improvements !== void 0) row.improvements = session.improvements;
+  if (session.rubricScores !== void 0) row.rubric_scores = session.rubricScores;
+  if (session.questions !== void 0) row.questions = session.questions;
+  if (session.notes !== void 0) row.notes = session.notes;
+  return row;
+}
 var SessionService = {
   async create(data) {
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const row = mapSessionToSupabase(data);
+          const { data: savedRow, error } = await client.from("interview_sessions").insert(row).select().single();
+          if (!error && savedRow) {
+            const mapped = mapSupabaseToSession(savedRow);
+            memorySessions.set(mapped.id, mapped);
+            return mapped;
+          }
+          if (error) {
+            console.warn("[SessionService] Supabase insert warning:", error.message);
+          }
+        }
+      } catch (err) {
+        console.warn("[SessionService] Supabase create session fallback:", err?.message);
+      }
+    }
     if (mongoose2.connection.readyState === 1) {
       try {
         const session = new InterviewSession(data);
@@ -297,6 +504,40 @@ var SessionService = {
     return memSession;
   },
   async find(filter, skip = 0, limit = 10) {
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          let query = client.from("interview_sessions").select("*", { count: "exact" });
+          if (filter.$or && Array.isArray(filter.$or)) {
+            const emailCond = filter.$or.find((c) => c.candidateEmail);
+            const userCond = filter.$or.find((c) => c.userId);
+            const email = emailCond?.candidateEmail;
+            const uid = userCond?.userId?.toString ? userCond.userId.toString() : userCond?.userId;
+            const isUUID = uid && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(uid);
+            if (isUUID && email) {
+              query = query.or(`user_id.eq.${uid},candidate_email.ilike.${email}`);
+            } else if (email) {
+              query = query.ilike("candidate_email", email);
+            } else if (isUUID) {
+              query = query.eq("user_id", uid);
+            }
+          }
+          if (filter.course) query = query.eq("course", filter.course);
+          if (filter.targetRole) query = query.eq("target_role", filter.targetRole);
+          if (filter.difficulty) query = query.eq("difficulty", filter.difficulty);
+          const { data: data2, count, error } = await query.order("created_at", { ascending: false }).range(skip, skip + limit - 1);
+          if (!error && data2) {
+            return {
+              total: count !== null ? count : data2.length,
+              data: data2.map(mapSupabaseToSession)
+            };
+          }
+        }
+      } catch (err) {
+        console.warn("[SessionService] Supabase find fallback:", err?.message);
+      }
+    }
     if (mongoose2.connection.readyState === 1) {
       try {
         const [total2, sessions] = await Promise.all([
@@ -333,22 +574,55 @@ var SessionService = {
     return { total, data };
   },
   async findById(id) {
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const { data, error } = await client.from("interview_sessions").select("*").eq("id", id).maybeSingle();
+          if (!error && data) {
+            return mapSupabaseToSession(data);
+          }
+        }
+      } catch (err) {
+        console.warn("[SessionService] Supabase findById fallback:", err?.message);
+      }
+    }
     if (mongoose2.connection.readyState === 1) {
       try {
-        const session = await InterviewSession.findById(id);
-        if (session) return session;
+        if (mongoose2.isValidObjectId(id)) {
+          const session = await InterviewSession.findById(id);
+          if (session) return session;
+        }
       } catch (err) {
       }
     }
     return memorySessions.get(id) || null;
   },
   async findByIdAndUpdate(id, updates) {
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const row = mapSessionToSupabase(updates);
+          const { data, error } = await client.from("interview_sessions").update(row).eq("id", id).select().single();
+          if (!error && data) {
+            const mapped = mapSupabaseToSession(data);
+            memorySessions.set(id, mapped);
+            return mapped;
+          }
+        }
+      } catch (err) {
+        console.warn("[SessionService] Supabase findByIdAndUpdate fallback:", err?.message);
+      }
+    }
     if (mongoose2.connection.readyState === 1) {
       try {
-        const updated2 = await InterviewSession.findByIdAndUpdate(id, { $set: updates }, { new: true, runValidators: true });
-        if (updated2) {
-          memorySessions.set(id, updated2.toObject ? updated2.toObject() : updated2);
-          return updated2;
+        if (mongoose2.isValidObjectId(id)) {
+          const updated2 = await InterviewSession.findByIdAndUpdate(id, { $set: updates }, { returnDocument: "after", runValidators: true });
+          if (updated2) {
+            memorySessions.set(id, updated2.toObject ? updated2.toObject() : updated2);
+            return updated2;
+          }
         }
       } catch (err) {
       }
@@ -360,11 +634,25 @@ var SessionService = {
     return updated;
   },
   async findByIdAndDelete(id) {
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const { error } = await client.from("interview_sessions").delete().eq("id", id);
+          memorySessions.delete(id);
+          if (!error) return { id };
+        }
+      } catch (err) {
+        console.warn("[SessionService] Supabase delete fallback:", err?.message);
+      }
+    }
     if (mongoose2.connection.readyState === 1) {
       try {
-        const deleted = await InterviewSession.findByIdAndDelete(id);
-        memorySessions.delete(id);
-        if (deleted) return deleted;
+        if (mongoose2.isValidObjectId(id)) {
+          const deleted = await InterviewSession.findByIdAndDelete(id);
+          memorySessions.delete(id);
+          if (deleted) return deleted;
+        }
       } catch (err) {
       }
     }
@@ -479,8 +767,9 @@ router.post("/sessions", authenticateToken, async (req, res) => {
     const authenticatedUserId = req.user?.userId;
     const authenticatedEmail = req.user?.email;
     const effectiveName = candidateName || req.user?.name || "Candidate";
+    const sessionUserId = authenticatedUserId && mongoose3.Types.ObjectId.isValid(authenticatedUserId) ? new mongoose3.Types.ObjectId(authenticatedUserId) : authenticatedUserId || void 0;
     const sessionPayload = {
-      userId: authenticatedUserId ? new mongoose3.Types.ObjectId(authenticatedUserId) : void 0,
+      userId: sessionUserId,
       candidateName: effectiveName,
       candidateEmail: authenticatedEmail,
       course,
@@ -504,7 +793,7 @@ router.post("/sessions", authenticateToken, async (req, res) => {
     const savedSession = await SessionService.create(sessionPayload);
     res.status(201).json({
       success: true,
-      message: "Interview session record created successfully in MongoDB",
+      message: "Interview session record created successfully",
       data: savedSession
     });
   } catch (error) {
@@ -534,8 +823,11 @@ router.get("/sessions", authenticateToken, async (req, res) => {
     const filter = {};
     if (!req.user?.isAdmin) {
       const userConditions = [];
-      if (req.user?.userId && mongoose3.Types.ObjectId.isValid(req.user.userId)) {
-        userConditions.push({ userId: new mongoose3.Types.ObjectId(req.user.userId) });
+      if (req.user?.userId) {
+        if (mongoose3.Types.ObjectId.isValid(req.user.userId)) {
+          userConditions.push({ userId: new mongoose3.Types.ObjectId(req.user.userId) });
+        }
+        userConditions.push({ userId: req.user.userId });
       }
       if (req.user?.email) {
         userConditions.push({ candidateEmail: req.user.email.toLowerCase() });
@@ -671,8 +963,9 @@ router.post("/seed-sample", authenticateToken, async (req, res) => {
         error: "Database not connected. Please verify MongoDB connection string in .env"
       });
     }
+    const sampleUserId = req.user?.userId && mongoose3.Types.ObjectId.isValid(req.user.userId) ? new mongoose3.Types.ObjectId(req.user.userId) : req.user?.userId || void 0;
     const sample = await SessionService.create({
-      userId: req.user?.userId ? new mongoose3.Types.ObjectId(req.user.userId) : void 0,
+      userId: sampleUserId,
       candidateName: req.user?.name || "Test Candidate",
       candidateEmail: req.user?.email || "candidate@example.com",
       course: "B.Tech",
@@ -712,7 +1005,7 @@ router.post("/seed-sample", authenticateToken, async (req, res) => {
     });
     res.status(201).json({
       success: true,
-      message: "Sample test document created successfully in MongoDB",
+      message: "Sample test document created successfully",
       data: sample
     });
   } catch (error) {
@@ -842,7 +1135,7 @@ var UserSchema = new Schema2(
     },
     skills: {
       type: [String],
-      default: ["JavaScript", "TypeScript", "React.js", "Node.js", "MongoDB", "REST APIs", "Data Structures & Algorithms"]
+      default: ["JavaScript", "TypeScript", "React.js", "Node.js", "PostgreSQL", "REST APIs", "Data Structures & Algorithms"]
     },
     topSkills: {
       type: [String],
@@ -909,25 +1202,120 @@ var memoryUsers = /* @__PURE__ */ new Map();
 function wrapUserWithMethods(userData) {
   if (!userData) return null;
   const user = { ...userData };
-  user._id = user._id || new mongoose4.Types.ObjectId();
-  user.id = user._id.toString();
+  user.id = user.id || user._id?.toString();
+  user._id = user._id || user.id;
   user.isVerified = user.isVerified !== void 0 ? Boolean(user.isVerified) : true;
+  user.isAdmin = Boolean(user.isAdmin);
   user.authProvider = user.authProvider || "local";
+  user.skills = Array.isArray(user.skills) ? user.skills : [];
   user.comparePassword = async (candidatePassword) => {
-    if (!user.passwordHash) return false;
-    return bcrypt.compare(candidatePassword, user.passwordHash);
+    const hash = user.passwordHash || user.password_hash;
+    if (!hash) return false;
+    return bcrypt.compare(candidatePassword, hash);
   };
   user.toSafeJSON = () => {
     const copy = { ...user };
     delete copy.passwordHash;
+    delete copy.password_hash;
     delete copy.__v;
     return copy;
   };
   return user;
 }
+function mapSupabaseToUser(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    _id: row.id,
+    name: row.name,
+    email: row.email,
+    passwordHash: row.password_hash,
+    authProvider: row.auth_provider,
+    googleId: row.google_id,
+    isVerified: row.is_verified,
+    role: row.role,
+    isAdmin: row.is_admin,
+    avatar: row.avatar,
+    college: row.college,
+    degree: row.degree,
+    courseId: row.course_id,
+    courseName: row.course_name,
+    courseCategory: row.course_category,
+    specialization: row.specialization,
+    semester: row.semester,
+    graduationYear: row.graduation_year,
+    targetRole: row.target_role,
+    targetIndustry: row.target_industry,
+    experienceLevel: row.experience_level,
+    preferredIndustry: row.preferred_industry,
+    interviewPreference: row.interview_preference,
+    preferredLanguage: row.preferred_language,
+    skills: row.skills || [],
+    topSkills: row.top_skills || [],
+    readinessScore: row.readiness_score,
+    readinessLevel: row.readiness_level,
+    totalInterviews: row.total_interviews,
+    avgScore: Number(row.avg_score || 0),
+    bestScore: Number(row.best_score || 0),
+    questionsAnswered: row.questions_answered,
+    currentStreak: row.current_streak,
+    createdAt: row.created_at ? new Date(row.created_at) : /* @__PURE__ */ new Date(),
+    updatedAt: row.updated_at ? new Date(row.updated_at) : /* @__PURE__ */ new Date()
+  };
+}
+function mapUserToSupabase(user) {
+  const row = {};
+  if (user.name !== void 0) row.name = user.name;
+  if (user.email !== void 0) row.email = user.email.toLowerCase().trim();
+  if (user.passwordHash !== void 0) row.password_hash = user.passwordHash;
+  if (user.password_hash !== void 0) row.password_hash = user.password_hash;
+  if (user.authProvider !== void 0) row.auth_provider = user.authProvider;
+  if (user.googleId !== void 0) row.google_id = user.googleId;
+  if (user.isVerified !== void 0) row.is_verified = user.isVerified;
+  if (user.role !== void 0) row.role = user.role;
+  if (user.isAdmin !== void 0) row.is_admin = user.isAdmin;
+  if (user.avatar !== void 0) row.avatar = user.avatar;
+  if (user.college !== void 0) row.college = user.college;
+  if (user.degree !== void 0) row.degree = user.degree;
+  if (user.courseId !== void 0) row.course_id = user.courseId;
+  if (user.courseName !== void 0) row.course_name = user.courseName;
+  if (user.courseCategory !== void 0) row.course_category = user.courseCategory;
+  if (user.specialization !== void 0) row.specialization = user.specialization;
+  if (user.semester !== void 0) row.semester = user.semester;
+  if (user.graduationYear !== void 0) row.graduation_year = user.graduationYear;
+  if (user.targetRole !== void 0) row.target_role = user.targetRole;
+  if (user.targetIndustry !== void 0) row.target_industry = user.targetIndustry;
+  if (user.experienceLevel !== void 0) row.experience_level = user.experienceLevel;
+  if (user.preferredIndustry !== void 0) row.preferred_industry = user.preferredIndustry;
+  if (user.interviewPreference !== void 0) row.interview_preference = user.interviewPreference;
+  if (user.preferredLanguage !== void 0) row.preferred_language = user.preferredLanguage;
+  if (user.skills !== void 0) row.skills = user.skills;
+  if (user.topSkills !== void 0) row.top_skills = user.topSkills;
+  if (user.readinessScore !== void 0) row.readiness_score = user.readinessScore;
+  if (user.readinessLevel !== void 0) row.readiness_level = user.readinessLevel;
+  if (user.totalInterviews !== void 0) row.total_interviews = user.totalInterviews;
+  if (user.avgScore !== void 0) row.avg_score = user.avgScore;
+  if (user.bestScore !== void 0) row.best_score = user.bestScore;
+  if (user.questionsAnswered !== void 0) row.questions_answered = user.questionsAnswered;
+  if (user.currentStreak !== void 0) row.current_streak = user.currentStreak;
+  return row;
+}
 var UserService = {
   async findByEmail(email) {
     const normalized = email.trim().toLowerCase();
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const { data, error } = await client.from("users").select("*").eq("email", normalized).maybeSingle();
+          if (!error && data) {
+            return wrapUserWithMethods(mapSupabaseToUser(data));
+          }
+        }
+      } catch (err) {
+        console.warn("[UserService] Supabase findByEmail failed, checking fallback:", err?.message);
+      }
+    }
     if (mongoose4.connection.readyState === 1 || mongoose4.connection.readyState === 2) {
       try {
         const user = await User.findOne({ email: normalized }).select("+passwordHash");
@@ -939,6 +1327,19 @@ var UserService = {
     return memUser ? wrapUserWithMethods(memUser) : null;
   },
   async findById(id) {
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const { data, error } = await client.from("users").select("*").eq("id", id).maybeSingle();
+          if (!error && data) {
+            return wrapUserWithMethods(mapSupabaseToUser(data));
+          }
+        }
+      } catch (err) {
+        console.warn("[UserService] Supabase findById fallback:", err?.message);
+      }
+    }
     if (mongoose4.connection.readyState === 1 || mongoose4.connection.readyState === 2) {
       try {
         if (mongoose4.isValidObjectId(id)) {
@@ -957,6 +1358,31 @@ var UserService = {
   },
   async create(userData) {
     const normalized = userData.email.trim().toLowerCase();
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const row = mapUserToSupabase(userData);
+          const { data, error } = await client.from("users").insert(row).select().single();
+          if (error) {
+            if (error.code === "23505") {
+              const err = new Error("An account with this email address already exists.");
+              err.code = 11e3;
+              throw err;
+            }
+            throw error;
+          }
+          if (data) {
+            const mapped = wrapUserWithMethods(mapSupabaseToUser(data));
+            memoryUsers.set(normalized, mapped);
+            return mapped;
+          }
+        }
+      } catch (err) {
+        if (err.code === 11e3 || err.code === "23505") throw err;
+        console.warn("[UserService] Supabase create user fallback:", err?.message);
+      }
+    }
     if (memoryUsers.has(normalized)) {
       const err = new Error("Duplicate key");
       err.code = 11e3;
@@ -983,12 +1409,30 @@ var UserService = {
     return wrapUserWithMethods(memUser);
   },
   async updateById(id, updates) {
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const row = mapUserToSupabase(updates);
+          const { data, error } = await client.from("users").update(row).eq("id", id).select().single();
+          if (!error && data) {
+            const mapped = wrapUserWithMethods(mapSupabaseToUser(data));
+            if (mapped.email) memoryUsers.set(mapped.email, mapped);
+            return mapped;
+          }
+        }
+      } catch (err) {
+        console.warn("[UserService] Supabase updateById fallback:", err?.message);
+      }
+    }
     if (mongoose4.connection.readyState === 1) {
       try {
-        const user = await User.findByIdAndUpdate(id, { $set: updates }, { new: true, runValidators: true });
-        if (user) {
-          memoryUsers.set(user.email, user.toObject ? user.toObject() : user);
-          return user;
+        if (mongoose4.isValidObjectId(id)) {
+          const user = await User.findByIdAndUpdate(id, { $set: updates }, { returnDocument: "after", runValidators: true });
+          if (user) {
+            memoryUsers.set(user.email, user.toObject ? user.toObject() : user);
+            return user;
+          }
         }
       } catch (err) {
       }
@@ -1003,6 +1447,16 @@ var UserService = {
     return null;
   },
   async count() {
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const { count, error } = await client.from("users").select("*", { count: "exact", head: true });
+          if (!error && count !== null) return count;
+        }
+      } catch {
+      }
+    }
     if (mongoose4.connection.readyState === 1) {
       try {
         return await User.countDocuments();
@@ -1012,6 +1466,19 @@ var UserService = {
     return memoryUsers.size;
   },
   async findAll() {
+    if (isSupabaseConfigured()) {
+      try {
+        const client = getSupabaseClient();
+        if (client) {
+          const { data, error } = await client.from("users").select("*").order("created_at", { ascending: false });
+          if (!error && data) {
+            return data.map((r) => wrapUserWithMethods(mapSupabaseToUser(r)).toSafeJSON());
+          }
+        }
+      } catch (err) {
+        console.warn("[UserService] Supabase findAll fallback:", err?.message);
+      }
+    }
     if (mongoose4.connection.readyState === 1) {
       try {
         const users = await User.find({}).sort({ createdAt: -1 });
@@ -3080,13 +3547,25 @@ router4.post("/parse-document", async (req, res) => {
       });
     }
     const words = extractedText.split(/\s+/).filter(Boolean);
+    let fileUrl;
+    if (isSupabaseConfigured()) {
+      try {
+        const uploadRes = await uploadResumeToSupabase(fileName, buffer, mimeType);
+        if (uploadRes.url) {
+          fileUrl = uploadRes.url;
+        }
+      } catch (uploadErr) {
+        console.warn("[Resume Parser] Supabase storage upload skipped:", uploadErr);
+      }
+    }
     return res.json({
       success: true,
       text: extractedText,
       fileName,
       fileSize: buffer.length,
       wordCount: words.length,
-      method: extractionMethod
+      method: extractionMethod,
+      fileUrl
     });
   } catch (error) {
     console.error("[Resume Parser] Critical error parsing resume document:", error);
@@ -3099,7 +3578,7 @@ router4.post("/parse-document", async (req, res) => {
 var resumeRoutes_default = router4;
 
 // server.ts
-dotenv2.config();
+dotenv3.config();
 var app = express();
 app.set("trust proxy", 1);
 var PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3e3;
