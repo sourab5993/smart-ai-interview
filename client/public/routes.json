@@ -1,0 +1,32 @@
+{
+  "routes": [
+    { "path": "/", "title": "SMART INTERVIEW" },
+    { "path": "/login", "title": "Sign in" },
+    { "path": "/signup", "title": "Create account" },
+    { "path": "/forgot-password", "title": "Forgot password" },
+    { "path": "/reset-password", "title": "Reset password" },
+    { "path": "/project-status", "title": "Project progress" },
+    { "path": "/onboarding", "title": "Onboarding" },
+    { "path": "/app", "title": "Dashboard" },
+    { "path": "/practice", "title": "Practice setup" },
+    { "path": "/practice/:id", "title": "Interview room" },
+    { "path": "/behavioral-interview", "title": "Behavioral Interview Analysis" },
+    { "path": "/behavioral-interview/:id", "title": "Behavioral interview room" },
+    { "path": "/behavioral-report/:id", "title": "Behavioral report" },
+    { "path": "/live-interview", "title": "Live Interview setup" },
+    { "path": "/live-interview/:id", "title": "Live Interview room" },
+    { "path": "/live-report/:id", "title": "Live Interview report" },
+    { "path": "/report/:id", "title": "Interview report" },
+    { "path": "/questions", "title": "Question bank" },
+    { "path": "/resume", "title": "Resume" },
+    { "path": "/performance", "title": "Performance" },
+    { "path": "/skill-gap", "title": "Skill gap" },
+    { "path": "/study-plan", "title": "Study plan" },
+    { "path": "/history", "title": "History" },
+    { "path": "/history/:id", "title": "History report" },
+    { "path": "/bookmarks", "title": "Bookmarks" },
+    { "path": "/settings", "title": "Settings" },
+    { "path": "/project-insights", "title": "Project Insights" },
+    { "path": "/admin", "title": "Admin" }
+  ]
+}

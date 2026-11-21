@@ -1,0 +1,182 @@
+-- Expand the starter question bank with realistic, discipline-specific material.
+-- This is idempotent: existing question texts and role/course names are preserved.
+insert into public.careers(name,description,course_category_id)
+select v.name,v.description,c.id from (values
+ ('Hospitality Operations','Coordinate guest service, lodging, tourism and culinary operations.','hospitality'),
+ ('Skilled Trades','Apply verified practical skills in a safe, standards-led trade.','vocational'),
+ ('Business Operations','Improve service, people and process outcomes across an organization.','management'),
+ ('Public Service','Support transparent, evidence-based public and community services.','other')
+) v(name,description,slug) join public.course_categories c on c.slug=v.slug on conflict(name) do nothing;
+
+insert into public.specializations(course_id,name)
+select c.id,v.name from (values
+ ('bcom','Accounting'),('bcom','Finance'),('bcom','Banking'),('bcom','Taxation'),('bcom','Auditing'),('bcom','Business Analytics'),
+ ('mcom','Accounting'),('mcom','Finance'),('mcom','Banking'),('mcom','Taxation'),('mcom','Auditing'),
+ ('bba','Finance'),('bba','Human Resources'),('bba','Operations'),('bba','International Business'),('bba','Entrepreneurship'),
+ ('mba','Marketing'),('mba','Operations'),('mba','Business Analytics'),('mba','International Business'),('mba','Entrepreneurship'),
+ ('pgdm','Finance'),('pgdm','Marketing'),('pgdm','Human Resources'),('pgdm','Operations'),('pgdm','International Business'),
+ ('bsc','Biotechnology'),('bsc','Microbiology'),('bsc','Environmental Science'),('bsc','Statistics'),('bsc','Zoology'),('bsc','Botany'),
+ ('msc','Biotechnology'),('msc','Microbiology'),('msc','Environmental Science'),('msc','Statistics'),('msc','Zoology'),('msc','Botany'),
+ ('ba','History'),('ba','Political Science'),('ba','Sociology'),('ba','Economics'),('ba','Geography'),('ba','Philosophy'),('ba','Journalism'),('ba','Mass Communication'),('ba','Languages'),
+ ('ma','History'),('ma','Political Science'),('ma','Sociology'),('ma','Economics'),('ma','Geography'),('ma','Psychology'),('ma','Journalism'),('ma','Mass Communication'),('ma','Languages'),
+ ('llb','Criminal Law'),('llb','Constitutional Law'),('llb','Civil Law'),('llb','Intellectual Property Law'),('llb','Cyber Law'),
+ ('llm','Corporate Law'),('llm','Criminal Law'),('llm','Constitutional Law'),('llm','Civil Law'),('llm','Intellectual Property Law'),('llm','Cyber Law'),
+ ('bdes','Fashion Design'),('bdes','Graphic Design'),('bdes','Interior Design'),('bdes','Animation'),('bdes','Film'),('bdes','Photography'),
+ ('mdes','Fashion Design'),('mdes','Graphic Design'),('mdes','Interior Design'),('mdes','Animation'),('mdes','Film'),('mdes','Photography'),
+ ('bed','Special Education'),('bed','Educational Administration'),('med','Special Education'),('med','Educational Administration'),
+ ('hotel-management','Hospitality Management'),('hotel-management','Culinary Arts'),('hotel-management','Front Office'),('travel-tourism','Tour Operations'),('travel-tourism','Travel Services'),
+ ('bsc-agriculture','Agricultural Engineering'),('bsc-agriculture','Food Technology'),('bsc-agriculture','Dairy Technology'),('msc-agriculture','Agricultural Engineering'),('msc-agriculture','Food Technology'),('msc-agriculture','Dairy Technology'),
+ ('iti','Electrician'),('iti','Fitter'),('iti','Welder'),('iti','Mechanic'),('iti','Electronics Technician'),('diploma','Electrical Engineering'),('diploma','Mechanical Engineering'),('diploma','Civil Engineering'),('diploma','Automobile Engineering'),('diploma','Laboratory Technology')
+) as v(course_slug,name) join public.courses c on c.slug=v.course_slug on conflict(course_id,name) do nothing;
+
+insert into public.job_roles(name,category,interview_types) values
+ ('Electrical Design Engineer','engineering',array['Domain','Technical','HR']),
+ ('Chemical Engineer','engineering',array['Domain','Technical','Situational']),
+ ('Medical Representative','medical',array['Domain','Situational','HR']),
+ ('Clinical Research Associate','medical',array['Domain','Technical','HR']),
+ ('Medical Laboratory Technologist','medical',array['Domain','Viva','HR']),
+ ('Physiotherapist','medical',array['Domain','Situational','HR']),
+ ('Dental Associate','medical',array['Domain','Viva','HR']),
+ ('Human Resources Generalist','management',array['Behavioral','Situational','HR']),
+ ('Operations Associate','management',array['Case Study','Situational','HR']),
+ ('Auditor','commerce',array['Domain','Technical','HR']),
+ ('Tax Associate','commerce',array['Domain','Technical','HR']),
+ ('Laboratory Research Assistant','science',array['Domain','Viva','Technical']),
+ ('Journalist','arts',array['Communication','Situational','HR']),
+ ('Corporate Legal Associate','law',array['Domain','Case Study','HR']),
+ ('UX Researcher','design',array['Case Study','Communication','HR']),
+ ('Early Years Educator','education',array['Situational','Communication','HR']),
+ ('Hotel Front Office Associate','hospitality',array['Situational','Communication','HR']),
+ ('Agronomy Officer','agriculture',array['Domain','Situational','HR']),
+ ('ITI Electrician','vocational',array['Domain','Viva','Situational']),
+ ('Diploma Engineering Technician','vocational',array['Domain','Viva','Situational']),
+ ('Community Program Associate','other',array['Behavioral','Communication','Situational'])
+on conflict(name) do nothing;
+
+insert into public.question_bank(course_category,course_names,topic,question_text,role,interview_type,difficulty,question_category) values
+-- Engineering and technology: CSE, mechanical, civil, electrical and chemical.
+('engineering',array['B.Tech','B.E.','Computer Science','Information Technology','BCA','MCA','B.Sc Computer Science','B.Sc IT'],'Data Structures','How would you choose between a hash map, a balanced tree and a sorted array for a lookup-heavy workload?','Software Engineer','Technical','Medium','Technical Fundamentals'),
+('engineering',array['B.Tech','B.E.','Computer Science','Information Technology','BCA','MCA'],'Algorithms','Explain how you would find a cycle in a linked list and analyze the time and space costs.','Software Engineer','Coding','Medium','Problem Solving'),
+('engineering',array['B.Tech','B.E.','Computer Science','Information Technology','MCA'],'Databases','A report query becomes slow as a table grows. How would you inspect the query plan and decide whether an index is appropriate?','Backend Developer','Technical','Hard','Technical Fundamentals'),
+('engineering',array['B.Tech','B.E.','Computer Science','Information Technology','BCA','MCA'],'Operating Systems','What happens during a context switch, and how can excessive switching affect application throughput?','Software Engineer','Viva','Medium','Technical Fundamentals'),
+('engineering',array['B.Tech','B.E.','Computer Science','Information Technology','BCA','MCA'],'Networks','Walk through the major steps when a browser loads an HTTPS page from a domain name.','Software Engineer','Technical','Medium','Technical Fundamentals'),
+('engineering',array['B.Tech','B.E.','Mechanical Engineering','Mechanical'],'Thermodynamics','How would you explain the practical difference between a heat engine and a refrigeration cycle using an energy-flow diagram?','Mechanical Design Engineer','Domain','Medium','Core Concepts'),
+('engineering',array['B.Tech','B.E.','Mechanical Engineering','Mechanical'],'Machine Design','A shaft carries a fluctuating load. Which failure modes and design factors would you evaluate before selecting its dimensions?','Mechanical Design Engineer','Technical','Hard','Design Application'),
+('engineering',array['B.Tech','B.E.','Mechanical Engineering','Mechanical','Diploma Engineering'],'Manufacturing','When would you recommend casting, machining or additive manufacturing for a small production run, and what trade-offs matter?','Mechanical Design Engineer','Case Study','Medium','Applied Engineering'),
+('engineering',array['B.Tech','B.E.','Mechanical Engineering','Mechanical'],'Materials','How would you select a material for a lightweight component that experiences fatigue and a corrosive environment?','Mechanical Design Engineer','Domain','Hard','Design Application'),
+('engineering',array['B.Tech','B.E.','Mechanical Engineering','Mechanical'],'CAD','Describe how you would check a CAD assembly for interference, tolerances and manufacturability before release.','Mechanical Design Engineer','Situational','Medium','Applied Engineering'),
+('engineering',array['B.Tech','B.E.','Mechanical Engineering','Mechanical'],'Fluid Mechanics','What physical measurements would you use to estimate pressure loss in a pipe network, and what assumptions must be stated?','Mechanical Design Engineer','Viva','Medium','Core Concepts'),
+('engineering',array['B.Tech','B.E.','Mechanical Engineering','Mechanical'],'Quality Control','A manufactured part fails inspection intermittently. How would you distinguish process variation from a measurement problem?','Mechanical Design Engineer','Situational','Medium','Problem Solving'),
+('engineering',array['B.Tech','B.E.','Civil Engineering','Civil'],'Structural Analysis','How do load paths change when a simply supported beam is replaced with a continuous beam? State the assumptions in your explanation.','Civil Engineer','Domain','Medium','Core Concepts'),
+('engineering',array['B.Tech','B.E.','Civil Engineering','Civil'],'Geotechnical Engineering','What site investigation evidence would you seek before recommending foundations for a structure on variable soil?','Civil Engineer','Technical','Hard','Applied Engineering'),
+('engineering',array['B.Tech','B.E.','Civil Engineering','Civil'],'Construction Management','A project is behind schedule after a material delivery delay. How would you assess critical-path impacts and communicate options?','Civil Engineer','Situational','Medium','Project Management'),
+('engineering',array['B.Tech','B.E.','Civil Engineering','Civil'],'Surveying','How would you establish and verify a control point when nearby measurements disagree beyond the expected tolerance?','Civil Engineer','Viva','Medium','Applied Engineering'),
+('engineering',array['B.Tech','B.E.','Civil Engineering','Civil'],'Transportation','Which traffic and safety observations would you collect before proposing a change to a busy urban junction?','Civil Engineer','Case Study','Medium','Problem Solving'),
+('engineering',array['B.Tech','B.E.','Civil Engineering','Civil'],'Water Resources','How would seasonal rainfall and demand uncertainty affect a basic water-supply planning recommendation?','Civil Engineer','Technical','Hard','Applied Engineering'),
+('engineering',array['B.Tech','B.E.','Electrical Engineering','Electrical'],'Circuit Analysis','How would you verify the expected current and power in a mixed series-parallel circuit before energizing a test setup?','Electrical Design Engineer','Viva','Easy','Core Concepts'),
+('engineering',array['B.Tech','B.E.','Electrical Engineering','Electrical'],'Power Systems','What factors determine voltage drop and losses on a feeder, and how might you investigate an unexpected measurement?','Electrical Design Engineer','Domain','Medium','Applied Engineering'),
+('engineering',array['B.Tech','B.E.','Electrical Engineering','Electrical'],'Control Systems','Describe how overshoot and settling time appear in a step response and which design trade-offs you would discuss.','Electrical Design Engineer','Technical','Hard','Core Concepts'),
+('engineering',array['B.Tech','B.E.','Electrical Engineering','Electrical'],'Electrical Safety','What isolation, verification and documentation steps are essential before beginning approved electrical maintenance?','Electrical Design Engineer','Situational','Medium','Safety and Practice'),
+('engineering',array['B.Tech','B.E.','Electrical Engineering','Electrical'],'Instrumentation','A sensor output drifts during a test. How would you separate sensor error, wiring faults and environmental effects?','Electrical Design Engineer','Technical','Medium','Problem Solving'),
+('engineering',array['B.Tech','B.E.','Chemical Engineering','Chemical'],'Mass Transfer','How do concentration driving force and interfacial area influence the performance of a separation column?','Chemical Engineer','Domain','Hard','Core Concepts'),
+('engineering',array['B.Tech','B.E.','Chemical Engineering','Chemical'],'Process Safety','Which hazard-review questions would you raise before changing the operating conditions of a process unit?','Chemical Engineer','Situational','Medium','Safety and Practice'),
+('engineering',array['B.Tech','B.E.','Chemical Engineering','Chemical'],'Reaction Engineering','How would you use conversion, selectivity and temperature data when comparing two reactor options?','Chemical Engineer','Case Study','Hard','Applied Engineering'),
+('engineering',array['B.Tech','B.E.','Chemical Engineering','Chemical'],'Process Control','A measured process variable oscillates around its set point. What evidence would you inspect before recommending a control change?','Chemical Engineer','Technical','Medium','Problem Solving'),
+-- Medical and healthcare: interview-learning prompts only, never diagnosis or treatment advice.
+('medical',array['MBBS','Medicine'],'Clinical Communication','How would you explain the purpose of a clinical handover and what information should be communicated clearly to the receiving team?','Staff Nurse','Situational','Medium','Professional Practice'),
+('medical',array['MBBS','BDS','BAMS','BHMS','B.Sc Nursing','GNM','ANM'],'Patient Safety','Describe how you would raise and document a patient-safety concern through your institution approved escalation process.','Staff Nurse','Behavioral','Medium','Professional Practice'),
+('medical',array['MBBS'],'Research Ethics','What safeguards should be considered when collecting consent and protecting participant confidentiality in a clinical research project?','Clinical Research Associate','Domain','Hard','Ethics'),
+('medical',array['MBBS','BDS','BPT','BOT','B.Sc Nursing'],'Teamwork','Tell us about a time you communicated a complex task with a multidisciplinary team. How did you check that responsibilities were understood?','Staff Nurse','Behavioral','Medium','Behavioral'),
+('medical',array['B.Pharm','M.Pharm','Pharmacy'],'Pharmacovigilance','What information is useful in a safety report, and why should uncertainties and source records be documented accurately?','Pharmacovigilance Associate','Domain','Medium','Core Concepts'),
+('medical',array['B.Pharm','M.Pharm','Pharmacy'],'Drug Safety','How would you prioritize incoming safety case records while maintaining traceability and quality checks?','Pharmacovigilance Associate','Case Study','Hard','Applied Healthcare'),
+('medical',array['B.Pharm','M.Pharm','Pharmacy'],'Medical Representative','How would you explain a product claim using only approved, substantiated information while responding to a clinician question?','Medical Representative','Situational','Medium','Ethics'),
+('medical',array['B.Pharm','M.Pharm'],'Quality Assurance','Which records and review checks would you examine when investigating a deviation in a pharmaceutical quality process?','Pharmacovigilance Associate','Technical','Hard','Applied Healthcare'),
+('medical',array['B.Sc Nursing','GNM','ANM'],'Nursing Practice','What does a clear shift handover accomplish, and how would you organize the information you are responsible for communicating?','Staff Nurse','Viva','Easy','Core Concepts'),
+('medical',array['B.Sc Nursing','GNM','ANM'],'Infection Prevention','How would you describe the purpose of standard precautions and how you keep your practice aligned with local protocol?','Staff Nurse','Domain','Medium','Professional Practice'),
+('medical',array['B.Sc Nursing','GNM','ANM'],'Patient Dignity','A patient is uncomfortable discussing a personal matter. How would you support dignity, privacy and respectful communication?','Staff Nurse','Situational','Medium','Communication'),
+('medical',array['B.Sc Nursing','GNM','ANM'],'Documentation','Why should care documentation be factual, timely and attributable, and how would you correct a discovered omission under local policy?','Staff Nurse','Viva','Medium','Professional Practice'),
+('medical',array['Medical Laboratory Technology','Radiology','B.Sc'],'Laboratory Quality','What controls help a laboratory maintain specimen traceability and recognize an unreliable result before it is reported?','Medical Laboratory Technologist','Technical','Medium','Applied Healthcare'),
+('medical',array['Medical Laboratory Technology','Radiology'],'Equipment Quality','How would you follow a documented quality-control process when an instrument check falls outside its acceptable range?','Medical Laboratory Technologist','Situational','Medium','Professional Practice'),
+('medical',array['BPT','BOT'],'Rehabilitation Communication','How would you set a clear, respectful goal with a client while keeping communication within your training and supervision?','Physiotherapist','Behavioral','Medium','Communication'),
+('medical',array['BDS'],'Dental Teamwork','Describe how preparation, documentation and clear team communication support a safe dental-clinic workflow.','Dental Associate','Viva','Easy','Professional Practice'),
+-- Business and management.
+('management',array['BBA','MBA','PGDM'],'Marketing Strategy','A new service has a limited launch budget. Which audience, positioning and outcome measures would you define first?','Marketing Executive','Case Study','Medium','Business Case'),
+('management',array['BBA','MBA','PGDM'],'Consumer Behavior','How would you distinguish a stated customer preference from behavior observed in a well-designed study?','Marketing Executive','Domain','Medium','Core Concepts'),
+('management',array['BBA','MBA','PGDM'],'Digital Marketing','Which leading and lagging indicators would you use to evaluate a digital campaign, and how would you avoid over-crediting one channel?','Marketing Executive','Technical','Hard','Applied Business'),
+('management',array['BBA','MBA','PGDM'],'Branding','How would you maintain a consistent brand promise across different audiences without ignoring local context?','Marketing Executive','Situational','Medium','Communication'),
+('management',array['BBA','MBA','PGDM'],'Human Resources','How would you structure a fair, job-related interview process and keep candidate evaluation evidence-based?','Human Resources Generalist','Situational','Medium','Professional Practice'),
+('management',array['MBA','PGDM'],'Operations','A service queue is growing while staffing is fixed. What process evidence would you collect before proposing an improvement?','Operations Associate','Case Study','Hard','Problem Solving'),
+('management',array['BBA','MBA','PGDM'],'Leadership','Tell us about a time you resolved a disagreement on a team. How did you listen, decide and follow up?','Business Analyst','Behavioral','Medium','Behavioral'),
+-- Commerce and finance.
+('commerce',array['B.Com','M.Com','Commerce'],'Financial Statements','How do the income statement, balance sheet and cash-flow statement connect when a business records a new loan?','Financial Analyst','Domain','Medium','Core Concepts'),
+('commerce',array['B.Com','M.Com','Accounting & Finance'],'Accounting','Explain the difference between accrual and cash accounting using a simple business transaction.','Accountant','Viva','Easy','Core Concepts'),
+('commerce',array['B.Com','M.Com','Accounting & Finance'],'Bank Reconciliation','What steps would you take when a bank reconciliation shows an unexplained timing difference?','Accountant','Technical','Medium','Applied Finance'),
+('commerce',array['B.Com','M.Com','Accounting & Finance'],'GST and Taxation','What source records and checks would you use to prepare a compliant indirect-tax reconciliation under the applicable current rules?','Tax Associate','Domain','Hard','Professional Practice'),
+('commerce',array['B.Com','M.Com','Accounting & Finance'],'Auditing','How would you select supporting evidence when testing whether a recorded expense has adequate authorization?','Auditor','Case Study','Medium','Audit Practice'),
+('commerce',array['B.Com','M.Com','Finance'],'Financial Analysis','Which ratios would you use to assess short-term liquidity, and what can make a comparison misleading?','Financial Analyst','Technical','Medium','Applied Finance'),
+('commerce',array['B.Com','M.Com','Finance'],'Budget Variance','Actual costs exceed budget in one department. How would you separate volume, price and timing explanations?','Financial Analyst','Case Study','Hard','Problem Solving'),
+('commerce',array['B.Com','M.Com','Banking'],'Ethics and Controls','You notice an incomplete support document near a reporting deadline. How would you resolve it without bypassing a control?','Accountant','Situational','Medium','Ethics'),
+-- Science and research.
+('science',array['B.Sc','M.Sc','Physics'],'Experimental Design','How would you choose control variables and repeat measurements for an experiment with a noisy signal?','Research Assistant','Viva','Medium','Research Methods'),
+('science',array['B.Sc','M.Sc','Chemistry'],'Laboratory Safety','Which preparation and documentation steps would you take before an approved laboratory procedure involving a hazardous reagent?','Research Assistant','Situational','Medium','Safety and Practice'),
+('science',array['B.Sc','M.Sc','Biology','Biotechnology','Microbiology'],'Data Interpretation','Your sample results differ across replicates. How would you evaluate measurement error, biological variation and the next analysis step?','Research Assistant','Domain','Hard','Problem Solving'),
+('science',array['B.Sc','M.Sc','Statistics','Mathematics'],'Statistics','Explain the difference between a confidence interval and a prediction interval, and when each is useful.','Data Analyst','Technical','Medium','Core Concepts'),
+('science',array['B.Sc','M.Sc','Environmental Science'],'Environmental Science','How would you design a sampling plan that accounts for seasonality and variation across locations?','Research Assistant','Case Study','Medium','Research Methods'),
+('science',array['B.Sc','M.Sc','Physics','Chemistry'],'Research Integrity','How would you record an unexpected result so another researcher can understand what was observed and what remains uncertain?','Research Assistant','Behavioral','Medium','Ethics'),
+('science',array['B.Sc','M.Sc','Zoology','Botany'],'Scientific Communication','How would you explain the main limitation of a research finding to a non-specialist without overstating the evidence?','Research Assistant','Communication','Medium','Communication'),
+-- Arts, humanities and communication.
+('arts',array['BA','MA','English'],'Writing and Editing','How do you adapt tone and structure when the same evidence must be communicated to two different audiences?','Content Writer','Communication','Medium','Communication'),
+('arts',array['BA','MA','History'],'Historical Analysis','How would you compare two primary sources that describe the same event differently?','Research Assistant','Viva','Medium','Critical Analysis'),
+('arts',array['BA','MA','Psychology'],'Research Ethics','What consent, confidentiality and supervision boundaries matter in a student-led behavioral research project?','Research Assistant','Domain','Hard','Ethics'),
+('arts',array['BA','MA','Economics'],'Economic Reasoning','How would you explain the difference between correlation and causation using a social or economic example?','Research Assistant','Technical','Medium','Core Concepts'),
+('arts',array['BA','MA','Journalism','Mass Communication'],'Journalism','How would you verify a fast-developing claim before deciding whether it is ready to publish?','Journalist','Situational','Hard','Ethics'),
+('arts',array['BA','MA','Political Science','Sociology'],'Critical Thinking','How would you distinguish a source observation from an interpretation in a short policy analysis?','Content Writer','Case Study','Medium','Critical Analysis'),
+('arts',array['BA','MA','English','Languages'],'Editorial Communication','Tell us how you would respond to substantive editorial feedback when the intended meaning is important to preserve.','Content Writer','Behavioral','Medium','Behavioral'),
+-- Law.
+('law',array['LLB','LLM','Law'],'Legal Research','How would you verify that an authority is current and applicable before relying on it in a written case note?','Legal Associate','Domain','Medium','Legal Analysis'),
+('law',array['LLB','LLM','Corporate Law'],'Contract Analysis','Which clauses would you review first to understand allocation of obligations, risk and termination rights in a commercial contract?','Corporate Legal Associate','Case Study','Hard','Applied Law'),
+('law',array['LLB','LLM','Criminal Law'],'Evidence and Procedure','How would you distinguish a factual allegation from admissible evidence when preparing a neutral case summary?','Legal Associate','Viva','Medium','Legal Analysis'),
+('law',array['LLB','LLM','Constitutional Law'],'Constitutional Principles','How would you structure an argument that identifies the legal issue, governing principle, competing interests and conclusion?','Legal Associate','Case Study','Hard','Legal Reasoning'),
+('law',array['LLB','LLM','Cyber Law'],'Cyber Law','What questions would you investigate before assessing the legal and jurisdictional issues raised by a reported data incident?','Corporate Legal Associate','Domain','Hard','Applied Law'),
+('law',array['LLB','LLM','Civil Law'],'Client Communication','How would you explain a procedural next step clearly while distinguishing established facts from matters that still need verification?','Legal Associate','Communication','Medium','Professional Practice'),
+-- Design and creative careers.
+('design',array['B.Des','M.Des','UI/UX','Graphic Design'],'User Research','How would you turn a broad product assumption into a research question that can be investigated with users?','Product Designer','Case Study','Medium','Design Practice'),
+('design',array['B.Des','M.Des','UI/UX'],'Interaction Design','How would you test whether an error state helps a first-time user recover without losing work?','Product Designer','Technical','Medium','Design Practice'),
+('design',array['B.Des','M.Des','Graphic Design'],'Visual Communication','Which hierarchy and contrast decisions make a dense information graphic easier to scan?','Product Designer','Viva','Easy','Core Concepts'),
+('design',array['B.Des','M.Des','Fashion Design'],'Design Process','Describe how material constraints, user needs and sustainability can influence an early design direction.','Product Designer','Situational','Medium','Applied Design'),
+('design',array['B.Des','M.Des','Animation'],'Creative Portfolio','Choose one portfolio project and explain your role, important iteration and what you would improve next.','Product Designer','Behavioral','Medium','Portfolio'),
+('design',array['B.Des','M.Des','Interior Design'],'Accessibility','What inclusive-design considerations would you review before handing an interior or digital concept to a client?','Product Designer','Domain','Hard','Professional Practice'),
+-- Education.
+('education',array['B.Ed','M.Ed','Education'],'Lesson Planning','How would you state a measurable learning objective and align one lesson activity to it?','Teacher','Domain','Easy','Teaching Practice'),
+('education',array['B.Ed','M.Ed','Special Education'],'Inclusive Education','How would you learn about a learner support requirement and coordinate appropriate adjustments within school policy?','Early Years Educator','Situational','Hard','Inclusive Practice'),
+('education',array['B.Ed','M.Ed','Education'],'Classroom Management','A group loses focus during an activity. How would you respond while keeping expectations consistent and respectful?','Teacher','Situational','Medium','Classroom Practice'),
+('education',array['B.Ed','M.Ed','Educational Administration'],'Assessment','How would you use assessment evidence to decide whether to revisit a concept or move to the next objective?','Teacher','Case Study','Medium','Assessment Practice'),
+('education',array['B.Ed','M.Ed','Education'],'Communication with Families','How would you communicate a student progress concern with a family while protecting confidentiality and remaining constructive?','Teacher','Communication','Medium','Professional Practice'),
+('education',array['B.Ed','M.Ed','Education'],'Teaching Reflection','Tell us about a lesson that did not go as planned. What evidence informed your next adjustment?','Teacher','Behavioral','Medium','Behavioral'),
+-- Hospitality and tourism.
+('hospitality',array['Hotel Management','Hospitality Management','Hotel Management'],'Guest Services','A guest reports that a reservation detail is incorrect. How would you verify it and coordinate a clear resolution?','Hotel Front Office Associate','Situational','Easy','Service Practice'),
+('hospitality',array['Travel & Tourism','Hotel Management','Tourism'],'Tour Operations','How would you plan a tour itinerary that accounts for timing, accessibility, weather uncertainty and clear guest information?','Hotel Front Office Associate','Case Study','Medium','Operations'),
+('hospitality',array['Hotel Management','Culinary Arts','Food Safety'],'Food Safety','What routine checks and escalation steps help maintain safe food handling in a busy kitchen?','Hotel Front Office Associate','Domain','Medium','Safety and Practice'),
+('hospitality',array['Hotel Management','Hospitality Management'],'Service Recovery','Describe how you would respond to a service complaint, document the issue and avoid promising an outcome outside your authority.','Hotel Front Office Associate','Behavioral','Medium','Communication'),
+('hospitality',array['Hotel Management','Hospitality Management'],'Revenue Management','Which demand and capacity signals would you consider before adjusting room inventory for a seasonal period?','Operations Associate','Case Study','Hard','Applied Business'),
+-- Agriculture and food technology.
+('agriculture',array['B.Sc Agriculture','M.Sc Agriculture','Agriculture'],'Crop Science','Which field observations would you record before comparing the performance of two crop-management approaches?','Agriculture Officer','Domain','Medium','Core Concepts'),
+('agriculture',array['B.Sc Agriculture','M.Sc Agriculture','Horticulture'],'Soil Science','How would soil texture, organic matter and drainage inform a responsible field-level recommendation?','Agronomy Officer','Viva','Medium','Applied Agriculture'),
+('agriculture',array['B.Sc Agriculture','M.Sc Agriculture','Agronomy'],'Sustainable Agriculture','How would you explain a trade-off between short-term output and long-term soil health using observable evidence?','Agronomy Officer','Case Study','Hard','Sustainability'),
+('agriculture',array['B.Sc Agriculture','M.Sc Agriculture','Agricultural Engineering'],'Agricultural Engineering','How would you compare irrigation options when water availability and energy use are both constraints?','Agriculture Officer','Technical','Medium','Applied Engineering'),
+('agriculture',array['B.Sc Agriculture','M.Sc Agriculture','Food Technology'],'Food Technology','Which quality and traceability checks would you consider when reviewing a food-processing workflow?','Agriculture Officer','Domain','Medium','Quality Practice'),
+('agriculture',array['B.Sc Agriculture','M.Sc Agriculture','Dairy Technology'],'Agriculture Communication','How would you explain a research-backed agricultural practice to a grower while checking local constraints and uncertainty?','Agronomy Officer','Communication','Medium','Communication'),
+-- Vocational and diploma courses.
+('vocational',array['ITI','Electrician','Diploma','Diploma Engineering','Electrical Engineering'],'Trade Safety','What checks should be completed before an authorized electrical task begins, and how would you confirm the equipment state?','ITI Electrician','Viva','Medium','Safety and Practice'),
+('vocational',array['ITI','Fitter','Diploma Engineering','Mechanical Engineering'],'Workshop Measurement','How would you choose an appropriate measuring tool and record a dimension that is near the tolerance limit?','Diploma Engineering Technician','Domain','Easy','Applied Engineering'),
+('vocational',array['ITI','Welder','Diploma Engineering'],'Welding Quality','Which visual signs would prompt you to pause work and request the required weld-quality review?','Diploma Engineering Technician','Situational','Medium','Quality Practice'),
+('vocational',array['ITI','Mechanic','Automobile Engineering'],'Automotive Maintenance','How would you use a documented inspection sequence to isolate a reported mechanical fault without replacing parts prematurely?','Diploma Engineering Technician','Technical','Medium','Problem Solving'),
+('vocational',array['Diploma Engineering','Laboratory Technology','Professional certifications'],'Workplace Communication','Describe how you would hand over an unfinished practical task so the next technician can continue it safely.','Diploma Engineering Technician','Behavioral','Easy','Professional Practice'),
+-- Custom courses can practice transferable, role-relevant communication rather than being treated as a technical discipline.
+('other',array['Other / Custom Course','Custom course'],'Career Context','How would you connect a concept from your course to a real task in the role you are preparing for?','Community Program Associate','Communication','Easy','Career Readiness'),
+('other',array['Other / Custom Course','Custom course'],'Learning Agility','Tell us how you learned an unfamiliar topic for a project and how you checked that your understanding was sound.','Community Program Associate','Behavioral','Medium','Behavioral'),
+('other',array['Other / Custom Course','Custom course'],'Professional Judgment','A task is unclear and the deadline is close. What questions would you ask before deciding how to proceed?','Community Program Associate','Situational','Medium','Professional Practice')
+on conflict(question_text) do nothing;
+
+-- If a new course is added by an administrator, its catalog tables remain the source of truth;
+-- these initial seeds only make common cross-disciplinary routes available immediately.
