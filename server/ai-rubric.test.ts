@@ -123,6 +123,85 @@ describe("evidence-backed evaluation rubric", () => {
     expect(result.dimensions.map(dimension => dimension.name)).toEqual(["Relevance"]);
   });
 
+  it("scales 0-10 rubric scores to 0-100 when declaredScale is 0-10 or low rubric integers are returned", () => {
+    const result = scoreEvidenceBackedDimensions(
+      [
+        {
+          name: "Relevance",
+          score: 8,
+          note: "Good domain relevance.",
+          evidence: "I used React and TypeScript",
+        },
+        {
+          name: "Problem Solving",
+          score: 7,
+          note: "Clear solution approach.",
+          evidence: "I resolved the memory leak",
+        },
+      ],
+      "In the project I used React and TypeScript. I resolved the memory leak by cleaning up listeners.",
+      [
+        { name: "Relevance", weight: 50 },
+        { name: "Problem Solving", weight: 50 },
+      ],
+      "0-10"
+    );
+
+    expect(result.overallScore).toBe(75);
+    expect(result.dimensions[0].score).toBe(80);
+    expect(result.dimensions[1].score).toBe(70);
+  });
+
+  it("preserves 0-100 scale scores without double-scaling", () => {
+    const result = scoreEvidenceBackedDimensions(
+      [
+        {
+          name: "Relevance",
+          score: 85,
+          note: "Strong relevance.",
+          evidence: "I optimized database queries",
+        },
+      ],
+      "I optimized database queries to reduce p99 latency.",
+      [{ name: "Relevance", weight: 1 }],
+      "0-100"
+    );
+
+    expect(result.overallScore).toBe(85);
+    expect(result.dimensions[0].score).toBe(85);
+  });
+
+  it("matches evidence with smart quotes and collapsed whitespace while still rejecting fabricated quotes", () => {
+    const result = scoreEvidenceBackedDimensions(
+      [
+        {
+          name: "Relevance",
+          score: 80,
+          note: "Accurate quote with curly quotes.",
+          evidence: '"strict mode" helped catch bugs',
+        },
+      ],
+      'Using “strict mode”  helped catch bugs early.',
+      [{ name: "Relevance", weight: 1 }]
+    );
+
+    expect(result.overallScore).toBe(80);
+    expect(() =>
+      scoreEvidenceBackedDimensions(
+        [
+          {
+            name: "Relevance",
+            score: 80,
+            note: "Fabricated quote.",
+            evidence: "completely fabricated sentence",
+          },
+        ],
+        'Using “strict mode”  helped catch bugs early.',
+        [{ name: "Relevance", weight: 1 }]
+      )
+    ).toThrow("exact supporting answer evidence");
+  });
+
   describe("safe Gemini JSON parsing", () => {
     it("preserves commas, quotation marks, and curly quotes inside string contents", () => {
       const raw = `{"text": "Item 1, and } item 2", "quote": "He said \\"hello\\" and 'goodbye'", "curly": "“smart quotes”", "trailing": 42, }`;

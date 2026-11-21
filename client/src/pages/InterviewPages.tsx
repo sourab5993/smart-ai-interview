@@ -2729,6 +2729,9 @@ export function ReportPage() {
               {score !== null && (
                 <Tag tone="cyan">{readinessLabel(score)}</Tag>
               )}
+              {answerQuality !== null && (
+                <Tag tone="violet">Answer quality: {answerQuality}/100</Tag>
+              )}
               <Tag>
                 {answeredCount} / {answers.length} answered
               </Tag>

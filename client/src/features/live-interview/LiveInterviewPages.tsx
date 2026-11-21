@@ -110,33 +110,100 @@ export function LiveInterviewSetup() {
   const create = trpc.liveInterview.create.useMutation();
   const saveQuestion = trpc.liveInterview.saveQuestion.useMutation();
   const generate = trpc.ai.generateQuestions.useMutation();
-  async function start() {
+  const isStartingRef = useRef(false);
+  const prefetchedRef = useRef<{
+    role: string;
+    lang: string;
+    promise: Promise<any> | null;
+    data: any;
+  } | null>(null);
+
+  useEffect(() => {
     const target = role.trim();
-    if (!target) {
-      setError("Enter the target role to begin.");
+    const lang = inferredSpeechLocale();
+    if (target.length < 3 || active.data) {
+      prefetchedRef.current = null;
       return;
     }
-    setError("");
-    setRecoveryId("");
-    try {
-      const generated = await generate.mutateAsync({
+    const timer = window.setTimeout(() => {
+      if (prefetchedRef.current?.role === target && prefetchedRef.current?.lang === lang) {
+        return;
+      }
+      const fetchPromise = generate.mutateAsync({
         course: "General interview preparation",
         role: target,
         type: "Live Interview opening question",
         difficulty: "Medium",
         skills: [],
         count: 1,
-        language: questionLanguage(inferredSpeechLocale()),
+        language: questionLanguage(lang),
         context:
           "Create a concise, natural opening question that lets the candidate introduce role-relevant experience. This is the first turn; do not assume a resume or background.",
-      });
-      const first = generated.questions?.[0];
+      })
+        .then(res => {
+          if (prefetchedRef.current?.role === target) {
+            prefetchedRef.current.data = res;
+            prefetchedRef.current.promise = null;
+          }
+          return res;
+        })
+        .catch(() => {
+          if (prefetchedRef.current?.role === target) {
+            prefetchedRef.current = null;
+          }
+        });
+
+      prefetchedRef.current = {
+        role: target,
+        lang,
+        promise: fetchPromise,
+        data: null,
+      };
+    }, 700);
+
+    return () => window.clearTimeout(timer);
+  }, [role, active.data, generate]);
+
+  async function start() {
+    if (isStartingRef.current) return;
+    const target = role.trim();
+    if (!target) {
+      setError("Enter the target role to begin.");
+      return;
+    }
+    isStartingRef.current = true;
+    setError("");
+    setRecoveryId("");
+    try {
+      const speechLang = inferredSpeechLocale();
+      let generatedData = null;
+      if (prefetchedRef.current?.role === target && prefetchedRef.current.lang === speechLang) {
+        if (prefetchedRef.current.data) {
+          generatedData = prefetchedRef.current.data;
+        } else if (prefetchedRef.current.promise) {
+          generatedData = await prefetchedRef.current.promise;
+        }
+      }
+      if (!generatedData?.questions?.[0]?.question?.trim()) {
+        generatedData = await generate.mutateAsync({
+          course: "General interview preparation",
+          role: target,
+          type: "Live Interview opening question",
+          difficulty: "Medium",
+          skills: [],
+          count: 1,
+          language: questionLanguage(speechLang),
+          context:
+            "Create a concise, natural opening question that lets the candidate introduce role-relevant experience. This is the first turn; do not assume a resume or background.",
+        });
+      }
+      const first = generatedData?.questions?.[0];
       if (!first?.question?.trim())
         throw new Error("No usable interviewer question was returned.");
       const session = await create.mutateAsync({
         role: target,
         durationMinutes: duration,
-        speechLanguage: inferredSpeechLocale(),
+        speechLanguage: speechLang,
       });
       setRecoveryId(session.id);
       await saveQuestion.mutateAsync({
@@ -155,13 +222,15 @@ export function LiveInterviewSetup() {
           ? cause.message
           : "We could not start the interview. Check your connection and try again."
       );
+    } finally {
+      isStartingRef.current = false;
     }
   }
   const busy =
     create.isPending ||
-    generate.isPending ||
     saveQuestion.isPending ||
-    active.isLoading;
+    active.isLoading ||
+    isStartingRef.current;
   return (
     <div className="page-stack live-interview-page">
       <PageHeading
@@ -391,6 +460,7 @@ export function LiveInterviewRoom() {
   const answerTimeout = useRef<number | null>(null);
   const submittedRef = useRef(false);
   const listeningStartedAt = useRef(0);
+  const restartTimerRef = useRef<number | null>(null);
   const stopListeningRef = useRef<() => void>(() => {});
   const transcribingAudioRef = useRef(false);
   const abortCapture = useRef(false);
@@ -848,6 +918,7 @@ export function LiveInterviewRoom() {
       stopTracks();
       stopCamera(false);
       if (answerTimeout.current) window.clearTimeout(answerTimeout.current);
+      if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
       speechGenerationRef.current += 1;
       window.speechSynthesis?.cancel?.();
     };
@@ -999,6 +1070,8 @@ export function LiveInterviewRoom() {
       if (transcribedText) {
         setTranscriptDraft(transcribedText);
         setPartial(transcribedText);
+        finalText.current = transcribedText;
+        latestRecognizedText.current = transcribedText;
         await acceptTranscript(transcribedText);
       } else {
         setBusy(false);
@@ -1119,8 +1192,10 @@ export function LiveInterviewRoom() {
     }
 
     // 3. Browser SpeechRecognition for live real-time preview (parallel)
-    const Speech = browserSpeech();
-    if (Speech) {
+    const startSpeechEngine = () => {
+      if (abortCapture.current || stopping.current || phaseRef.current !== "LISTENING") return;
+      const Speech = browserSpeech();
+      if (!Speech) return;
       try {
         const r = new Speech();
         recognition.current = r;
@@ -1154,16 +1229,20 @@ export function LiveInterviewRoom() {
             if (currentTotal) {
               baseTranscript.current = currentTotal;
             }
-            try {
-              r.start();
-            } catch {}
+            if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
+            restartTimerRef.current = window.setTimeout(() => {
+              if (!stopping.current && !abortCapture.current && phaseRef.current === "LISTENING") {
+                startSpeechEngine();
+              }
+            }, 150);
           }
         };
         r.start();
       } catch (speechErr) {
         console.warn("Web Speech start failed:", speechErr);
       }
-    }
+    };
+    startSpeechEngine();
 
     setBusy(false);
     setPhase("LISTENING");
@@ -1177,10 +1256,13 @@ export function LiveInterviewRoom() {
   }
 
   function stopListening() {
+    const durationMs = listeningStartedAt.current ? Date.now() - listeningStartedAt.current : 0;
     listeningStartedAt.current = 0;
     if (phaseRef.current !== "LISTENING") return;
     if (answerTimeout.current) window.clearTimeout(answerTimeout.current);
     answerTimeout.current = null;
+    if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
+    restartTimerRef.current = null;
     setBusy(true);
     stopping.current = true;
     setPhase("PROCESSING_ANSWER");
@@ -1203,9 +1285,26 @@ export function LiveInterviewRoom() {
         });
         stopTracks();
 
-        if (liveText && liveText.trim().length >= 2) {
+        const liveTrimmed = liveText.trim();
+        const words = liveTrimmed ? liveTrimmed.split(/\s+/).filter(Boolean).length : 0;
+
+        // Detect if browser speech recognition stalled/dropped speech:
+        // If candidate spoke for >= 6 seconds and audio recording has substantial size (> 2500 bytes),
+        // but browser transcript has fewer than 7 words, the browser speech engine dropped sentences!
+        const recognitionStalled = durationMs >= 6000 && audioBlob.size > 2500 && words < 7;
+        const noLiveText = words === 0;
+
+        if ((recognitionStalled || noLiveText) && audioBlob.size > 800) {
+          setCapturedAudio(audioBlob);
+          void transcribeCapturedAudio(audioBlob);
+          return;
+        }
+
+        if (liveTrimmed.length >= 2) {
+          setTranscriptDraft(liveTrimmed);
+          setPartial(liveTrimmed);
           setBusy(false);
-          void acceptTranscript(liveText.trim());
+          void acceptTranscript(liveTrimmed);
           return;
         }
 

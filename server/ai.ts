@@ -16,6 +16,7 @@ export const INTERVIEW_ANALYSIS_PROMPT_VERSION = "interview-analysis-v2";
 const evaluationSchema = {
   type: "object",
   properties: {
+    score_scale: { type: "string", enum: ["0-100", "0-10"] },
     overall_score: { type: "integer" },
     dimensions: {
       type: "array",
@@ -38,6 +39,7 @@ const evaluationSchema = {
     improvement_tip: { type: "string" },
   },
   required: [
+    "score_scale",
     "overall_score",
     "dimensions",
     "strengths",
@@ -234,6 +236,7 @@ const questionOutput = z
   .strict();
 const evaluationOutput = z
   .object({
+    score_scale: z.enum(["0-100", "0-10"]).default("0-100"),
     overall_score: score,
     dimensions: z
       .array(
@@ -856,6 +859,7 @@ function baselineEvaluation(
     ) / weightTotal
   );
   return {
+    score_scale: "0-100" as "0-100" | "0-10",
     overall_score: overall,
     dimensions,
     strengths:
@@ -884,7 +888,8 @@ export function scoreEvidenceBackedDimensions(
     evidence: string;
   }>,
   answer: string,
-  criteria: Array<Pick<EvaluationCriterion, "name" | "weight">>
+  criteria: Array<Pick<EvaluationCriterion, "name" | "weight">>,
+  declaredScale?: "0-100" | "0-10"
 ) {
   const normalized = (value: string) =>
     value
@@ -909,6 +914,20 @@ export function scoreEvidenceBackedDimensions(
   );
   if (!criteria.length || rubricWeights.size !== criteria.length)
     throw new Error("The evaluation rubric is missing or contains duplicate criteria.");
+
+  const isZeroToTen =
+    declaredScale === "0-10" ||
+    (rawDimensions.length > 0 &&
+      rawDimensions.every(d => d.score <= 10) &&
+      rawDimensions.some(d => d.score > 0));
+
+  const normalizeQuotesAndWhitespace = (s: string) =>
+    s
+      .replace(/[\u2018\u2019]/g, "'")
+      .replace(/[\u201C\u201D]/g, '"')
+      .replace(/\s+/g, " ")
+      .trim();
+
   const seen = new Set<string>();
   const candidates = rawDimensions.flatMap(dimension => {
     const key = normalized(dimension.name);
@@ -920,13 +939,24 @@ export function scoreEvidenceBackedDimensions(
       throw new Error("AI returned a dimension outside the configured rubric.");
     if (isUnsupportedTextualTrait(dimension.name)) return [];
     const candidateEvidence = dimension.evidence.trim();
-    if (!candidateEvidence || !answer.includes(candidateEvidence))
+    let evidenceMatches = answer.includes(candidateEvidence);
+    if (!evidenceMatches) {
+      const normCandidate = normalizeQuotesAndWhitespace(candidateEvidence);
+      const normAnswer = normalizeQuotesAndWhitespace(answer);
+      if (normCandidate && normAnswer.includes(normCandidate)) {
+        evidenceMatches = true;
+      }
+    }
+    if (!candidateEvidence || !evidenceMatches)
       throw new Error(
         "AI returned a rubric score without exact supporting answer evidence."
       );
+    const effectiveScore = isZeroToTen
+      ? clamp(dimension.score * 10)
+      : clamp(dimension.score);
     return {
       name: dimension.name.trim(),
-      score: clamp(dimension.score),
+      score: effectiveScore,
       note: dimension.note.trim(),
       evidence: candidateEvidence,
       sourceWeight,
@@ -1031,7 +1061,7 @@ export async function evaluateAnswer(input: {
       .map(item => `${item.name} (weight ${item.weight}): ${item.description}`)
       .join("\n") ||
     "Choose only dimensions relevant to the interview type and course; use domain-specific criteria.";
-  const prompt = `Evaluate a candidate's interview answer using only relevant, course- and interview-type-specific criteria. Candidate course: ${input.course}; specialization: ${input.specialization || "not provided"}; academic stage: ${input.semester || "not provided"}; role: ${input.role}; interview type: ${input.type}; relevant skills: ${input.skills.join(", ")}; response language: ${input.language}. Configured rubric: ${criteriaText}. Use only these exact criterion names and omit every dimension that cannot be assessed from this answer. Consider relevance, domain correctness, completeness and reasoning as answer quality; keep communication structure as a separate transcript-only observation that never contributes to answer quality. Communication feedback may address the written transcript's organization and explicitness only. Never score accent, vocal confidence, personality, honesty or protected traits, even if a rubric requests them. For every scored dimension provide one exact, verbatim, non-empty substring from the candidate answer as evidence; do not paraphrase, normalize or invent quotations. If no exact evidence supports a dimension, omit that dimension. Tie factual strengths and weaknesses to one of the quoted evidence phrases; if they cannot be anchored, omit them. Phrase missing_points as possible items the answer could add, not as verified facts about the candidate. Return concise, constructive strengths, actionable weaknesses, possible missing points, a better-answer example/outline and a practical tip. Medical content is educational only and never diagnosis or treatment. Question: <question>${input.question}</question>. Candidate answer: <answer>${input.answer}</answer>.`;
+  const prompt = `Evaluate a candidate's interview answer using only relevant, course- and interview-type-specific criteria. Candidate course: ${input.course}; specialization: ${input.specialization || "not provided"}; academic stage: ${input.semester || "not provided"}; role: ${input.role}; interview type: ${input.type}; relevant skills: ${input.skills.join(", ")}; response language: ${input.language}. Configured rubric: ${criteriaText}. Use only these exact criterion names and omit every dimension that cannot be assessed from this answer. Consider relevance, domain correctness, completeness and reasoning as answer quality; keep communication structure as a separate transcript-only observation that never contributes to answer quality. Communication feedback may address the written transcript's organization and explicitness only. Never score accent, vocal confidence, personality, honesty or protected traits, even if a rubric requests them. MANDATORY SCORING CONTRACT: Score each dimension on a 0 to 100 percentage scale (never a 1-10 scale). Set score_scale to "0-100". Score calibration bands: 90-100: Exceptional, accurate, and comprehensive; 75-89: Strong and specific with solid technical grounding; 60-74: Sound and competent with minor gaps; 40-59: Basic or partial understanding; 20-39: Weak or superficial; 0-19: Completely incorrect or irrelevant. Compute overall_score as the weighted average of answer-quality dimension scores on this 0-100 scale. For every scored dimension provide one exact, verbatim, non-empty substring from the candidate answer as evidence; do not paraphrase, normalize or invent quotations. If no exact evidence supports a dimension, omit that dimension. Tie factual strengths and weaknesses to one of the quoted evidence phrases; if they cannot be anchored, omit them. Phrase missing_points as possible items the answer could add, not as verified facts about the candidate. Return concise, constructive strengths, actionable weaknesses, possible missing points, a better-answer example/outline and a practical tip. Medical content is educational only and never diagnosis or treatment. Question: <question>${input.question}</question>. Candidate answer: <answer>${input.answer}</answer>.`;
   try {
     const result = await structured<
       Omit<ReturnType<typeof baselineEvaluation>, "source">
@@ -1039,7 +1069,8 @@ export async function evaluateAnswer(input: {
     const weighted = scoreEvidenceBackedDimensions(
       result.dimensions,
       input.answer,
-      criteria
+      criteria,
+      (result as any).score_scale
     );
     return {
       ...result,
