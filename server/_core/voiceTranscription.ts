@@ -1,5 +1,6 @@
 import { enforceGeminiRateLimit } from "./gemini-rate-limit";
 import { MAX_TRANSCRIPTION_AUDIO_BYTES } from "@shared/const";
+import { isSilenceHallucination } from "@shared/scoring";
 
 export type TranscriptionSegment = {
   id: number;
@@ -109,7 +110,8 @@ export async function transcribeAudioBuffer(options: {
               role: "user",
               parts: [
                 {
-                  text: `${options.prompt?.trim() || languagePrompt} Return only the transcript. Do not summarize or add commentary.`,
+                  text: `${options.prompt?.trim() || languagePrompt}
+CRITICAL INSTRUCTION: Transcribe only genuine spoken human speech verbatim. If the audio contains only silence, background noise, breathing, static, or no clearly intelligible speech, return an empty string. Never invent or hallucinate default sentences or phrases such as "Where is a hospital in this city?" or "Thank you for watching". Return only the transcript with no commentary.`,
                 },
                 {
                   inlineData: {
@@ -149,10 +151,13 @@ export async function transcribeAudioBuffer(options: {
       ?.map(part => part.text ?? "")
       .join("")
       .trim();
-    if (!text) {
+    if (!text || isSilenceHallucination(text)) {
       return {
-        error: "The transcription provider returned no transcript.",
-        code: "TRANSCRIPTION_FAILED",
+        task: "transcribe",
+        language: options.language ?? "und",
+        duration: null,
+        text: "",
+        segments: [],
       };
     }
     return {

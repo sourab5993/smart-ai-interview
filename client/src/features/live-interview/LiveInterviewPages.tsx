@@ -30,6 +30,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { getLiveAudioRetryAction } from "./audio-retry";
 import { MAX_TRANSCRIPTION_AUDIO_BYTES } from "@shared/const";
+import { isSilenceHallucination } from "@shared/scoring";
 
 type Turn = {
   id: string;
@@ -1095,7 +1096,7 @@ export function LiveInterviewRoom() {
         language: session.speech_language.split("-")[0] || "en",
       });
       const transcribedText = result?.text?.trim() || "";
-      if (transcribedText) {
+      if (transcribedText && !isSilenceHallucination(transcribedText)) {
         setTranscriptDraft(transcribedText);
         setPartial(transcribedText);
         finalText.current = transcribedText;

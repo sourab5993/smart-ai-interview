@@ -54,6 +54,7 @@ import {
   persistInterviewCompletion,
 } from "@/lib/interview-completion";
 import { completionAdjustedScore } from "@/lib/scoring";
+import { isSilenceHallucination } from "@shared/scoring";
 import {
   EmptyState,
   LoadingState,
@@ -1482,6 +1483,8 @@ export function InterviewRoom() {
   const [evaluations, setEvaluations] = useState<Record<string, Eval>>({});
   const [index, setIndex] = useState(0);
   const [text, setText] = useState("");
+  const textRef = useRef("");
+  textRef.current = text;
   const [mode, setMode] = useState<"text" | "voice">("text");
   const [recording, setRecording] = useState(false);
   const [interim, setInterim] = useState("");
@@ -1611,6 +1614,11 @@ export function InterviewRoom() {
       live = false;
       if (voiceRestartTimer.current) clearTimeout(voiceRestartTimer.current);
       recognition.current?.stop?.();
+      const stream = audioStream.current;
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        audioStream.current = null;
+      }
       if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     };
   }, [id, userId]);
@@ -1684,6 +1692,13 @@ export function InterviewRoom() {
   }, [text, session?.id, current?.id, user?.id]);
 
   useEffect(() => {
+    if (isRecordingRef.current) {
+      void stopVoiceRef.current?.();
+    }
+    interimRef.current = "";
+    setInterim("");
+    audioChunks.current = [];
+
     if (!session?.id || !current?.id) return;
     const userScope = user?.id
       ? `practice_draft_${user.id}_${session.id}_${current.id}`
@@ -1691,9 +1706,9 @@ export function InterviewRoom() {
     const saved =
       (userScope ? safeStorage.getItem(userScope) : null) ||
       safeStorage.getItem(`practice_draft_${session.id}_${current.id}`);
-    if (saved && !text) {
-      setText(saved);
-    }
+    const initial = saved || "";
+    setText(initial);
+    textRef.current = initial;
   }, [current?.id, session?.id, user?.id]);
 
   const minutesLeft = Math.max(
@@ -1719,6 +1734,7 @@ export function InterviewRoom() {
     setMode("voice");
     recordingStarted.current = Date.now();
     setRecordElapsed(0);
+    audioChunks.current = [];
 
     try {
       if (navigator.mediaDevices?.getUserMedia) {
@@ -1778,7 +1794,14 @@ export function InterviewRoom() {
               else partial += chunk;
             }
             if (final) {
-              setText(prev => `${prev}${prev ? " " : ""}${final.trim()}`);
+              const cleanedFinal = final.trim();
+              if (cleanedFinal && !isSilenceHallucination(cleanedFinal)) {
+                setText(prev => {
+                  const updated = prev ? `${prev} ${cleanedFinal}` : cleanedFinal;
+                  textRef.current = updated;
+                  return updated;
+                });
+              }
               interimRef.current = "";
             }
             interimRef.current = partial.trim();
@@ -1792,7 +1815,13 @@ export function InterviewRoom() {
             if (isRecordingRef.current) {
               if (interimRef.current.trim()) {
                 const pending = interimRef.current.trim();
-                setText(prev => (prev ? `${prev} ${pending}` : pending));
+                if (!isSilenceHallucination(pending)) {
+                  setText(prev => {
+                    const updated = prev ? `${prev} ${pending}` : pending;
+                    textRef.current = updated;
+                    return updated;
+                  });
+                }
                 interimRef.current = "";
                 setInterim("");
               }
@@ -1810,16 +1839,28 @@ export function InterviewRoom() {
       startSpeechEngine();
     }
   }
-  async function stopVoice() {
-    if (voiceRestartTimer.current) clearTimeout(voiceRestartTimer.current);
+  async function stopVoice(): Promise<void> {
+    if (voiceRestartTimer.current) {
+      clearTimeout(voiceRestartTimer.current);
+      voiceRestartTimer.current = null;
+    }
+    const wasRecording = isRecordingRef.current;
     isRecordingRef.current = false;
     setRecording(false);
+
     if (interimRef.current.trim()) {
       const pending = interimRef.current.trim();
-      setText(prev => (prev ? `${prev} ${pending}` : pending));
+      if (!isSilenceHallucination(pending)) {
+        setText(prev => {
+          const updated = prev ? `${prev} ${pending}` : pending;
+          textRef.current = updated;
+          return updated;
+        });
+      }
       interimRef.current = "";
     }
     setInterim("");
+
     try {
       recognition.current?.stop?.();
     } catch {}
@@ -1832,45 +1873,82 @@ export function InterviewRoom() {
 
     const rec = mediaRecorder.current;
     if (rec && rec.state === "recording") {
-      rec.onstop = async () => {
-        const audioBlob = new Blob(audioChunks.current, {
-          type: rec.mimeType || "audio/webm",
-        });
-        mediaRecorder.current = null;
+      const audioBlobPromise = new Promise<Blob | null>(resolve => {
+        const timeout = setTimeout(() => {
+          resolve(
+            audioChunks.current.length > 0
+              ? new Blob(audioChunks.current, { type: rec.mimeType || "audio/webm" })
+              : null
+          );
+        }, 800);
 
-        const durationMs = recordingStarted.current ? Date.now() - recordingStarted.current : 0;
-        const wordsCaptured = text.trim().split(/\s+/).filter(Boolean).length;
-        const stalledSpeech = durationMs >= 6000 && audioBlob.size > 2500 && wordsCaptured < 7;
-        if ((!text || text.trim().length < 5 || stalledSpeech) && audioBlob.size > 800) {
-          setTranscribing(true);
-          try {
-            const result = await transcribe.mutateAsync({
-              audioBase64: bytesToBase64(new Uint8Array(await audioBlob.arrayBuffer())),
-              mimeType: audioBlob.type || "audio/webm",
-              language: session?.language === "Hindi" ? "hi" : "en",
-            });
-            if (result?.text?.trim()) {
-              const transcribed = result.text.trim();
-              setText(prev => {
-                const prevWords = prev.trim().split(/\s+/).filter(Boolean).length;
-                if (prevWords < 7) {
-                  return transcribed;
-                }
-                return `${prev} ${transcribed}`;
-              });
-            }
-          } catch (e) {
-            console.warn("Fallback transcription error:", e);
-          } finally {
-            setTranscribing(false);
-          }
-        }
-      };
+        rec.onstop = () => {
+          clearTimeout(timeout);
+          const blob =
+            audioChunks.current.length > 0
+              ? new Blob(audioChunks.current, { type: rec.mimeType || "audio/webm" })
+              : null;
+          resolve(blob);
+        };
+      });
+
       try {
         rec.stop();
       } catch {
-        mediaRecorder.current = null;
+        // mediaRecorder already inactive
       }
+
+      const audioBlob = await audioBlobPromise;
+      mediaRecorder.current = null;
+
+      const durationMs = recordingStarted.current
+        ? Date.now() - recordingStarted.current
+        : 0;
+      const wordsCaptured = textRef.current
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean).length;
+      const hasSubstantialAudio =
+        audioBlob && audioBlob.size >= 3000 && durationMs >= 1500;
+
+      if (wordsCaptured < 5 && hasSubstantialAudio) {
+        setTranscribing(true);
+        try {
+          const arrayBuf = await audioBlob.arrayBuffer();
+          const result = await transcribe.mutateAsync({
+            audioBase64: bytesToBase64(new Uint8Array(arrayBuf)),
+            mimeType: audioBlob.type || "audio/webm",
+            language: session?.language === "Hindi" ? "hi" : "en",
+          });
+          const rawText = result?.text?.trim() || "";
+          if (rawText && !isSilenceHallucination(rawText)) {
+            setText(prev => {
+              const prevWords = prev.trim().split(/\s+/).filter(Boolean).length;
+              const updated = prevWords < 5 ? rawText : `${prev} ${rawText}`;
+              textRef.current = updated;
+              return updated;
+            });
+          } else {
+            if (!textRef.current.trim()) {
+              setError(
+                "No clear speech was detected. Please speak into your microphone or type your answer above."
+              );
+            }
+          }
+        } catch (e) {
+          console.warn("Fallback transcription error:", e);
+        } finally {
+          setTranscribing(false);
+        }
+      } else if (wordsCaptured < 2 && wasRecording && durationMs >= 1000) {
+        if (!textRef.current.trim()) {
+          setError(
+            "No clear speech was detected. Please speak into your microphone or type your answer above."
+          );
+        }
+      }
+    } else {
+      mediaRecorder.current = null;
     }
   }
   stopVoiceRef.current = stopVoice;
@@ -1965,20 +2043,30 @@ export function InterviewRoom() {
   }
   async function submitAnswer() {
     if (!current || !session || !user || sending || submittingRef.current) return;
-    let answerText = text.trim();
+
+    if (isRecordingRef.current) {
+      await stopVoice();
+    }
+
     if (interimRef.current.trim()) {
       const pending = interimRef.current.trim();
-      answerText = answerText ? `${answerText} ${pending}` : pending;
-      setText(answerText);
+      if (!isSilenceHallucination(pending)) {
+        const updated = textRef.current ? `${textRef.current} ${pending}` : pending;
+        textRef.current = updated;
+        setText(updated);
+      }
       interimRef.current = "";
       setInterim("");
     }
+
+    let answerText = textRef.current.trim();
     const existingAnswer = answers.find(a => a.question_id === current.id);
-    if (!answerText && existingAnswer) {
+    if (!answerText && existingAnswer && !latestEval) {
       answerText = existingAnswer.answer_text;
     }
-    if (answerText.length < 2) {
-      setError("Add a little more to your answer before submitting.");
+
+    if (!answerText || isSilenceHallucination(answerText) || answerText.length < 2) {
+      setError("Please speak into your microphone or type your answer before submitting.");
       return;
     }
     if (answerText.length > 12000) {
@@ -1988,7 +2076,6 @@ export function InterviewRoom() {
     submittingRef.current = true;
     setSending(true);
     setError("");
-    stopVoice();
 
     let savedAnswerRow = existingAnswer;
     const c = await getSupabase();
@@ -2087,6 +2174,7 @@ export function InterviewRoom() {
     // Step 3: Success state cleanup & optional question adaptation
     try {
       setText("");
+      textRef.current = "";
       setInterim("");
       if (session?.id && current?.id) {
         if (user?.id) {
@@ -2106,10 +2194,17 @@ export function InterviewRoom() {
     }
   }
   async function skipQuestion() {
+    if (isRecordingRef.current) {
+      void stopVoiceRef.current?.();
+    }
+    interimRef.current = "";
+    setInterim("");
+    audioChunks.current = [];
     if (current) {
       setIndex(i => Math.min(i + 1, questions.length));
       setLatestEval(null);
       setText("");
+      textRef.current = "";
     }
   }
   function repeatQuestion() {
@@ -2290,10 +2385,13 @@ export function InterviewRoom() {
           <textarea
             className="answer-box"
             maxLength={12000}
-            value={text + (interim ? `${text ? " " : ""}${interim}` : "")}
+            value={recording && interim ? (text ? `${text} ${interim}` : interim) : text}
             onChange={e => {
               setError("");
+              interimRef.current = "";
+              setInterim("");
               setText(e.target.value);
+              textRef.current = e.target.value;
             }}
             placeholder={
               recording
@@ -2350,6 +2448,7 @@ export function InterviewRoom() {
               onClick={submitAnswer}
               disabled={
                 sending ||
+                transcribing ||
                 (!text.trim() &&
                   !answers.some(a => a.question_id === current?.id))
               }
@@ -2357,6 +2456,10 @@ export function InterviewRoom() {
               {sending ? (
                 <>
                   <span className="spinner" /> Evaluating…
+                </>
+              ) : transcribing ? (
+                <>
+                  <span className="spinner" /> Transcribing…
                 </>
               ) : answers.some(a => a.question_id === current?.id) && !latestEval ? (
                 <>

@@ -31,6 +31,7 @@ import {
   type BehavioralSummary,
 } from "../../../../shared/behavioral-scoring";
 import { MAX_TRANSCRIPTION_AUDIO_BYTES } from "@shared/const";
+import { isSilenceHallucination } from "@shared/scoring";
 import {
   behavioralDeviceSelectionFromStream,
   behavioralDeviceSelectionStorageKey,
@@ -1065,7 +1066,7 @@ export function BehavioralRoom() {
         language: "en",
       });
       const transcript = transcription.text?.trim();
-      if (!transcript)
+      if (!transcript || isSilenceHallucination(transcript))
         throw new Error(
           "We couldn't recognize speech in that recording. Your captured audio is still available to retry."
         );

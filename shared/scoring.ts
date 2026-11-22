@@ -1,3 +1,34 @@
+export const SILENCE_HALLUCINATION_PATTERNS = [
+  /where is (a|the) hospital in this city/i,
+  /where is the nearest hospital/i,
+  /thank you for watching/i,
+  /thanks for watching/i,
+  /please subscribe/i,
+  /subtitles by/i,
+  /closed captions by/i,
+  /amara\.org/i,
+  /translated by/i,
+  /transcript by/i,
+  /^[\s\.,!?:;"'“”‘’]*(you|bye|hello|thank you|thanks)[\s\.,!?:;"'“”‘’]*$/i,
+];
+
+/**
+ * Checks if a transcribed string is an empty string, pure punctuation,
+ * or a known silence/static hallucination produced by STT engines on silent audio.
+ */
+export function isSilenceHallucination(text: unknown): boolean {
+  if (typeof text !== "string" || !text.trim()) return true;
+  const trimmed = text.trim();
+  const stripped = trimmed.replace(/^["'“‘\s.,;:!?]+|["'”’\s.,;:!?]+$/g, "");
+  if (!stripped) return true;
+  for (const pattern of SILENCE_HALLUCINATION_PATTERNS) {
+    if (pattern.test(trimmed) || pattern.test(stripped)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export type ScoreScale = "0-100" | "0-10" | string | null | undefined;
 
 export const CANONICAL_DIMENSIONS = [

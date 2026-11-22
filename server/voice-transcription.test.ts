@@ -115,4 +115,34 @@ describe("Gemini audio transcription fallback", () => {
       "sensitive provider diagnostics"
     );
   });
+
+  it("filters out known silence and static hallucinations from transcription output", async () => {
+    vi.stubEnv("GEMINI_API_KEY", "test-server-key");
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [{ text: "Where is a hospital in this city?" }],
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await transcribeAudioBuffer({
+      audioBuffer: Buffer.from("silent audio bytes"),
+      mimeType: "audio/webm",
+      language: "en",
+    });
+
+    expect(result).toMatchObject({
+      task: "transcribe",
+      text: "",
+    });
+  });
 });
