@@ -141,12 +141,18 @@ export default function CareerPathPage() {
   const courseCategory = joined(courseRecord, "category");
   const target = norm(profile?.target_role);
   const targetCareer = norm(profile?.target_career);
-  const recentScore = practice.length
+  const scoredPractice = practice.filter(
+    s =>
+      s.overall_score !== null &&
+      s.overall_score !== undefined &&
+      Number.isFinite(Number(s.overall_score))
+  );
+  const recentScore = scoredPractice.length
     ? Math.round(
-        practice.reduce((a, s) => a + (Number(s.overall_score) || 0), 0) /
-          practice.length
+        scoredPractice.reduce((a, s) => a + Number(s.overall_score), 0) /
+          scoredPractice.length
       )
-    : 0;
+    : null;
   const recommendations = useMemo(
     () =>
       careers
@@ -203,7 +209,9 @@ export default function CareerPathPage() {
                     (desired ? 12 : 0) +
                     (interestFit ? 8 : 0) +
                     skillFit * 13 +
-                    (practice.length ? Math.min(5, recentScore / 20) : 0)
+                    (scoredPractice.length && recentScore !== null
+                      ? Math.min(5, recentScore / 20)
+                      : 0)
                 )
               )
             );
@@ -231,7 +239,7 @@ export default function CareerPathPage() {
       target,
       targetCareer,
       profile?.interests,
-      practice.length,
+      scoredPractice.length,
       recentScore,
     ]
   );
@@ -323,7 +331,7 @@ export default function CareerPathPage() {
           <TrendingUp />
           <span>
             <b>
-              {practice.length
+              {scoredPractice.length && recentScore !== null
                 ? `${recentScore}% practice average`
                 : "Build your signal"}
             </b>

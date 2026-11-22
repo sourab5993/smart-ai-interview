@@ -258,20 +258,22 @@ export function Dashboard() {
   const completed = sessions.filter(
     s => s.status === "completed" && s.overall_score !== null
   );
-  const scoreForSession = (session: SessionRow) =>
-    completionAdjustedScore(
-      session.overall_score || 0,
-      answeredBySession[session.id] || 0,
-      session.question_count
-    );
-  const avg = completed.length
+  const scoreForSession = (session: SessionRow): number | null => {
+    if (session.overall_score === null || session.overall_score === undefined) return null;
+    const num = Number(session.overall_score);
+    return Number.isFinite(num) && num >= 0 && num <= 100 ? Math.round(num) : null;
+  };
+  const scoredSessions = completed
+    .map(s => scoreForSession(s))
+    .filter((score): score is number => score !== null);
+  const avg = scoredSessions.length
     ? Math.round(
-        completed.reduce((a, s) => a + scoreForSession(s), 0) / completed.length
+        scoredSessions.reduce((a, s) => a + s, 0) / scoredSessions.length
       )
-    : 0;
-  const best = completed.length
-    ? completed.reduce((max, s) => Math.max(max, scoreForSession(s)), 0)
-    : 0;
+    : null;
+  const best = scoredSessions.length
+    ? scoredSessions.reduce((max, s) => Math.max(max, s), 0)
+    : null;
   const name =
     profile?.full_name ||
     user?.user_metadata?.full_name ||
@@ -378,7 +380,7 @@ export function Dashboard() {
               <Orbit size={13} /> YOUR INTERVIEW READINESS
             </span>
             <h2>
-              {completed.length
+              {avg !== null
                 ? readinessLabel(avg)
                 : "A baseline begins here"}
             </h2>
@@ -409,13 +411,13 @@ export function Dashboard() {
           <StatTile
             icon={BarChart3}
             label="Recent average"
-            value={completed.length ? `${avg}%` : "—"}
+            value={avg !== null ? `${avg}%` : "—"}
             tone="violet"
           />
           <StatTile
             icon={TrendingUp}
             label="Best recent score"
-            value={completed.length ? `${best}%` : "—"}
+            value={best !== null ? `${best}%` : "—"}
             tone="green"
           />
           <StatTile
@@ -466,13 +468,19 @@ export function Dashboard() {
                   </defs>
                   <path
                     d={sparkArea(
-                      completed.slice().reverse().map(scoreForSession)
+                      completed
+                        .slice()
+                        .reverse()
+                        .map(s => scoreForSession(s) ?? 0)
                     )}
                     fill="url(#dash-fill)"
                   />
                   <path
                     d={sparkPath(
-                      completed.slice().reverse().map(scoreForSession)
+                      completed
+                        .slice()
+                        .reverse()
+                        .map(s => scoreForSession(s) ?? 0)
                     )}
                     fill="none"
                     stroke="#67dff6"
@@ -1500,6 +1508,7 @@ export function InterviewRoom() {
   const isRecordingRef = useRef(false);
   const submittingRef = useRef(false);
   const interimRef = useRef("");
+  const voiceRestartTimer = useRef<any>(null);
   const stopVoiceRef = useRef<() => void>(() => {});
   const [transcribing, setTranscribing] = useState(false);
   const finish = useCallback(async () => {
@@ -1600,6 +1609,7 @@ export function InterviewRoom() {
     })();
     return () => {
       live = false;
+      if (voiceRestartTimer.current) clearTimeout(voiceRestartTimer.current);
       recognition.current?.stop?.();
       if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     };
@@ -1745,57 +1755,63 @@ export function InterviewRoom() {
       (window as any).SpeechRecognition ||
       (window as any).webkitSpeechRecognition;
     if (Speech) {
-      try {
-        const r = new Speech();
-        recognition.current = r;
-        const speechLang =
-          session?.language === "Hindi"
+      const startSpeechEngine = () => {
+        if (!isRecordingRef.current) return;
+        try {
+          const r = new Speech();
+          recognition.current = r;
+          const speechLang =
+            session?.language === "Hindi"
+              ? "hi-IN"
+              : (navigator.language || "en-IN");
+          r.lang = speechLang.startsWith("hi")
             ? "hi-IN"
-            : (navigator.language || "en-IN");
-        r.lang = speechLang.startsWith("hi")
-          ? "hi-IN"
-          : (speechLang.includes("IN") ? "en-IN" : "en-US");
-        r.continuous = true;
-        r.interimResults = true;
-        r.onresult = (event: any) => {
-          let final = "",
-            partial = "";
-          for (let i = event.resultIndex; i < event.results.length; i++) {
-            const chunk = event.results[i][0]?.transcript || "";
-            if (event.results[i].isFinal) final += chunk;
-            else partial += chunk;
-          }
-          if (final) {
-            setText(prev => `${prev}${prev ? " " : ""}${final.trim()}`);
-            interimRef.current = "";
-          }
-          interimRef.current = partial.trim();
-          setInterim(partial);
-        };
-        r.onerror = (event: any) => {
-          if (event?.error === "no-speech") return;
-          console.warn("Speech error notice:", event?.error);
-        };
-        r.onend = () => {
-          if (isRecordingRef.current) {
-            if (interimRef.current.trim()) {
-              const pending = interimRef.current.trim();
-              setText(prev => (prev ? `${prev} ${pending}` : pending));
-              interimRef.current = "";
-              setInterim("");
+            : (speechLang.includes("IN") ? "en-IN" : "en-US");
+          r.continuous = true;
+          r.interimResults = true;
+          r.onresult = (event: any) => {
+            let final = "",
+              partial = "";
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+              const chunk = event.results[i][0]?.transcript || "";
+              if (event.results[i].isFinal) final += chunk;
+              else partial += chunk;
             }
-            try {
-              r.start();
-            } catch {}
-          }
-        };
-        r.start();
-      } catch (err) {
-        console.warn("Speech recognition start warning:", err);
-      }
+            if (final) {
+              setText(prev => `${prev}${prev ? " " : ""}${final.trim()}`);
+              interimRef.current = "";
+            }
+            interimRef.current = partial.trim();
+            setInterim(partial);
+          };
+          r.onerror = (event: any) => {
+            if (event?.error === "no-speech") return;
+            console.warn("Speech error notice:", event?.error);
+          };
+          r.onend = () => {
+            if (isRecordingRef.current) {
+              if (interimRef.current.trim()) {
+                const pending = interimRef.current.trim();
+                setText(prev => (prev ? `${prev} ${pending}` : pending));
+                interimRef.current = "";
+                setInterim("");
+              }
+              if (voiceRestartTimer.current) clearTimeout(voiceRestartTimer.current);
+              voiceRestartTimer.current = setTimeout(() => {
+                startSpeechEngine();
+              }, 150);
+            }
+          };
+          r.start();
+        } catch (err) {
+          console.warn("Speech recognition start warning:", err);
+        }
+      };
+      startSpeechEngine();
     }
   }
   async function stopVoice() {
+    if (voiceRestartTimer.current) clearTimeout(voiceRestartTimer.current);
     isRecordingRef.current = false;
     setRecording(false);
     if (interimRef.current.trim()) {
@@ -1822,7 +1838,10 @@ export function InterviewRoom() {
         });
         mediaRecorder.current = null;
 
-        if ((!text || text.trim().length < 5) && audioBlob.size > 800) {
+        const durationMs = recordingStarted.current ? Date.now() - recordingStarted.current : 0;
+        const wordsCaptured = text.trim().split(/\s+/).filter(Boolean).length;
+        const stalledSpeech = durationMs >= 6000 && audioBlob.size > 2500 && wordsCaptured < 7;
+        if ((!text || text.trim().length < 5 || stalledSpeech) && audioBlob.size > 800) {
           setTranscribing(true);
           try {
             const result = await transcribe.mutateAsync({
@@ -1831,7 +1850,14 @@ export function InterviewRoom() {
               language: session?.language === "Hindi" ? "hi" : "en",
             });
             if (result?.text?.trim()) {
-              setText(prev => (prev ? `${prev} ${result.text.trim()}` : result.text.trim()));
+              const transcribed = result.text.trim();
+              setText(prev => {
+                const prevWords = prev.trim().split(/\s+/).filter(Boolean).length;
+                if (prevWords < 7) {
+                  return transcribed;
+                }
+                return `${prev} ${transcribed}`;
+              });
             }
           } catch (e) {
             console.warn("Fallback transcription error:", e);
@@ -1947,6 +1973,10 @@ export function InterviewRoom() {
       interimRef.current = "";
       setInterim("");
     }
+    const existingAnswer = answers.find(a => a.question_id === current.id);
+    if (!answerText && existingAnswer) {
+      answerText = existingAnswer.answer_text;
+    }
     if (answerText.length < 2) {
       setError("Add a little more to your answer before submitting.");
       return;
@@ -1959,32 +1989,53 @@ export function InterviewRoom() {
     setSending(true);
     setError("");
     stopVoice();
-    try {
-      const c = await getSupabase();
-      const { data: answer, error: answerError } = await c.rpc(
-        "save_simple_interview_answer",
-        {
-          p_session_id: session.id,
-          p_question_id: current.id,
-          p_answer_text: answerText,
-          p_answer_mode: mode,
-        }
-      );
-      if (answerError || !answer)
-        throw (
-          answerError ||
-          new Error(
-            "This interview no longer accepts answers or its server deadline has elapsed."
-          )
+
+    let savedAnswerRow = existingAnswer;
+    const c = await getSupabase();
+
+    // Step 1: Save Answer if not already persisted with identical text
+    if (!savedAnswerRow || savedAnswerRow.answer_text !== answerText) {
+      try {
+        const { data: answer, error: answerError } = await c.rpc(
+          "save_simple_interview_answer",
+          {
+            p_session_id: session.id,
+            p_question_id: current.id,
+            p_answer_text: answerText,
+            p_answer_mode: mode,
+          }
         );
-      setAnswers(a => [
-        ...a.filter(x => x.id !== answer.id),
-        answer as AnswerRow,
-      ]);
-      const criteria = evaluationCriteriaFromContext(
-        session.context_notes || ""
-      );
-      const result = await evaluate.mutateAsync({
+        if (answerError || !answer) {
+          throw (
+            answerError ||
+            new Error(
+              "This interview no longer accepts answers or its server deadline has elapsed."
+            )
+          );
+        }
+        savedAnswerRow = answer as AnswerRow;
+        setAnswers(a => [
+          ...a.filter(x => x.id !== answer.id && x.question_id !== current.id),
+          savedAnswerRow!,
+        ]);
+      } catch (err: any) {
+        submittingRef.current = false;
+        setSending(false);
+        setError(
+          err?.message ||
+            "We couldn't save this answer. Your text is still here—please try again."
+        );
+        return;
+      }
+    }
+
+    // Step 2: AI Evaluation
+    const criteria = evaluationCriteriaFromContext(
+      session.context_notes || ""
+    );
+    let result: Eval;
+    try {
+      result = await evaluate.mutateAsync({
         question: current.question_text,
         answer: answerText,
         course: session.course,
@@ -1996,23 +2047,45 @@ export function InterviewRoom() {
         criteria,
         language: session.language as "English" | "Hindi" | "Hinglish",
       });
-      if (result.source !== "ai")
+      if (result.source !== "ai") {
         throw new Error("A verified AI evaluation was not returned.");
+      }
       const { data: savedEvaluation, error: evalError } = await c.rpc(
         "save_simple_answer_evaluation",
         {
           p_session_id: session.id,
-          p_answer_id: answer.id,
+          p_answer_id: savedAnswerRow.id,
           p_evaluation: result,
         }
       );
       if (evalError) throw evalError;
-      if (savedEvaluation !== true)
+      if (savedEvaluation !== true) {
         throw new Error(
           "This interview began finalizing before the evaluation could be saved."
         );
+      }
       setEvaluations(e => ({ ...e, [current.id]: result }));
       setLatestEval(result);
+    } catch (evalErr: any) {
+      console.warn("Evaluation step failed:", evalErr);
+      submittingRef.current = false;
+      setSending(false);
+      setError(
+        "Your answer was saved successfully, but coaching evaluation is temporarily unavailable. You can retry evaluation or move to the next question."
+      );
+      if (session?.id && current?.id) {
+        if (user?.id) {
+          safeStorage.removeItem(
+            `practice_draft_${user.id}_${session.id}_${current.id}`
+          );
+        }
+        safeStorage.removeItem(`practice_draft_${session.id}_${current.id}`);
+      }
+      return;
+    }
+
+    // Step 3: Success state cleanup & optional question adaptation
+    try {
       setText("");
       setInterim("");
       if (session?.id && current?.id) {
@@ -2025,10 +2098,8 @@ export function InterviewRoom() {
       }
       setAdaptiveNote("");
       await adaptNextQuestion(result.overall_score, result.weaknesses, c);
-    } catch {
-      setError(
-        "We couldn't save and evaluate this answer. Your text is still here—please try again."
-      );
+    } catch (adaptErr) {
+      console.warn("Question adaptation notice:", adaptErr);
     } finally {
       submittingRef.current = false;
       setSending(false);
@@ -2109,7 +2180,10 @@ export function InterviewRoom() {
             You evaluated{" "}
             {
               Object.keys(evaluations).filter(
-                k => (evaluations[k]?.overall_score || 0) > 0
+                k =>
+                  evaluations[k] != null &&
+                  typeof evaluations[k].overall_score === "number" &&
+                  !isNaN(evaluations[k].overall_score)
               ).length
             }{" "}
             of {questions.length} questions. Your report will summarize
@@ -2274,11 +2348,19 @@ export function InterviewRoom() {
             <button
               className="button button-primary"
               onClick={submitAnswer}
-              disabled={sending || !text.trim()}
+              disabled={
+                sending ||
+                (!text.trim() &&
+                  !answers.some(a => a.question_id === current?.id))
+              }
             >
               {sending ? (
                 <>
                   <span className="spinner" /> Evaluating…
+                </>
+              ) : answers.some(a => a.question_id === current?.id) && !latestEval ? (
+                <>
+                  Retry evaluation <Send size={13} />
                 </>
               ) : (
                 <>
@@ -2286,6 +2368,19 @@ export function InterviewRoom() {
                 </>
               )}
             </button>
+            {answers.some(a => a.question_id === current?.id) && !latestEval && (
+              <button
+                className="button button-secondary"
+                onClick={() => {
+                  setError("");
+                  if (index + 1 >= questions.length) setIndex(questions.length);
+                  else setIndex(i => i + 1);
+                }}
+                disabled={sending}
+              >
+                Next question <ArrowRight size={13} />
+              </button>
+            )}
             <button
               className="button button-ghost"
               onClick={skipQuestion}
@@ -2309,7 +2404,9 @@ export function InterviewRoom() {
                   <h4>
                     Answer signal{" "}
                     <b className="feedback-score">
-                      {latestEval.overall_score}
+                      {typeof latestEval.overall_score === "number" && !isNaN(latestEval.overall_score)
+                        ? latestEval.overall_score
+                        : "—"}
                       <small>/100</small>
                     </b>
                   </h4>

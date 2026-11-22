@@ -57,10 +57,15 @@ export function ScoreRing({
   size = 128,
   label = "readiness",
 }: {
-  score: number;
+  score: number | null | undefined;
   size?: number;
   label?: string;
 }) {
+  const isAvailable =
+    score !== null && score !== undefined && Number.isFinite(Number(score));
+  const numericScore = isAvailable
+    ? Math.max(0, Math.min(100, Math.round(Number(score))))
+    : 0;
   return (
     <div
       className="score-ring"
@@ -68,16 +73,20 @@ export function ScoreRing({
         {
           width: size,
           height: size,
-          "--score": `${Math.max(0, Math.min(100, score))}%`,
+          "--score": `${numericScore}%`,
         } as React.CSSProperties
       }
       role="img"
-      aria-label={`${score} percent ${label}`}
+      aria-label={
+        isAvailable
+          ? `${numericScore} percent ${label}`
+          : `No ${label} available`
+      }
     >
       <div>
         <b>
-          {score}
-          <small>%</small>
+          {isAvailable ? numericScore : "—"}
+          {isAvailable && <small>%</small>}
         </b>
         <span>{label}</span>
       </div>

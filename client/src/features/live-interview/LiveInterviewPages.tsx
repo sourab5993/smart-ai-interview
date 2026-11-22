@@ -784,31 +784,42 @@ export function LiveInterviewRoom() {
         instruction:
           "Ask one relevant follow-up grounded in the candidate's answer if it is incomplete or raises an important point. Otherwise continue with a distinct role-relevant competency. Never assume evidence not in the transcript.",
       }).slice(0, 3000);
-      const next = await generate.mutateAsync({
-        course: "General interview preparation",
-        role: session.target_role,
-        type: "Adaptive live interview follow-up",
-        difficulty: prior.evaluation?.overall_score >= 80 ? "Hard" : "Medium",
-        skills: ((prior.evaluation?.missing_points as string[] | undefined) || [])
-          .map((point: string) => point.trim().slice(0, 100))
-          .filter(Boolean)
-          .slice(0, 8),
-        count: 1,
-        language: questionLanguage(session.speech_language),
-        context,
-      });
-      const q = next.questions?.[0];
-      if (!q?.question?.trim())
-        throw new Error(
-          "The interviewer could not produce a valid next question."
-        );
+      let nextQuestionText = "";
+      let nextDifficulty = prior.evaluation?.overall_score >= 80 ? "Hard" : "Medium";
+      let nextTopic = session.target_role;
+      try {
+        const next = await generate.mutateAsync({
+          course: "General interview preparation",
+          role: session.target_role,
+          type: "Adaptive live interview follow-up",
+          difficulty: nextDifficulty,
+          skills: ((prior.evaluation?.missing_points as string[] | undefined) || [])
+            .map((point: string) => point.trim().slice(0, 100))
+            .filter(Boolean)
+            .slice(0, 8),
+          count: 1,
+          language: questionLanguage(session.speech_language),
+          context,
+        });
+        const q = next.questions?.[0];
+        if (q?.question?.trim()) {
+          nextQuestionText = q.question.trim();
+          if (q.difficulty) nextDifficulty = q.difficulty;
+          if (q.topic) nextTopic = q.topic;
+        }
+      } catch (genError) {
+        console.warn("Live interview adaptive question generation fallback:", genError);
+      }
+      if (!nextQuestionText) {
+        nextQuestionText = `Can you provide a specific example of how you navigate trade-offs and edge cases in your work as a ${session.target_role}?`;
+      }
       const saved = await saveQuestion.mutateAsync({
         sessionId: id,
         turnIndex: prior.turn_index + 1,
-        question: q.question,
+        question: nextQuestionText,
         type: "follow-up or next question",
-        difficulty: q.difficulty || "Medium",
-        competencies: [q.topic || session.target_role],
+        difficulty: nextDifficulty,
+        competencies: [nextTopic],
         parentTurnId: prior.id,
         idempotencyKey: `${id}:turn:${prior.turn_index + 1}`,
       });
@@ -1016,27 +1027,44 @@ export function LiveInterviewRoom() {
       };
       setTurns(old => old.map(t => (t.id === current.id ? accepted : t)));
       setPhase("EVALUATING");
-      const result = await evaluate.mutateAsync({
-        sessionId: id,
-        turnId: current.id,
-      });
-      const evaluated = {
+      let evaluated: Turn = {
         ...accepted,
-        evaluation: result,
-        evaluation_status: "completed",
+        evaluation_status: "not_started",
       };
-      setTurns(old => old.map(t => (t.id === current.id ? evaluated : t)));
+      try {
+        const result = await evaluate.mutateAsync({
+          sessionId: id,
+          turnId: current.id,
+        });
+        evaluated = {
+          ...accepted,
+          evaluation: result,
+          evaluation_status: "completed",
+        };
+        setTurns(old => old.map(t => (t.id === current.id ? evaluated : t)));
+      } catch (evalErr) {
+        console.warn("Live interview evaluation step warning:", evalErr);
+        setPhase("RECOVERABLE_ERROR");
+        setError("Your answer was saved, but its coaching evaluation is temporarily pending. Click Continue to retry evaluation or load the next question.");
+        return;
+      }
       if (Date.now() >= Date.parse(session!.deadline_at)) {
         setBusy(false);
         await finalizeSession("deadline");
         return;
       }
-      await beginAdaptiveTurn(evaluated);
+      try {
+        await beginAdaptiveTurn(evaluated);
+      } catch (turnErr) {
+        console.warn("Live interview adaptive turn step warning:", turnErr);
+        setPhase("RECOVERABLE_ERROR");
+        setError("Your answer was evaluated, but loading the next question had a network pause. Click Continue interview to load it.");
+      }
     } catch {
       setPhase("RECOVERABLE_ERROR");
       setError(
         transcriptSaved
-          ? "Your answer was saved, but its coaching could not finish. Retry the saved answer without recording again."
+          ? "Your answer was saved, but coaching could not finish. Click Continue interview to load the next question."
           : "Your recognized answer could not be saved. The text remains on this page; retry saving it."
       );
     } finally {
@@ -1347,17 +1375,20 @@ export function LiveInterviewRoom() {
     setError("");
     setBusy(true);
     try {
-      setPhase("EVALUATING");
-      const result = await evaluate.mutateAsync({
-        sessionId: id,
-        turnId: current.id,
-      });
-      const evaluated = {
-        ...current,
-        evaluation: result,
-        evaluation_status: "completed",
-      };
-      setTurns(old => old.map(t => (t.id === current.id ? evaluated : t)));
+      let evaluated = current;
+      if (current.evaluation_status !== "completed" || !current.evaluation) {
+        setPhase("EVALUATING");
+        const result = await evaluate.mutateAsync({
+          sessionId: id,
+          turnId: current.id,
+        });
+        evaluated = {
+          ...current,
+          evaluation: result,
+          evaluation_status: "completed",
+        };
+        setTurns(old => old.map(t => (t.id === current.id ? evaluated : t)));
+      }
       await beginAdaptiveTurn(evaluated);
     } catch (cause) {
       setPhase("RECOVERABLE_ERROR");

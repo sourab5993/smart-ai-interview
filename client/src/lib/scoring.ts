@@ -1,3 +1,5 @@
+export * from "../../../shared/scoring";
+
 export function completionAdjustedScore(
   answerQuality: number,
   answeredCount: number,

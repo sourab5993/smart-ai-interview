@@ -118,15 +118,23 @@ export function PerformancePage() {
       live = false;
     };
   }, [userId]);
-  const overall = avg(sessions.map(s => s.overall_score || 0));
-  const latest = sessions.at(-1);
-  const trend = sessions.map((s, i) => ({
+  const scoredSessions = sessions.filter(
+    s =>
+      s.overall_score !== null &&
+      s.overall_score !== undefined &&
+      Number.isFinite(Number(s.overall_score))
+  );
+  const overall = scoredSessions.length
+    ? avg(scoredSessions.map(s => Number(s.overall_score)))
+    : null;
+  const latest = scoredSessions.at(-1) || sessions.at(-1);
+  const trend = scoredSessions.map((s, i) => ({
     index: i + 1,
     date: new Date(s.created_at).toLocaleDateString(undefined, {
       month: "short",
       day: "numeric",
     }),
-    score: s.overall_score || 0,
+    score: Math.round(Number(s.overall_score)),
     role: s.target_role,
   }));
   const names = Array.from(new Set(metrics.map(m => m.metric_name)));
@@ -147,18 +155,21 @@ export function PerformancePage() {
     fullMark: 100,
   }));
   const difficulties = Array.from(new Set(sessions.map(s => s.difficulty)));
-  const difficultyRows = difficulties.map(d => ({
-    difficulty: d,
-    avg: avg(
-      sessions.filter(s => s.difficulty === d).map(s => s.overall_score || 0)
-    ),
-    count: sessions.filter(s => s.difficulty === d).length,
-  }));
-  const recentMean = sessions.slice(-3).length
-    ? avg(sessions.slice(-3).map(s => s.overall_score || 0))
+  const difficultyRows = difficulties.map(d => {
+    const matched = scoredSessions.filter(s => s.difficulty === d);
+    return {
+      difficulty: d,
+      avg: matched.length
+        ? avg(matched.map(s => Number(s.overall_score)))
+        : 0,
+      count: sessions.filter(s => s.difficulty === d).length,
+    };
+  });
+  const recentMean = scoredSessions.slice(-3).length
+    ? avg(scoredSessions.slice(-3).map(s => Number(s.overall_score)))
     : 0;
-  const priorMean = sessions.slice(-6, -3).length
-    ? avg(sessions.slice(-6, -3).map(s => s.overall_score || 0))
+  const priorMean = scoredSessions.slice(-6, -3).length
+    ? avg(scoredSessions.slice(-6, -3).map(s => Number(s.overall_score)))
     : 0;
   if (loading) return <LoadingState text="Loading your performance signals…" />;
   return (
@@ -190,7 +201,7 @@ export function PerformancePage() {
             <StatTile
               icon={Target}
               label="Practice readiness"
-              value={`${overall}%`}
+              value={overall !== null ? `${overall}%` : "—"}
               change="Transparent session average"
               tone="cyan"
             />
@@ -222,7 +233,11 @@ export function PerformancePage() {
             <StatTile
               icon={Trophy}
               label="Best session"
-              value={`${Math.max(...sessions.map(s => s.overall_score || 0))}%`}
+              value={
+                scoredSessions.length
+                  ? `${Math.max(...scoredSessions.map(s => Number(s.overall_score)))}%`
+                  : "—"
+              }
               tone="blue"
             />
           </section>
