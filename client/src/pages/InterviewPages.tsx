@@ -1518,6 +1518,7 @@ export function InterviewRoom() {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animFrameRef = useRef<number | null>(null);
   const [micVolume, setMicVolume] = useState(0);
+  const speechRecognitionTextRef = useRef("");
   const finish = useCallback(async () => {
     if (!session || !userId || finalizing.current) return;
     finalizing.current = true;
@@ -1798,6 +1799,7 @@ export function InterviewRoom() {
     recordingStarted.current = Date.now();
     setRecordElapsed(0);
     audioChunks.current = [];
+    speechRecognitionTextRef.current = "";
 
     // 1. Audio Visualizer using Web Audio API
     try {
@@ -1860,7 +1862,7 @@ export function InterviewRoom() {
       console.warn("MediaRecorder start warning:", recErr);
     }
 
-    // 3. Web Speech Recognition for live preview
+    // 3. Web Speech Recognition for live preview & zero-latency native STT
     const Speech =
       (window as any).SpeechRecognition ||
       (window as any).webkitSpeechRecognition;
@@ -1893,6 +1895,7 @@ export function InterviewRoom() {
                 setText(prev => {
                   const updated = prev ? `${prev} ${cleanedFinal}` : cleanedFinal;
                   textRef.current = updated;
+                  speechRecognitionTextRef.current = updated;
                   return updated;
                 });
                 setError("");
@@ -1907,20 +1910,21 @@ export function InterviewRoom() {
             console.warn("Speech error notice:", event?.error);
           };
           r.onend = () => {
-            if (isRecordingRef.current) {
-              if (interimRef.current.trim()) {
-                const pending = interimRef.current.trim();
-                if (!isSilenceHallucination(pending)) {
-                  setText(prev => {
-                    const updated = prev ? `${prev} ${pending}` : pending;
-                    textRef.current = updated;
-                    return updated;
-                  });
-                  setError("");
-                }
-                interimRef.current = "";
-                setInterim("");
+            if (interimRef.current.trim()) {
+              const pending = interimRef.current.trim();
+              if (!isSilenceHallucination(pending)) {
+                setText(prev => {
+                  const updated = prev ? `${prev} ${pending}` : pending;
+                  textRef.current = updated;
+                  speechRecognitionTextRef.current = updated;
+                  return updated;
+                });
+                setError("");
               }
+              interimRef.current = "";
+              setInterim("");
+            }
+            if (isRecordingRef.current) {
               if (voiceRestartTimer.current) clearTimeout(voiceRestartTimer.current);
               voiceRestartTimer.current = setTimeout(() => {
                 startSpeechEngine();
@@ -1963,6 +1967,7 @@ export function InterviewRoom() {
         setText(prev => {
           const updated = prev ? `${prev} ${pending}` : pending;
           textRef.current = updated;
+          speechRecognitionTextRef.current = updated;
           return updated;
         });
         setError("");
@@ -2021,14 +2026,18 @@ export function InterviewRoom() {
     const durationMs = recordingStarted.current
       ? Date.now() - recordingStarted.current
       : 0;
-    const wordsCaptured = textRef.current
-      .trim()
-      .split(/\s+/)
-      .filter(Boolean).length;
+    const liveCaptured = (speechRecognitionTextRef.current || textRef.current).trim();
+    const wordsCaptured = liveCaptured.split(/\s+/).filter(Boolean).length;
 
-    // Check if backend STT fallback is needed
-    // If Web Speech captured fewer than 4 words, and we have >= 500ms audio with size > 0:
-    if (wordsCaptured < 4 && audioBlob && audioBlob.size > 0 && durationMs >= 500) {
+    // In Chrome/Edge, if native Web Speech API captured real speech (>= 2 words),
+    // finalize directly with zero latency and zero dependency on external network STT:
+    if (wordsCaptured >= 2) {
+      setText(liveCaptured);
+      textRef.current = liveCaptured;
+      setError("");
+    } else if (audioBlob && audioBlob.size > 0 && durationMs >= 500) {
+      // For browsers without Web Speech (or if speech recognition didn't yield text),
+      // call the backend STT endpoint:
       setTranscribing(true);
       try {
         const arrayBuf = await audioBlob.arrayBuffer();
@@ -2046,16 +2055,25 @@ export function InterviewRoom() {
             return updated;
           });
           setError("");
+        } else if (liveCaptured) {
+          // If backend STT returned empty but Web Speech captured words, preserve Web Speech
+          setText(liveCaptured);
+          textRef.current = liveCaptured;
+          setError("");
         } else {
-          if (!textRef.current.trim()) {
-            setError(
-              "No clear speech was detected. Please speak into your microphone or type your answer above."
-            );
-          }
+          setError(
+            "No clear speech was detected. Please speak into your microphone or type your answer above."
+          );
         }
       } catch (e: any) {
-        console.error("Audio transcription API error:", e);
-        if (!textRef.current.trim()) {
+        console.warn("Backend transcription notice:", e);
+        // Seamless fallback to Web Speech API if backend STT failed:
+        if (liveCaptured) {
+          console.info("Preserving Web Speech API transcript after backend STT error.");
+          setText(liveCaptured);
+          textRef.current = liveCaptured;
+          setError(""); // Suppress provider error because speech is already captured!
+        } else {
           setError(
             e?.message ||
               "Audio transcription could not be completed. Please try again or type your answer above."
