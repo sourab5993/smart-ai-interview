@@ -9,7 +9,6 @@ export const SILENCE_HALLUCINATION_PATTERNS = [
   /amara\.org/i,
   /translated by/i,
   /transcript by/i,
-  /^[\s\.,!?:;"'“”‘’]*(you|bye|hello|thank you|thanks)[\s\.,!?:;"'“”‘’]*$/i,
 ];
 
 /**

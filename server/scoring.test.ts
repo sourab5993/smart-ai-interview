@@ -21,7 +21,7 @@ describe("isSilenceHallucination", () => {
     expect(isSilenceHallucination("Subtitles by Amara.org")).toBe(true);
   });
 
-  it("does not flag legitimate interview answers", () => {
+  it("does not flag legitimate interview answers or short conversational greetings", () => {
     expect(
       isSilenceHallucination(
         "I would first clarify the API requirements and data access patterns."
@@ -32,6 +32,9 @@ describe("isSilenceHallucination", () => {
         "We can use a distributed hash table or Redis caching layer."
       )
     ).toBe(false);
+    expect(isSilenceHallucination("Hello")).toBe(false);
+    expect(isSilenceHallucination("Thank you")).toBe(false);
+    expect(isSilenceHallucination("Yes, definitely")).toBe(false);
   });
 });
 

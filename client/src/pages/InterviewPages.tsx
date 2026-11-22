@@ -1514,6 +1514,10 @@ export function InterviewRoom() {
   const voiceRestartTimer = useRef<any>(null);
   const stopVoiceRef = useRef<() => void>(() => {});
   const [transcribing, setTranscribing] = useState(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animFrameRef = useRef<number | null>(null);
+  const [micVolume, setMicVolume] = useState(0);
   const finish = useCallback(async () => {
     if (!session || !userId || finalizing.current) return;
     finalizing.current = true;
@@ -1614,6 +1618,16 @@ export function InterviewRoom() {
       live = false;
       if (voiceRestartTimer.current) clearTimeout(voiceRestartTimer.current);
       recognition.current?.stop?.();
+      if (animFrameRef.current) {
+        cancelAnimationFrame(animFrameRef.current);
+        animFrameRef.current = null;
+      }
+      if (audioContextRef.current && audioContextRef.current.state !== "closed") {
+        try {
+          void audioContextRef.current.close();
+        } catch {}
+        audioContextRef.current = null;
+      }
       const stream = audioStream.current;
       if (stream) {
         stream.getTracks().forEach(t => t.stop());
@@ -1729,6 +1743,55 @@ export function InterviewRoom() {
       );
       return;
     }
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError(
+        "Audio recording is not supported in this browser. Please use Chrome, Edge, Safari, or type your answer above."
+      );
+      return;
+    }
+
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+    } catch (constraintErr) {
+      console.warn("Advanced mic constraints rejected, retrying with simple audio:", constraintErr);
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (micErr: any) {
+        console.error("Microphone getUserMedia failed:", micErr);
+        isRecordingRef.current = false;
+        setRecording(false);
+        if (
+          micErr?.name === "NotAllowedError" ||
+          micErr?.name === "PermissionDeniedError"
+        ) {
+          setError(
+            "Microphone permission was denied. Please allow microphone access in your browser settings to use voice mode, or type your answer."
+          );
+        } else if (
+          micErr?.name === "NotFoundError" ||
+          micErr?.name === "DevicesNotFoundError"
+        ) {
+          setError(
+            "No microphone was found on this device. Please connect a microphone or type your answer above."
+          );
+        } else {
+          setError(
+            `Could not access your microphone (${micErr?.message || "device error"}). Please check your microphone settings or type your answer above.`
+          );
+        }
+        return;
+      }
+    }
+
+    audioStream.current = stream;
     isRecordingRef.current = true;
     setRecording(true);
     setMode("voice");
@@ -1736,37 +1799,68 @@ export function InterviewRoom() {
     setRecordElapsed(0);
     audioChunks.current = [];
 
+    // 1. Audio Visualizer using Web Audio API
     try {
-      if (navigator.mediaDevices?.getUserMedia) {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
-        audioStream.current = stream;
-        const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-          ? "audio/webm;codecs=opus"
-          : MediaRecorder.isTypeSupported("audio/webm")
-            ? "audio/webm"
-            : MediaRecorder.isTypeSupported("audio/mp4")
-              ? "audio/mp4"
-              : "";
-        const rec = mime
-          ? new MediaRecorder(stream, { mimeType: mime, audioBitsPerSecond: 32000 })
-          : new MediaRecorder(stream, { audioBitsPerSecond: 32000 });
-        mediaRecorder.current = rec;
-        audioChunks.current = [];
-        rec.ondataavailable = e => {
-          if (e.data && e.data.size > 0) audioChunks.current.push(e.data);
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioCtx) {
+        const actx = new AudioCtx();
+        audioContextRef.current = actx;
+        const src = actx.createMediaStreamSource(stream);
+        const analyser = actx.createAnalyser();
+        analyser.fftSize = 128;
+        src.connect(analyser);
+        analyserRef.current = analyser;
+        const dataArr = new Uint8Array(analyser.frequencyBinCount);
+
+        const updateVolume = () => {
+          if (!isRecordingRef.current || !analyserRef.current) return;
+          analyser.getByteFrequencyData(dataArr);
+          let sum = 0;
+          for (let i = 0; i < dataArr.length; i++) sum += dataArr[i];
+          const avg = sum / dataArr.length;
+          setMicVolume(Math.min(100, Math.round((avg / 128) * 100)));
+          animFrameRef.current = requestAnimationFrame(updateVolume);
         };
-        rec.start(250);
+        animFrameRef.current = requestAnimationFrame(updateVolume);
       }
-    } catch (e) {
-      console.warn("Hardware mic recording init warning:", e);
+    } catch (actxErr) {
+      console.warn("AudioContext init warning:", actxErr);
     }
 
+    // 2. Hardware recording with MediaRecorder
+    const supportedMimes = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/mp4",
+      "audio/ogg;codecs=opus",
+      "audio/wav",
+    ];
+    let chosenMime = "";
+    for (const candidate of supportedMimes) {
+      if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(candidate)) {
+        chosenMime = candidate;
+        break;
+      }
+    }
+
+    try {
+      const recOptions: MediaRecorderOptions = {};
+      if (chosenMime) recOptions.mimeType = chosenMime;
+      const rec = new MediaRecorder(stream, recOptions);
+      mediaRecorder.current = rec;
+      audioChunks.current = [];
+      rec.ondataavailable = e => {
+        if (e.data && e.data.size > 0) audioChunks.current.push(e.data);
+      };
+      rec.onerror = (e: any) => {
+        console.warn("MediaRecorder runtime error:", e);
+      };
+      rec.start(250);
+    } catch (recErr) {
+      console.warn("MediaRecorder start warning:", recErr);
+    }
+
+    // 3. Web Speech Recognition for live preview
     const Speech =
       (window as any).SpeechRecognition ||
       (window as any).webkitSpeechRecognition;
@@ -1801,6 +1895,7 @@ export function InterviewRoom() {
                   textRef.current = updated;
                   return updated;
                 });
+                setError("");
               }
               interimRef.current = "";
             }
@@ -1821,6 +1916,7 @@ export function InterviewRoom() {
                     textRef.current = updated;
                     return updated;
                   });
+                  setError("");
                 }
                 interimRef.current = "";
                 setInterim("");
@@ -1848,6 +1944,19 @@ export function InterviewRoom() {
     isRecordingRef.current = false;
     setRecording(false);
 
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = null;
+    }
+    if (audioContextRef.current && audioContextRef.current.state !== "closed") {
+      try {
+        void audioContextRef.current.close();
+      } catch {}
+      audioContextRef.current = null;
+    }
+    analyserRef.current = null;
+    setMicVolume(0);
+
     if (interimRef.current.trim()) {
       const pending = interimRef.current.trim();
       if (!isSilenceHallucination(pending)) {
@@ -1856,6 +1965,7 @@ export function InterviewRoom() {
           textRef.current = updated;
           return updated;
         });
+        setError("");
       }
       interimRef.current = "";
     }
@@ -1871,15 +1981,16 @@ export function InterviewRoom() {
       audioStream.current = null;
     }
 
+    let audioBlob: Blob | null = null;
     const rec = mediaRecorder.current;
-    if (rec && rec.state === "recording") {
+    if (rec && rec.state !== "inactive") {
       const audioBlobPromise = new Promise<Blob | null>(resolve => {
         const timeout = setTimeout(() => {
-          resolve(
+          const blob =
             audioChunks.current.length > 0
               ? new Blob(audioChunks.current, { type: rec.mimeType || "audio/webm" })
-              : null
-          );
+              : null;
+          resolve(blob);
         }, 800);
 
         rec.onstop = () => {
@@ -1893,62 +2004,76 @@ export function InterviewRoom() {
       });
 
       try {
+        if (rec.state === "recording") {
+          rec.requestData();
+        }
         rec.stop();
-      } catch {
-        // mediaRecorder already inactive
+      } catch (e) {
+        console.warn("MediaRecorder stop notice:", e);
       }
 
-      const audioBlob = await audioBlobPromise;
-      mediaRecorder.current = null;
+      audioBlob = await audioBlobPromise;
+    } else if (audioChunks.current.length > 0) {
+      audioBlob = new Blob(audioChunks.current, { type: "audio/webm" });
+    }
+    mediaRecorder.current = null;
 
-      const durationMs = recordingStarted.current
-        ? Date.now() - recordingStarted.current
-        : 0;
-      const wordsCaptured = textRef.current
-        .trim()
-        .split(/\s+/)
-        .filter(Boolean).length;
-      const hasSubstantialAudio =
-        audioBlob && audioBlob.size >= 3000 && durationMs >= 1500;
+    const durationMs = recordingStarted.current
+      ? Date.now() - recordingStarted.current
+      : 0;
+    const wordsCaptured = textRef.current
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean).length;
 
-      if (wordsCaptured < 5 && hasSubstantialAudio) {
-        setTranscribing(true);
-        try {
-          const arrayBuf = await audioBlob.arrayBuffer();
-          const result = await transcribe.mutateAsync({
-            audioBase64: bytesToBase64(new Uint8Array(arrayBuf)),
-            mimeType: audioBlob.type || "audio/webm",
-            language: session?.language === "Hindi" ? "hi" : "en",
+    // Check if backend STT fallback is needed
+    // If Web Speech captured fewer than 4 words, and we have >= 500ms audio with size > 0:
+    if (wordsCaptured < 4 && audioBlob && audioBlob.size > 0 && durationMs >= 500) {
+      setTranscribing(true);
+      try {
+        const arrayBuf = await audioBlob.arrayBuffer();
+        const result = await transcribe.mutateAsync({
+          audioBase64: bytesToBase64(new Uint8Array(arrayBuf)),
+          mimeType: audioBlob.type || "audio/webm",
+          language: session?.language === "Hindi" ? "hi" : "en",
+        });
+        const rawText = result?.text?.trim() || "";
+        if (rawText && !isSilenceHallucination(rawText)) {
+          setText(prev => {
+            const prevWords = prev.trim().split(/\s+/).filter(Boolean).length;
+            const updated = prevWords < 2 ? rawText : `${prev} ${rawText}`;
+            textRef.current = updated;
+            return updated;
           });
-          const rawText = result?.text?.trim() || "";
-          if (rawText && !isSilenceHallucination(rawText)) {
-            setText(prev => {
-              const prevWords = prev.trim().split(/\s+/).filter(Boolean).length;
-              const updated = prevWords < 5 ? rawText : `${prev} ${rawText}`;
-              textRef.current = updated;
-              return updated;
-            });
-          } else {
-            if (!textRef.current.trim()) {
-              setError(
-                "No clear speech was detected. Please speak into your microphone or type your answer above."
-              );
-            }
+          setError("");
+        } else {
+          if (!textRef.current.trim()) {
+            setError(
+              "No clear speech was detected. Please speak into your microphone or type your answer above."
+            );
           }
-        } catch (e) {
-          console.warn("Fallback transcription error:", e);
-        } finally {
-          setTranscribing(false);
         }
-      } else if (wordsCaptured < 2 && wasRecording && durationMs >= 1000) {
+      } catch (e: any) {
+        console.error("Audio transcription API error:", e);
         if (!textRef.current.trim()) {
           setError(
-            "No clear speech was detected. Please speak into your microphone or type your answer above."
+            e?.message ||
+              "Audio transcription could not be completed. Please try again or type your answer above."
           );
         }
+      } finally {
+        setTranscribing(false);
       }
-    } else {
-      mediaRecorder.current = null;
+    } else if (wasRecording && !textRef.current.trim()) {
+      if (durationMs < 500 || !audioBlob || audioBlob.size === 0) {
+        setError(
+          "Recording was too short. Please speak after clicking 'Start answer' or type your answer above."
+        );
+      } else {
+        setError(
+          "No clear speech was detected. Please speak into your microphone or type your answer above."
+        );
+      }
     }
   }
   stopVoiceRef.current = stopVoice;
@@ -2411,16 +2536,25 @@ export function InterviewRoom() {
                 <span className="record-indicator" />
                 <span>Recording · {formatTime(recordElapsed)}</span>
                 <div className="waveform" aria-label="Recording waveform">
-                  {Array.from({ length: 14 }, (_, i) => (
-                    <i
-                      key={i}
-                      style={
-                        {
-                          "--h": `${5 + ((i * 13) % 15)}px`,
-                        } as React.CSSProperties
-                      }
-                    />
-                  ))}
+                  {Array.from({ length: 14 }, (_, i) => {
+                    const dynamicHeight = Math.max(
+                      5,
+                      Math.min(
+                        22,
+                        Math.round(5 + ((i * 13) % 10) + (micVolume / 100) * 12)
+                      )
+                    );
+                    return (
+                      <i
+                        key={i}
+                        style={
+                          {
+                            "--h": `${dynamicHeight}px`,
+                          } as React.CSSProperties
+                        }
+                      />
+                    );
+                  })}
                 </div>
                 <button className="button button-secondary" onClick={stopVoice}>
                   <Square size={12} /> Stop
