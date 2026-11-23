@@ -9,6 +9,7 @@ import {
   Keyboard,
   Mic,
   Orbit,
+  RotateCcw,
   Send,
   ShieldCheck,
   Square,
@@ -497,6 +498,7 @@ export function LiveInterviewRoom() {
   const abortCapture = useRef(false);
   const expiryRef = useRef(false);
   const speechGenerationRef = useRef(0);
+  const turnAbortControllerRef = useRef<AbortController | null>(null);
   const phaseRef = useRef(phase);
   phaseRef.current = phase;
   const transcriptRef = useRef<HTMLDivElement | null>(null);
@@ -958,15 +960,28 @@ export function LiveInterviewRoom() {
     async (reason: "manual" | "deadline") => {
       if (!session || (expiryRef.current && reason === "deadline"))
         return;
-      if (phaseRef.current === "LISTENING") {
-        stopListening();
+      // Abort any in-flight turn evaluation or speech processing immediately
+      abortCapture.current = true;
+      if (turnAbortControllerRef.current) {
+        turnAbortControllerRef.current.abort();
+        turnAbortControllerRef.current = null;
       }
+      submittedRef.current = false;
+      if (stopping.current) stopping.current = false;
+      if (phaseRef.current === "LISTENING") {
+        try { recognition.current?.stop?.(); } catch {}
+        try { recorder.current?.stop?.(); } catch {}
+      }
+      stopTracks();
+      if (answerTimeout.current) window.clearTimeout(answerTimeout.current);
+      if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
       stopCamera(false);
       expiryRef.current = true;
       setPhase("FINALIZING");
       speechGenerationRef.current += 1;
       setQuestionAudioPending(false);
       window.speechSynthesis?.cancel?.();
+      setBusy(false);
       try {
         await persistCameraSummary();
         await finalize.mutateAsync({ id, reason });
@@ -1081,7 +1096,7 @@ export function LiveInterviewRoom() {
     }
   }, [current?.id, session?.id, session?.owner_id]);
   async function acceptTranscript(text: string) {
-    if (!current || submittedRef.current) return;
+    if (!current || submittedRef.current || abortCapture.current) return;
     const transcript = (text || transcriptDraft || partial).trim();
     if (!transcript) {
       setBusy(false);
@@ -1091,6 +1106,8 @@ export function LiveInterviewRoom() {
       );
       return;
     }
+    const controller = new AbortController();
+    turnAbortControllerRef.current = controller;
     setTranscriptDraft(transcript);
     setPartial(transcript);
     submittedRef.current = true;
@@ -1104,6 +1121,7 @@ export function LiveInterviewRoom() {
         turnId: current.id,
         transcript,
       });
+      if (abortCapture.current || controller.signal.aborted) return;
       transcriptSaved = true;
       setTranscriptDraft("");
       setCapturedAudio(null);
@@ -1128,11 +1146,13 @@ export function LiveInterviewRoom() {
       };
       let evalSuccess = false;
       for (let attempt = 0; attempt < 2; attempt++) {
+        if (abortCapture.current || controller.signal.aborted) return;
         try {
           const result = await evaluate.mutateAsync({
             sessionId: id,
             turnId: current.id,
           });
+          if (abortCapture.current || controller.signal.aborted) return;
           evaluated = {
             ...accepted,
             evaluation: result,
@@ -1143,12 +1163,14 @@ export function LiveInterviewRoom() {
           setError("");
           break;
         } catch (evalErr) {
+          if (abortCapture.current || controller.signal.aborted) return;
           console.warn(`Live interview evaluation attempt ${attempt + 1} warning:`, evalErr);
           if (attempt < 1) {
             await new Promise(res => setTimeout(res, 800));
           }
         }
       }
+      if (abortCapture.current || controller.signal.aborted) return;
       if (!evalSuccess) {
         setPhase("RECOVERABLE_ERROR");
         setError("Your answer was saved, but its coaching evaluation is temporarily pending. Click Continue to retry evaluation or load the next question.");
@@ -1162,11 +1184,13 @@ export function LiveInterviewRoom() {
       try {
         await beginAdaptiveTurn(evaluated);
       } catch (turnErr) {
+        if (abortCapture.current || controller.signal.aborted) return;
         console.warn("Live interview adaptive turn step warning:", turnErr);
         setPhase("RECOVERABLE_ERROR");
         setError("Your answer was evaluated, but loading the next question had a network pause. Click Continue interview to load it.");
       }
     } catch {
+      if (abortCapture.current || controller.signal.aborted) return;
       setPhase("RECOVERABLE_ERROR");
       setError(
         transcriptSaved
@@ -1179,7 +1203,7 @@ export function LiveInterviewRoom() {
       stopTracks();
     }
   }
-  async function transcribeCapturedAudio(blob: Blob) {
+  async function transcribeCapturedAudio(blob: Blob, fallbackLiveText = "") {
     if (!session || !blob.size || transcribingAudioRef.current) return;
     if (blob.size > MAX_TRANSCRIPTION_AUDIO_BYTES) {
       setBusy(false);
@@ -1191,14 +1215,17 @@ export function LiveInterviewRoom() {
       return;
     }
     transcribingAudioRef.current = true;
+    setCapturedAudio(blob);
     setError("");
     setBusy(true);
     setPhase("PROCESSING_ANSWER");
     try {
+      const mime = blob.type || "audio/webm";
+      const userLang = session.speech_language || "en-US";
       const result = await transcribe.mutateAsync({
         audioBase64: bytesToBase64(new Uint8Array(await blob.arrayBuffer())),
-        mimeType: blob.type || "audio/webm",
-        language: session.speech_language.split("-")[0] || "en",
+        mimeType: mime,
+        language: userLang.startsWith("hi") ? "hi" : (userLang.includes("IN") ? "en-IN" : "en"),
       });
       const transcribedText = result?.text?.trim() || "";
       if (transcribedText && !isSilenceHallucination(transcribedText)) {
@@ -1206,7 +1233,15 @@ export function LiveInterviewRoom() {
         setPartial(transcribedText);
         finalText.current = transcribedText;
         latestRecognizedText.current = transcribedText;
-        await acceptTranscript(transcribedText);
+        setPhase("READY");
+        setBusy(false);
+      } else if (fallbackLiveText && fallbackLiveText.length >= 1) {
+        setTranscriptDraft(fallbackLiveText);
+        setPartial(fallbackLiveText);
+        finalText.current = fallbackLiveText;
+        latestRecognizedText.current = fallbackLiveText;
+        setPhase("READY");
+        setBusy(false);
       } else {
         setBusy(false);
         setPhase("READY");
@@ -1216,12 +1251,18 @@ export function LiveInterviewRoom() {
       }
     } catch (cause) {
       setBusy(false);
-      setPhase("RECOVERABLE_ERROR");
-      setError(
-        cause instanceof Error
-          ? cause.message
-          : "The completed recording could not be transcribed. You can retry transcription or type your answer below."
-      );
+      if (fallbackLiveText && fallbackLiveText.length >= 1) {
+        setTranscriptDraft(fallbackLiveText);
+        setPartial(fallbackLiveText);
+        setPhase("READY");
+      } else {
+        setPhase("RECOVERABLE_ERROR");
+        setError(
+          cause instanceof Error
+            ? cause.message
+            : "The completed recording could not be transcribed. You can retry transcription or type your answer below."
+        );
+      }
     } finally {
       transcribingAudioRef.current = false;
     }
@@ -1435,21 +1476,26 @@ export function LiveInterviewRoom() {
 
         if ((recognitionStalled || noLiveText) && audioBlob.size > 200) {
           setCapturedAudio(audioBlob);
-          void transcribeCapturedAudio(audioBlob);
+          void transcribeCapturedAudio(audioBlob, liveTrimmed);
           return;
         }
 
-        if (liveTrimmed.length >= 2) {
+        if (liveTrimmed.length >= 1) {
           setTranscriptDraft(liveTrimmed);
           setPartial(liveTrimmed);
+          finalText.current = liveTrimmed;
+          latestRecognizedText.current = liveTrimmed;
+          if (audioBlob.size > 200) {
+            setCapturedAudio(audioBlob);
+          }
           setBusy(false);
-          void acceptTranscript(liveTrimmed);
+          setPhase("READY");
           return;
         }
 
         if (audioBlob.size > 200) {
           setCapturedAudio(audioBlob);
-          void transcribeCapturedAudio(audioBlob);
+          void transcribeCapturedAudio(audioBlob, "");
           return;
         }
 
@@ -1461,18 +1507,28 @@ export function LiveInterviewRoom() {
       };
 
       try {
+        recorder.current.requestData();
+      } catch {}
+      try {
         recorder.current.stop();
       } catch {
         stopTracks();
-        if (liveText) void acceptTranscript(liveText);
+        if (liveText) {
+          setTranscriptDraft(liveText);
+          setPartial(liveText);
+          setBusy(false);
+          setPhase("READY");
+        }
       }
       return;
     }
 
     stopTracks();
     if (liveText) {
+      setTranscriptDraft(liveText);
+      setPartial(liveText);
       setBusy(false);
-      void acceptTranscript(liveText);
+      setPhase("READY");
       return;
     }
 
@@ -1481,6 +1537,23 @@ export function LiveInterviewRoom() {
     setError("No speech was detected from your microphone. You can type your answer in the box below and click 'Submit answer'.");
   }
   stopListeningRef.current = stopListening;
+
+  function handleReRecord() {
+    if (busy || remaining <= 0) return;
+    if (phase === "LISTENING") {
+      try { recognition.current?.stop?.(); } catch {}
+      try { recorder.current?.stop?.(); } catch {}
+      stopTracks();
+    }
+    setTranscriptDraft("");
+    setPartial("");
+    finalText.current = "";
+    latestRecognizedText.current = "";
+    baseTranscript.current = "";
+    setCapturedAudio(null);
+    setError("");
+    void startListening();
+  }
   async function continueSaved() {
     if (!current?.transcript) return;
     setError("");
@@ -1576,19 +1649,13 @@ export function LiveInterviewRoom() {
         title={session.target_role}
         description="Your camera is optional. Interview audio is processed only when you start an answer."
         action={
-          phase === "LISTENING" ? (
-            <button className="button button-danger" onClick={stopListening}>
-              <Square size={15} /> Stop answer
-            </button>
-          ) : (
-            <button
-              className="button button-danger"
-              disabled={busy || phase === "FINALIZING"}
-              onClick={() => setEndConfirmOpen(true)}
-            >
-              End interview
-            </button>
-          )
+          <button
+            className="button button-danger"
+            disabled={phase === "FINALIZING"}
+            onClick={() => setEndConfirmOpen(true)}
+          >
+            End interview
+          </button>
         }
       />
       <div className="live-room-meta">
@@ -1873,11 +1940,11 @@ export function LiveInterviewRoom() {
                         background:
                           answerMode === "type"
                             ? "var(--primary, #3b82f6)"
-                            : "transparent",
+                            : "rgba(255, 255, 255, 0.08)",
                         color:
                           answerMode === "type"
                             ? "#fff"
-                            : "var(--muted, #aaa)",
+                            : "#e2e8f0",
                       }}
                       onClick={() => {
                         if (phase === "LISTENING") stopListening();
@@ -1901,11 +1968,11 @@ export function LiveInterviewRoom() {
                         background:
                           answerMode === "speak"
                             ? "var(--primary, #3b82f6)"
-                            : "transparent",
+                            : "rgba(255, 255, 255, 0.08)",
                         color:
                           answerMode === "speak"
                             ? "#fff"
-                            : "var(--muted, #aaa)",
+                            : "#e2e8f0",
                       }}
                       onClick={() => {
                         setAnswerMode("speak");
@@ -1919,7 +1986,7 @@ export function LiveInterviewRoom() {
                 <span
                   style={{
                     fontSize: "0.8rem",
-                    color: "var(--muted, #888)",
+                    color: "#cbd5e1",
                   }}
                 >
                   {answerMode === "type"
@@ -2028,14 +2095,14 @@ export function LiveInterviewRoom() {
                   gap: "8px",
                 }}
               >
-                <div style={{ fontSize: "0.78rem", color: "var(--muted, #888)" }}>
+                <div style={{ fontSize: "0.78rem", color: "#94a3b8", fontWeight: 500 }}>
                   {(() => {
                     const txt = (transcriptDraft || partial).trim();
                     const words = txt ? txt.split(/\s+/).length : 0;
                     return `${words} words · ${txt.length} characters`;
                   })()}
                 </div>
-                <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
                   {answerMode === "speak" && phase === "LISTENING" && (
                     <button
                       type="button"
@@ -2043,24 +2110,43 @@ export function LiveInterviewRoom() {
                       onClick={stopListening}
                       disabled={busy}
                     >
-                      <Square size={14} /> Stop & submit
+                      <Square size={14} /> Stop recording
                     </button>
                   )}
                   {answerMode === "speak" && phase !== "LISTENING" && (
-                    <button
-                      type="button"
-                      className="button button-secondary"
-                      onClick={() => void startListening()}
-                      disabled={
-                        busy ||
-                        questionAudioPending ||
-                        phase === "ASKING" ||
-                        !current ||
-                        remaining <= 0
-                      }
-                    >
-                      <Mic size={14} /> Start speaking
-                    </button>
+                    <>
+                      {(transcriptDraft.trim() || partial.trim()) ? (
+                        <button
+                          type="button"
+                          className="button button-secondary"
+                          onClick={() => void handleReRecord()}
+                          disabled={
+                            busy ||
+                            phase === "PROCESSING_ANSWER" ||
+                            phase === "EVALUATING" ||
+                            !current ||
+                            remaining <= 0
+                          }
+                        >
+                          <RotateCcw size={14} /> Re-record / Speak again
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="button button-secondary"
+                          onClick={() => void startListening()}
+                          disabled={
+                            busy ||
+                            questionAudioPending ||
+                            phase === "ASKING" ||
+                            !current ||
+                            remaining <= 0
+                          }
+                        >
+                          <Mic size={14} /> Start speaking
+                        </button>
+                      )}
+                    </>
                   )}
                   <button
                     type="button"
@@ -2070,6 +2156,7 @@ export function LiveInterviewRoom() {
                     }
                     disabled={
                       busy ||
+                      phase === "LISTENING" ||
                       !(transcriptDraft.trim() || partial.trim()) ||
                       phase === "PROCESSING_ANSWER" ||
                       phase === "EVALUATING"
@@ -2165,8 +2252,41 @@ export function LiveInterviewRoom() {
             <>
               {phase === "LISTENING" ? (
                 <button className="button button-danger" onClick={stopListening}>
-                  <Square size={15} /> Stop & submit answer
+                  <Square size={15} /> Stop recording
                 </button>
+              ) : (transcriptDraft.trim() || partial.trim()) ? (
+                <div style={{ display: "inline-flex", gap: "8px" }}>
+                  <button
+                    className="button button-secondary"
+                    onClick={() => void handleReRecord()}
+                    disabled={
+                      busy ||
+                      phase === "PROCESSING_ANSWER" ||
+                      phase === "EVALUATING" ||
+                      !current ||
+                      remaining <= 0 ||
+                      Boolean(current?.transcript)
+                    }
+                  >
+                    <RotateCcw size={15} /> Re-record
+                  </button>
+                  <button
+                    className="button button-primary"
+                    onClick={() =>
+                      void acceptTranscript(transcriptDraft || partial)
+                    }
+                    disabled={
+                      busy ||
+                      phase === "PROCESSING_ANSWER" ||
+                      phase === "EVALUATING" ||
+                      !current ||
+                      remaining <= 0 ||
+                      Boolean(current?.transcript)
+                    }
+                  >
+                    <Send size={15} /> Submit answer
+                  </button>
+                </div>
               ) : (
                 <button
                   className="button button-primary live-start-answer"
@@ -2189,12 +2309,14 @@ export function LiveInterviewRoom() {
                 aria-live="polite"
               >
                 {phase === "LISTENING"
-                  ? "Microphone active · stop when your answer is complete"
-                  : questionAudioPending
-                    ? "Question audio is starting"
-                    : phase === "PROCESSING_ANSWER" || phase === "EVALUATING"
-                      ? "Processing your answer..."
-                      : "Voice mode active · click Start speaking to answer"}
+                  ? "Microphone active · click Stop recording when your answer is complete"
+                  : (transcriptDraft.trim() || partial.trim())
+                    ? "Review and edit your transcribed answer above before submitting"
+                    : questionAudioPending
+                      ? "Question audio is starting"
+                      : phase === "PROCESSING_ANSWER" || phase === "EVALUATING"
+                        ? "Processing your answer..."
+                        : "Voice mode active · click Start speaking to answer"}
               </span>
               <button
                 type="button"
