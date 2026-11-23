@@ -493,6 +493,7 @@ export function LiveInterviewRoom() {
   const submittedRef = useRef(false);
   const listeningStartedAt = useRef(0);
   const restartTimerRef = useRef<number | null>(null);
+  const typingRestartTimerRef = useRef<number | null>(null);
   const stopListeningRef = useRef<() => void>(() => {});
   const transcribingAudioRef = useRef(false);
   const abortCapture = useRef(false);
@@ -549,14 +550,18 @@ export function LiveInterviewRoom() {
     if (transcript && followTranscriptRef.current)
       transcript.scrollTop = transcript.scrollHeight;
   }, [turns, partial, transcriptDraft, phase]);
-  const stopTracks = () => {
+  const stopTracks = useCallback(() => {
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current.getTracks().forEach(t => {
+        try { t.stop(); } catch {}
+      });
       streamRef.current = null;
     }
     if (audioContextRef.current) {
       try {
-        audioContextRef.current.close();
+        if (audioContextRef.current.state !== "closed") {
+          audioContextRef.current.close();
+        }
       } catch {}
       audioContextRef.current = null;
     }
@@ -565,7 +570,37 @@ export function LiveInterviewRoom() {
       animFrameRef.current = null;
     }
     setMicVolume(0);
-  };
+  }, []);
+
+  const cleanupSpeechEngine = useCallback(() => {
+    if (restartTimerRef.current) {
+      window.clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
+    if (recognition.current) {
+      const r = recognition.current;
+      r.onresult = null;
+      r.onerror = null;
+      r.onend = null;
+      r.onstart = null;
+      try {
+        r.abort();
+      } catch {}
+      recognition.current = null;
+    }
+  }, []);
+
+  const cleanupRecorder = useCallback(() => {
+    if (recorder.current) {
+      const rec = recorder.current;
+      rec.ondataavailable = null;
+      rec.onstop = null;
+      try {
+        if (rec.state !== "inactive") rec.stop();
+      } catch {}
+      recorder.current = null;
+    }
+  }, []);
   const persistCameraSummary = useCallback(
     async (summary = cameraCountsRef.current) => {
       if (!summary.sample_count) return;
@@ -968,13 +1003,12 @@ export function LiveInterviewRoom() {
       }
       submittedRef.current = false;
       if (stopping.current) stopping.current = false;
-      if (phaseRef.current === "LISTENING") {
-        try { recognition.current?.stop?.(); } catch {}
-        try { recorder.current?.stop?.(); } catch {}
-      }
-      stopTracks();
-      if (answerTimeout.current) window.clearTimeout(answerTimeout.current);
+      if (typingRestartTimerRef.current) window.clearTimeout(typingRestartTimerRef.current);
       if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
+      if (answerTimeout.current) window.clearTimeout(answerTimeout.current);
+      cleanupSpeechEngine();
+      cleanupRecorder();
+      stopTracks();
       stopCamera(false);
       expiryRef.current = true;
       setPhase("FINALIZING");
@@ -1034,16 +1068,17 @@ export function LiveInterviewRoom() {
     abortCapture.current = false;
     return () => {
       abortCapture.current = true;
-      recognition.current?.stop?.();
-      recorder.current?.stop?.();
+      if (typingRestartTimerRef.current) window.clearTimeout(typingRestartTimerRef.current);
+      if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
+      if (answerTimeout.current) window.clearTimeout(answerTimeout.current);
+      cleanupSpeechEngine();
+      cleanupRecorder();
       stopTracks();
       stopCamera(false);
-      if (answerTimeout.current) window.clearTimeout(answerTimeout.current);
-      if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
       speechGenerationRef.current += 1;
       window.speechSynthesis?.cancel?.();
     };
-  }, [stopCamera]);
+  }, [stopCamera, cleanupSpeechEngine, cleanupRecorder, stopTracks]);
 
   useEffect(() => {
     const handleVisibilityChange = () => {
@@ -1095,9 +1130,25 @@ export function LiveInterviewRoom() {
       setPartial(saved);
     }
   }, [current?.id, session?.id, session?.owner_id]);
-  async function acceptTranscript(text: string) {
+  async function acceptTranscript(text?: string) {
     if (!current || submittedRef.current || abortCapture.current) return;
-    const transcript = (text || transcriptDraft || partial).trim();
+
+    // 1. If actively recording or listening, stop cleanly first
+    if (phaseRef.current === "LISTENING" || streamRef.current || recorder.current) {
+      stopping.current = true;
+      if (answerTimeout.current) window.clearTimeout(answerTimeout.current);
+      answerTimeout.current = null;
+      if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+      if (typingRestartTimerRef.current) window.clearTimeout(typingRestartTimerRef.current);
+      typingRestartTimerRef.current = null;
+
+      cleanupSpeechEngine();
+      cleanupRecorder();
+      stopTracks();
+    }
+
+    const transcript = (text || transcriptDraft || partial || finalText.current || latestRecognizedText.current).trim();
     if (!transcript) {
       setBusy(false);
       setPhase("READY");
@@ -1124,7 +1175,12 @@ export function LiveInterviewRoom() {
       if (abortCapture.current || controller.signal.aborted) return;
       transcriptSaved = true;
       setTranscriptDraft("");
+      setPartial("");
+      finalText.current = "";
+      latestRecognizedText.current = "";
+      baseTranscript.current = "";
       setCapturedAudio(null);
+      stopping.current = false;
       if (session?.id && current?.id) {
         if (session.owner_id) {
           safeStorage.removeItem(
@@ -1201,6 +1257,8 @@ export function LiveInterviewRoom() {
       submittedRef.current = false;
       setBusy(false);
       stopTracks();
+      cleanupSpeechEngine();
+      cleanupRecorder();
     }
   }
   async function transcribeCapturedAudio(blob: Blob, fallbackLiveText = "") {
@@ -1233,6 +1291,7 @@ export function LiveInterviewRoom() {
         setPartial(transcribedText);
         finalText.current = transcribedText;
         latestRecognizedText.current = transcribedText;
+        baseTranscript.current = transcribedText;
         setPhase("READY");
         setBusy(false);
       } else if (fallbackLiveText && fallbackLiveText.length >= 1) {
@@ -1240,6 +1299,7 @@ export function LiveInterviewRoom() {
         setPartial(fallbackLiveText);
         finalText.current = fallbackLiveText;
         latestRecognizedText.current = fallbackLiveText;
+        baseTranscript.current = fallbackLiveText;
         setPhase("READY");
         setBusy(false);
       } else {
@@ -1268,9 +1328,114 @@ export function LiveInterviewRoom() {
     }
   }
 
+  const startSpeechEngine = useCallback(() => {
+    if (abortCapture.current || stopping.current || phaseRef.current !== "LISTENING") return;
+    const Speech = browserSpeech();
+    if (!Speech) return;
+
+    if (recognition.current) {
+      const old = recognition.current;
+      old.onresult = null;
+      old.onerror = null;
+      old.onend = null;
+      old.onstart = null;
+      try { old.abort(); } catch {}
+      recognition.current = null;
+    }
+
+    try {
+      const r = new Speech();
+      recognition.current = r;
+      const userLang = session?.speech_language || (typeof navigator !== "undefined" ? navigator.language : "en-IN") || "en-IN";
+      r.lang = userLang.startsWith("hi") ? "hi-IN" : (userLang.includes("IN") ? "en-IN" : "en-US");
+      r.continuous = true;
+      r.interimResults = true;
+
+      // sessionBase holds whatever text was established prior to this SpeechRecognition session
+      const sessionBase = (baseTranscript.current || "").trim();
+
+      r.onresult = (event: any) => {
+        if (abortCapture.current || stopping.current || phaseRef.current !== "LISTENING") return;
+        let finals = "";
+        let interim = "";
+        for (let n = 0; n < event.results.length; n++) {
+          const item = event.results[n];
+          if (item.isFinal) finals += `${item[0]?.transcript || ""} `;
+          else interim += `${item[0]?.transcript || ""} `;
+        }
+        finals = finals.trim();
+        interim = interim.trim();
+
+        const resolvedFinals = sessionBase
+          ? (finals ? `${sessionBase} ${finals}` : sessionBase)
+          : finals;
+        finalText.current = resolvedFinals;
+
+        const combined = interim
+          ? (resolvedFinals ? `${resolvedFinals} ${interim}` : interim)
+          : resolvedFinals;
+        latestRecognizedText.current = combined;
+
+        // Synchronize both draft states so the textarea and draft card are always in sync
+        setPartial(combined);
+        setTranscriptDraft(combined);
+      };
+
+      r.onerror = (event: any) => {
+        if (abortCapture.current || stopping.current) return;
+        const err = event?.error;
+        if (err === "no-speech" || err === "aborted") {
+          return;
+        }
+        console.warn("Speech recognition non-fatal error:", err);
+        if (err === "not-allowed" || err === "service-not-allowed") {
+          setError("Microphone or speech permission was denied. You can type your answer in the box below.");
+        }
+      };
+
+      r.onend = () => {
+        if (abortCapture.current || stopping.current) return;
+        if (phaseRef.current === "LISTENING") {
+          const currentTotal = (finalText.current || latestRecognizedText.current || transcriptDraft || "").trim();
+          if (currentTotal) {
+            baseTranscript.current = currentTotal;
+          }
+          if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
+          restartTimerRef.current = window.setTimeout(() => {
+            if (!stopping.current && !abortCapture.current && phaseRef.current === "LISTENING") {
+              startSpeechEngine();
+            }
+          }, 100);
+        }
+      };
+
+      r.start();
+    } catch (speechErr) {
+      console.warn("Web Speech start failed:", speechErr);
+      if (phaseRef.current === "LISTENING" && !stopping.current && !abortCapture.current) {
+        if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
+        restartTimerRef.current = window.setTimeout(() => {
+          if (!stopping.current && !abortCapture.current && phaseRef.current === "LISTENING") {
+            startSpeechEngine();
+          }
+        }, 250);
+      }
+    }
+  }, [session?.speech_language, transcriptDraft]);
+
+  const restartSpeechEngine = useCallback((baseText: string) => {
+    if (abortCapture.current || stopping.current || phaseRef.current !== "LISTENING") return;
+    cleanupSpeechEngine();
+    baseTranscript.current = baseText;
+    finalText.current = baseText;
+    latestRecognizedText.current = baseText;
+    startSpeechEngine();
+  }, [cleanupSpeechEngine, startSpeechEngine]);
+
   async function startListening() {
     if (!session || !current || busy || remaining <= 0) return;
     abortCapture.current = false;
+    stopping.current = false;
     setError("");
     const existing = (transcriptDraft || partial || latestRecognizedText.current || finalText.current).trim();
     baseTranscript.current = existing;
@@ -1278,7 +1443,6 @@ export function LiveInterviewRoom() {
     latestRecognizedText.current = existing;
     setPartial(existing);
     setCapturedAudio(null);
-    stopping.current = false;
     setBusy(true);
 
     let micStream: MediaStream;
@@ -1372,60 +1536,9 @@ export function LiveInterviewRoom() {
     }
 
     // 3. Browser SpeechRecognition for live real-time preview (parallel)
-    const startSpeechEngine = () => {
-      if (abortCapture.current || stopping.current || phaseRef.current !== "LISTENING") return;
-      const Speech = browserSpeech();
-      if (!Speech) return;
-      try {
-        const r = new Speech();
-        recognition.current = r;
-        const userLang = session?.speech_language || navigator.language || "en-IN";
-        r.lang = userLang.startsWith("hi") ? "hi-IN" : (userLang.includes("IN") ? "en-IN" : "en-US");
-        r.continuous = true;
-        r.interimResults = true;
-        r.onresult = (event: any) => {
-          let finals = "", interim = "";
-          for (let n = 0; n < event.results.length; n++) {
-            const item = event.results[n];
-            if (item.isFinal) finals += `${item[0]?.transcript || ""} `;
-            else interim += `${item[0]?.transcript || ""} `;
-          }
-          const base = baseTranscript.current ? `${baseTranscript.current.trim()} ` : "";
-          const resolvedFinals = `${base}${finals}`.trim();
-          finalText.current = resolvedFinals;
-          const combined = `${resolvedFinals} ${interim}`.trim();
-          latestRecognizedText.current = combined;
-          setPartial(combined);
-          setTranscriptDraft(combined);
-        };
-        r.onerror = (event: any) => {
-          if (abortCapture.current || event.error === "no-speech") return;
-          console.warn("Speech recognition warning:", event.error);
-        };
-        r.onend = () => {
-          if (abortCapture.current || stopping.current) return;
-          if (phaseRef.current === "LISTENING") {
-            const currentTotal = (finalText.current || latestRecognizedText.current || "").trim();
-            if (currentTotal) {
-              baseTranscript.current = currentTotal;
-            }
-            if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
-            restartTimerRef.current = window.setTimeout(() => {
-              if (!stopping.current && !abortCapture.current && phaseRef.current === "LISTENING") {
-                startSpeechEngine();
-              }
-            }, 150);
-          }
-        };
-        r.start();
-      } catch (speechErr) {
-        console.warn("Web Speech start failed:", speechErr);
-      }
-    };
-    startSpeechEngine();
-
     setBusy(false);
     setPhase("LISTENING");
+    startSpeechEngine();
 
     answerTimeout.current = window.setTimeout(() => {
       if (phaseRef.current === "LISTENING") {
@@ -1443,13 +1556,14 @@ export function LiveInterviewRoom() {
     answerTimeout.current = null;
     if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
     restartTimerRef.current = null;
+    if (typingRestartTimerRef.current) window.clearTimeout(typingRestartTimerRef.current);
+    typingRestartTimerRef.current = null;
+
     setBusy(true);
     stopping.current = true;
     setPhase("PROCESSING_ANSWER");
 
-    try {
-      recognition.current?.stop?.();
-    } catch {}
+    cleanupSpeechEngine();
 
     const liveText = (
       finalText.current.trim() ||
@@ -1463,13 +1577,14 @@ export function LiveInterviewRoom() {
         const audioBlob = new Blob(chunks.current, {
           type: recorder.current?.mimeType || "audio/webm",
         });
+        cleanupRecorder();
         stopTracks();
 
         const liveTrimmed = liveText.trim();
         const words = liveTrimmed ? liveTrimmed.split(/\s+/).filter(Boolean).length : 0;
 
         // Detect if browser speech recognition stalled/dropped speech:
-        // If candidate spoke for >= 6 seconds and audio recording has substantial size (> 2500 bytes),
+        // If candidate spoke for >= 5 seconds and audio recording has substantial size (> 1500 bytes),
         // but browser transcript has fewer than 7 words, the browser speech engine dropped sentences!
         const recognitionStalled = durationMs >= 5000 && audioBlob.size > 1500 && words < 7;
         const noLiveText = words === 0;
@@ -1485,6 +1600,7 @@ export function LiveInterviewRoom() {
           setPartial(liveTrimmed);
           finalText.current = liveTrimmed;
           latestRecognizedText.current = liveTrimmed;
+          baseTranscript.current = liveTrimmed;
           if (audioBlob.size > 200) {
             setCapturedAudio(audioBlob);
           }
@@ -1512,10 +1628,12 @@ export function LiveInterviewRoom() {
       try {
         recorder.current.stop();
       } catch {
+        cleanupRecorder();
         stopTracks();
         if (liveText) {
           setTranscriptDraft(liveText);
           setPartial(liveText);
+          baseTranscript.current = liveText;
           setBusy(false);
           setPhase("READY");
         }
@@ -1523,10 +1641,12 @@ export function LiveInterviewRoom() {
       return;
     }
 
+    cleanupRecorder();
     stopTracks();
     if (liveText) {
       setTranscriptDraft(liveText);
       setPartial(liveText);
+      baseTranscript.current = liveText;
       setBusy(false);
       setPhase("READY");
       return;
@@ -1540,11 +1660,18 @@ export function LiveInterviewRoom() {
 
   function handleReRecord() {
     if (busy || remaining <= 0) return;
-    if (phase === "LISTENING") {
-      try { recognition.current?.stop?.(); } catch {}
-      try { recorder.current?.stop?.(); } catch {}
-      stopTracks();
-    }
+    stopping.current = true;
+    if (answerTimeout.current) window.clearTimeout(answerTimeout.current);
+    answerTimeout.current = null;
+    if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
+    restartTimerRef.current = null;
+    if (typingRestartTimerRef.current) window.clearTimeout(typingRestartTimerRef.current);
+    typingRestartTimerRef.current = null;
+
+    cleanupSpeechEngine();
+    cleanupRecorder();
+    stopTracks();
+
     setTranscriptDraft("");
     setPartial("");
     finalText.current = "";
@@ -1552,6 +1679,17 @@ export function LiveInterviewRoom() {
     baseTranscript.current = "";
     setCapturedAudio(null);
     setError("");
+
+    if (session?.id && current?.id) {
+      if (session.owner_id) {
+        safeStorage.removeItem(
+          `live_draft_${session.owner_id}_${session.id}_${current.id}`
+        );
+      }
+      safeStorage.removeItem(`live_draft_${session.id}_${current.id}`);
+    }
+
+    stopping.current = false;
     void startListening();
   }
   async function continueSaved() {
@@ -1947,7 +2085,13 @@ export function LiveInterviewRoom() {
                             : "#e2e8f0",
                       }}
                       onClick={() => {
-                        if (phase === "LISTENING") stopListening();
+                        if (phaseRef.current === "LISTENING") {
+                          stopListening();
+                        } else {
+                          cleanupSpeechEngine();
+                          cleanupRecorder();
+                          stopTracks();
+                        }
                         setAnswerMode("type");
                         safeStorage.setItem("live_interview_mode", "type");
                       }}
@@ -2068,11 +2212,27 @@ export function LiveInterviewRoom() {
                 }}
                 value={transcriptDraft || partial}
                 onChange={e => {
+                  const newText = e.target.value;
                   setError("");
-                  setTranscriptDraft(e.target.value);
-                  setPartial(e.target.value);
-                  finalText.current = e.target.value;
-                  latestRecognizedText.current = e.target.value;
+                  setTranscriptDraft(newText);
+                  setPartial(newText);
+                  finalText.current = newText;
+                  latestRecognizedText.current = newText;
+                  baseTranscript.current = newText;
+
+                  if (phaseRef.current === "LISTENING") {
+                    if (typingRestartTimerRef.current) {
+                      window.clearTimeout(typingRestartTimerRef.current);
+                    }
+                    if (recognition.current) {
+                      recognition.current.onresult = null;
+                    }
+                    typingRestartTimerRef.current = window.setTimeout(() => {
+                      if (phaseRef.current === "LISTENING" && !stopping.current && !abortCapture.current) {
+                        restartSpeechEngine(newText);
+                      }
+                    }, 300);
+                  }
                 }}
                 placeholder={
                   answerMode === "type"
@@ -2156,7 +2316,6 @@ export function LiveInterviewRoom() {
                     }
                     disabled={
                       busy ||
-                      phase === "LISTENING" ||
                       !(transcriptDraft.trim() || partial.trim()) ||
                       phase === "PROCESSING_ANSWER" ||
                       phase === "EVALUATING"
@@ -2251,9 +2410,22 @@ export function LiveInterviewRoom() {
           {answerMode === "speak" ? (
             <>
               {phase === "LISTENING" ? (
-                <button className="button button-danger" onClick={stopListening}>
-                  <Square size={15} /> Stop recording
-                </button>
+                <div style={{ display: "inline-flex", gap: "8px" }}>
+                  <button className="button button-danger" onClick={stopListening}>
+                    <Square size={15} /> Stop recording
+                  </button>
+                  {(transcriptDraft.trim() || partial.trim()) && (
+                    <button
+                      className="button button-primary"
+                      onClick={() =>
+                        void acceptTranscript(transcriptDraft || partial)
+                      }
+                      disabled={busy}
+                    >
+                      <Send size={15} /> Submit answer
+                    </button>
+                  )}
+                </div>
               ) : (transcriptDraft.trim() || partial.trim()) ? (
                 <div style={{ display: "inline-flex", gap: "8px" }}>
                   <button
@@ -2309,7 +2481,7 @@ export function LiveInterviewRoom() {
                 aria-live="polite"
               >
                 {phase === "LISTENING"
-                  ? "Microphone active · click Stop recording when your answer is complete"
+                  ? "Microphone active · speak your answer, then click Stop recording or Submit"
                   : (transcriptDraft.trim() || partial.trim())
                     ? "Review and edit your transcribed answer above before submitting"
                     : questionAudioPending
@@ -2323,7 +2495,13 @@ export function LiveInterviewRoom() {
                 className="button button-secondary"
                 style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: "6px" }}
                 onClick={() => {
-                  if (phase === "LISTENING") stopListening();
+                  if (phaseRef.current === "LISTENING") {
+                    stopListening();
+                  } else {
+                    cleanupSpeechEngine();
+                    cleanupRecorder();
+                    stopTracks();
+                  }
                   setAnswerMode("type");
                   safeStorage.setItem("live_interview_mode", "type");
                 }}
