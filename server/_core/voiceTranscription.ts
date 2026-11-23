@@ -164,14 +164,19 @@ CRITICAL INSTRUCTION: Transcribe only genuine spoken human speech verbatim. If t
         if (!response.ok) {
           const errorBody = await response.text();
           console.error(
-            `[AudioTranscription] Gemini API error for model "${model}" (${response.status} ${response.statusText}):`,
-            errorBody
+            `[AudioTranscription] Provider: Google Gemini | Model: "${model}" | Stage: gemini_generate_content | Status: ${response.status} ${response.statusText} | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error: ${errorBody.slice(0, 300)}`
           );
-          // Retry on model 404, 503, or 429 if another model is available
-          if (
-            (response.status === 404 || response.status === 503 || response.status === 429) &&
-            i < candidateModels.length - 1
-          ) {
+          // Retry on model 404, 503, 429, 5xx or transient provider errors if another model is available
+          const isRetryable =
+            response.status === 404 ||
+            response.status === 503 ||
+            response.status === 429 ||
+            response.status >= 500 ||
+            errorBody.includes("is not available") ||
+            errorBody.includes("not supported") ||
+            errorBody.includes("RESOURCE_EXHAUSTED");
+
+          if (isRetryable && i < candidateModels.length - 1) {
             continue;
           }
           break;
@@ -184,7 +189,10 @@ CRITICAL INSTRUCTION: Transcribe only genuine spoken human speech verbatim. If t
           result = (await response.json()) as typeof result;
         } catch (error) {
           if (error instanceof SyntaxError) {
-            console.error("[AudioTranscription] Gemini response JSON parse error:", error);
+            console.error(
+              `[AudioTranscription] Provider: Google Gemini | Model: "${model}" | Stage: gemini_json_parse | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error:`,
+              error
+            );
             break;
           }
           throw error;
@@ -214,10 +222,14 @@ CRITICAL INSTRUCTION: Transcribe only genuine spoken human speech verbatim. If t
         };
       } catch (error: any) {
         if (controller.signal.aborted) {
-          console.error(`[AudioTranscription] Gemini model "${model}" request timed out.`);
+          console.error(
+            `[AudioTranscription] Provider: Google Gemini | Model: "${model}" | Stage: gemini_request_timeout | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error: Request timed out after ${REQUEST_TIMEOUT_MS}ms`
+          );
           if (i < candidateModels.length - 1) continue;
         } else {
-          console.error(`[AudioTranscription] Gemini fetch exception for "${model}":`, error);
+          console.error(
+            `[AudioTranscription] Provider: Google Gemini | Model: "${model}" | Stage: gemini_fetch_exception | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error: ${error?.message || error}`
+          );
         }
       } finally {
         clearTimeout(timeout);
@@ -259,10 +271,14 @@ CRITICAL INSTRUCTION: Transcribe only genuine spoken human speech verbatim. If t
         }
       } else {
         const errText = await res.text();
-        console.error("[AudioTranscription] Groq Whisper API error:", errText);
+        console.error(
+          `[AudioTranscription] Provider: Groq Whisper | Model: whisper-large-v3-turbo | Stage: groq_transcribe | Status: ${res.status} ${res.statusText} | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error: ${errText.slice(0, 300)}`
+        );
       }
-    } catch (groqErr) {
-      console.error("[AudioTranscription] Groq Whisper network exception:", groqErr);
+    } catch (groqErr: any) {
+      console.error(
+        `[AudioTranscription] Provider: Groq Whisper | Model: whisper-large-v3-turbo | Stage: groq_exception | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error: ${groqErr?.message || groqErr}`
+      );
     }
   }
 
@@ -300,10 +316,14 @@ CRITICAL INSTRUCTION: Transcribe only genuine spoken human speech verbatim. If t
         }
       } else {
         const errText = await res.text();
-        console.error("[AudioTranscription] OpenAI Whisper API error:", errText);
+        console.error(
+          `[AudioTranscription] Provider: OpenAI Whisper | Model: whisper-1 | Stage: openai_transcribe | Status: ${res.status} ${res.statusText} | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error: ${errText.slice(0, 300)}`
+        );
       }
-    } catch (openaiErr) {
-      console.error("[AudioTranscription] OpenAI Whisper network exception:", openaiErr);
+    } catch (openaiErr: any) {
+      console.error(
+        `[AudioTranscription] Provider: OpenAI Whisper | Model: whisper-1 | Stage: openai_exception | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error: ${openaiErr?.message || openaiErr}`
+      );
     }
   }
 

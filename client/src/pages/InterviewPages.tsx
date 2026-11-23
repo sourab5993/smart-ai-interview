@@ -1519,6 +1519,11 @@ export function InterviewRoom() {
   const animFrameRef = useRef<number | null>(null);
   const [micVolume, setMicVolume] = useState(0);
   const speechRecognitionTextRef = useRef("");
+  const recordingSessionIdRef = useRef(0);
+  const initialTextRef = useRef("");
+  const userEditedDuringRecordingRef = useRef(false);
+  const speechSessionFinalsRef = useRef<string[]>([]);
+  const speechSessionInterimRef = useRef("");
   const finish = useCallback(async () => {
     if (!session || !userId || finalizing.current) return;
     finalizing.current = true;
@@ -1792,14 +1797,20 @@ export function InterviewRoom() {
       }
     }
 
+    const sessionId = ++recordingSessionIdRef.current;
+    initialTextRef.current = textRef.current;
+    userEditedDuringRecordingRef.current = false;
+    speechSessionFinalsRef.current = [];
+    speechSessionInterimRef.current = "";
+    audioChunks.current = [];
+    speechRecognitionTextRef.current = "";
+
     audioStream.current = stream;
     isRecordingRef.current = true;
     setRecording(true);
     setMode("voice");
     recordingStarted.current = Date.now();
     setRecordElapsed(0);
-    audioChunks.current = [];
-    speechRecognitionTextRef.current = "";
 
     // 1. Audio Visualizer using Web Audio API
     try {
@@ -1850,7 +1861,6 @@ export function InterviewRoom() {
       if (chosenMime) recOptions.mimeType = chosenMime;
       const rec = new MediaRecorder(stream, recOptions);
       mediaRecorder.current = rec;
-      audioChunks.current = [];
       rec.ondataavailable = e => {
         if (e.data && e.data.size > 0) audioChunks.current.push(e.data);
       };
@@ -1862,14 +1872,20 @@ export function InterviewRoom() {
       console.warn("MediaRecorder start warning:", recErr);
     }
 
-    // 3. Web Speech Recognition for live preview & zero-latency native STT
+    // 3. Web Speech Recognition for live preview ONLY (never authoritative over real recording)
     const Speech =
       (window as any).SpeechRecognition ||
       (window as any).webkitSpeechRecognition;
     if (Speech) {
       const startSpeechEngine = () => {
-        if (!isRecordingRef.current) return;
+        if (!isRecordingRef.current || recordingSessionIdRef.current !== sessionId) return;
         try {
+          if (recognition.current) {
+            try {
+              recognition.current.abort();
+            } catch {}
+            recognition.current = null;
+          }
           const r = new Speech();
           recognition.current = r;
           const speechLang =
@@ -1882,54 +1898,58 @@ export function InterviewRoom() {
           r.continuous = true;
           r.interimResults = true;
           r.onresult = (event: any) => {
-            let final = "",
-              partial = "";
+            if (recordingSessionIdRef.current !== sessionId || !isRecordingRef.current) return;
+            let currentFinal = "";
+            let currentInterim = "";
             for (let i = event.resultIndex; i < event.results.length; i++) {
-              const chunk = event.results[i][0]?.transcript || "";
-              if (event.results[i].isFinal) final += chunk;
-              else partial += chunk;
-            }
-            if (final) {
-              const cleanedFinal = final.trim();
-              if (cleanedFinal && !isSilenceHallucination(cleanedFinal)) {
-                setText(prev => {
-                  const updated = prev ? `${prev} ${cleanedFinal}` : cleanedFinal;
-                  textRef.current = updated;
-                  speechRecognitionTextRef.current = updated;
-                  return updated;
-                });
-                setError("");
+              const res = event.results[i];
+              const transcriptChunk = res[0]?.transcript || "";
+              if (res.isFinal) {
+                currentFinal += `${transcriptChunk} `;
+              } else {
+                currentInterim += `${transcriptChunk} `;
               }
-              interimRef.current = "";
             }
-            interimRef.current = partial.trim();
-            setInterim(partial);
+            if (currentFinal.trim()) {
+              const cleaned = currentFinal.trim();
+              if (!isSilenceHallucination(cleaned)) {
+                speechSessionFinalsRef.current.push(cleaned);
+              }
+            }
+            speechSessionInterimRef.current = currentInterim.trim();
+            setInterim(currentInterim.trim());
+
+            // Live preview only: update the text area if the user has not manually edited it
+            if (!userEditedDuringRecordingRef.current) {
+              const previewSpeech = [
+                ...speechSessionFinalsRef.current,
+                currentInterim.trim(),
+              ]
+                .filter(Boolean)
+                .join(" ")
+                .trim();
+              const base = initialTextRef.current.trim();
+              const fullPreview = base
+                ? (previewSpeech ? `${base} ${previewSpeech}` : base)
+                : previewSpeech;
+              setText(fullPreview);
+              textRef.current = fullPreview;
+              speechRecognitionTextRef.current = previewSpeech;
+            }
           };
           r.onerror = (event: any) => {
+            if (recordingSessionIdRef.current !== sessionId || !isRecordingRef.current) return;
             if (event?.error === "no-speech") return;
             console.warn("Speech error notice:", event?.error);
           };
           r.onend = () => {
-            if (interimRef.current.trim()) {
-              const pending = interimRef.current.trim();
-              if (!isSilenceHallucination(pending)) {
-                setText(prev => {
-                  const updated = prev ? `${prev} ${pending}` : pending;
-                  textRef.current = updated;
-                  speechRecognitionTextRef.current = updated;
-                  return updated;
-                });
-                setError("");
-              }
-              interimRef.current = "";
-              setInterim("");
-            }
-            if (isRecordingRef.current) {
-              if (voiceRestartTimer.current) clearTimeout(voiceRestartTimer.current);
-              voiceRestartTimer.current = setTimeout(() => {
+            if (recordingSessionIdRef.current !== sessionId || !isRecordingRef.current) return;
+            if (voiceRestartTimer.current) clearTimeout(voiceRestartTimer.current);
+            voiceRestartTimer.current = setTimeout(() => {
+              if (isRecordingRef.current && recordingSessionIdRef.current === sessionId) {
                 startSpeechEngine();
-              }, 150);
-            }
+              }
+            }, 150);
           };
           r.start();
         } catch (err) {
@@ -1944,6 +1964,7 @@ export function InterviewRoom() {
       clearTimeout(voiceRestartTimer.current);
       voiceRestartTimer.current = null;
     }
+    const sessionId = recordingSessionIdRef.current;
     const wasRecording = isRecordingRef.current;
     isRecordingRef.current = false;
     setRecording(false);
@@ -1961,31 +1982,22 @@ export function InterviewRoom() {
     analyserRef.current = null;
     setMicVolume(0);
 
-    if (interimRef.current.trim()) {
-      const pending = interimRef.current.trim();
-      if (!isSilenceHallucination(pending)) {
-        setText(prev => {
-          const updated = prev ? `${prev} ${pending}` : pending;
-          textRef.current = updated;
-          speechRecognitionTextRef.current = updated;
-          return updated;
-        });
-        setError("");
-      }
-      interimRef.current = "";
-    }
-    setInterim("");
-
+    // Stop recognition cleanly and harvest any pending interim text
     try {
       recognition.current?.stop?.();
     } catch {}
+    recognition.current = null;
 
-    const stream = audioStream.current;
-    if (stream) {
-      stream.getTracks().forEach(t => t.stop());
-      audioStream.current = null;
+    if (speechSessionInterimRef.current.trim()) {
+      const pending = speechSessionInterimRef.current.trim();
+      if (!isSilenceHallucination(pending)) {
+        speechSessionFinalsRef.current.push(pending);
+      }
+      speechSessionInterimRef.current = "";
     }
+    setInterim("");
 
+    // Stop MediaRecorder and wait for onstop BEFORE stopping media tracks
     let audioBlob: Blob | null = null;
     const rec = mediaRecorder.current;
     if (rec && rec.state !== "inactive") {
@@ -1996,7 +2008,7 @@ export function InterviewRoom() {
               ? new Blob(audioChunks.current, { type: rec.mimeType || "audio/webm" })
               : null;
           resolve(blob);
-        }, 800);
+        }, 1200);
 
         rec.onstop = () => {
           clearTimeout(timeout);
@@ -2014,7 +2026,7 @@ export function InterviewRoom() {
         }
         rec.stop();
       } catch (e) {
-        console.warn("MediaRecorder stop notice:", e);
+        console.warn("MediaRecorder stop error:", e);
       }
 
       audioBlob = await audioBlobPromise;
@@ -2023,21 +2035,31 @@ export function InterviewRoom() {
     }
     mediaRecorder.current = null;
 
+    // NOW stop audio tracks after MediaRecorder has completely finalized
+    const stream = audioStream.current;
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      audioStream.current = null;
+    }
+
     const durationMs = recordingStarted.current
       ? Date.now() - recordingStarted.current
       : 0;
-    const liveCaptured = (speechRecognitionTextRef.current || textRef.current).trim();
-    const wordsCaptured = liveCaptured.split(/\s+/).filter(Boolean).length;
 
-    // In Chrome/Edge, if native Web Speech API captured real speech (>= 2 words),
-    // finalize directly with zero latency and zero dependency on external network STT:
-    if (wordsCaptured >= 2) {
-      setText(liveCaptured);
-      textRef.current = liveCaptured;
-      setError("");
-    } else if (audioBlob && audioBlob.size > 0 && durationMs >= 500) {
-      // For browsers without Web Speech (or if speech recognition didn't yield text),
-      // call the backend STT endpoint:
+    // Verify session guard
+    if (recordingSessionIdRef.current !== sessionId) return;
+
+    const browserCandidate = speechSessionFinalsRef.current
+      .join(" ")
+      .trim();
+    const hasBrowserSpeech =
+      browserCandidate.length > 0 &&
+      !isSilenceHallucination(browserCandidate);
+
+    const baseText = initialTextRef.current.trim();
+
+    // 1. Authoritative Backend Transcription
+    if (audioBlob && audioBlob.size > 200 && durationMs >= 500) {
       setTranscribing(true);
       try {
         const arrayBuf = await audioBlob.arrayBuffer();
@@ -2046,48 +2068,93 @@ export function InterviewRoom() {
           mimeType: audioBlob.type || "audio/webm",
           language: session?.language === "Hindi" ? "hi" : "en",
         });
-        const rawText = result?.text?.trim() || "";
-        if (rawText && !isSilenceHallucination(rawText)) {
-          setText(prev => {
-            const prevWords = prev.trim().split(/\s+/).filter(Boolean).length;
-            const updated = prevWords < 2 ? rawText : `${prev} ${rawText}`;
-            textRef.current = updated;
-            return updated;
-          });
+
+        if (recordingSessionIdRef.current !== sessionId) return;
+
+        const authoritativeText = result?.text?.trim() || "";
+        if (authoritativeText && !isSilenceHallucination(authoritativeText)) {
+          // Authoritative backend transcript accepted
+          if (!userEditedDuringRecordingRef.current) {
+            const finalAnswer = baseText
+              ? `${baseText} ${authoritativeText}`
+              : authoritativeText;
+            setText(finalAnswer);
+            textRef.current = finalAnswer;
+          }
           setError("");
-        } else if (liveCaptured) {
-          // If backend STT returned empty but Web Speech captured words, preserve Web Speech
-          setText(liveCaptured);
-          textRef.current = liveCaptured;
+        } else if (hasBrowserSpeech) {
+          // Backend returned empty but browser recognition had genuine words from this session
+          if (!userEditedDuringRecordingRef.current) {
+            const finalAnswer = baseText
+              ? `${baseText} ${browserCandidate}`
+              : browserCandidate;
+            setText(finalAnswer);
+            textRef.current = finalAnswer;
+          }
           setError("");
         } else {
+          // No clear speech detected from either source
+          if (!userEditedDuringRecordingRef.current) {
+            setText(initialTextRef.current);
+            textRef.current = initialTextRef.current;
+          }
           setError(
             "No clear speech was detected. Please speak into your microphone or type your answer above."
           );
         }
-      } catch (e: any) {
-        console.warn("Backend transcription notice:", e);
-        // Seamless fallback to Web Speech API if backend STT failed:
-        if (liveCaptured) {
-          console.info("Preserving Web Speech API transcript after backend STT error.");
-          setText(liveCaptured);
-          textRef.current = liveCaptured;
-          setError(""); // Suppress provider error because speech is already captured!
+      } catch (sttErr: any) {
+        console.warn("Backend transcription failed:", sttErr);
+        if (recordingSessionIdRef.current !== sessionId) return;
+
+        if (hasBrowserSpeech) {
+          // Fallback to browser transcript for this session
+          if (!userEditedDuringRecordingRef.current) {
+            const finalAnswer = baseText
+              ? `${baseText} ${browserCandidate}`
+              : browserCandidate;
+            setText(finalAnswer);
+            textRef.current = finalAnswer;
+          }
+          setError("");
         } else {
+          // Preserve existing text and show honest error
+          if (!userEditedDuringRecordingRef.current) {
+            setText(initialTextRef.current);
+            textRef.current = initialTextRef.current;
+          }
           setError(
-            e?.message ||
+            sttErr?.message ||
               "Audio transcription could not be completed. Please try again or type your answer above."
           );
         }
       } finally {
-        setTranscribing(false);
+        if (recordingSessionIdRef.current === sessionId) {
+          setTranscribing(false);
+        }
       }
-    } else if (wasRecording && !textRef.current.trim()) {
-      if (durationMs < 500 || !audioBlob || audioBlob.size === 0) {
+    } else if (wasRecording) {
+      if (durationMs < 500 || !audioBlob || audioBlob.size <= 200) {
+        if (!userEditedDuringRecordingRef.current) {
+          setText(initialTextRef.current);
+          textRef.current = initialTextRef.current;
+        }
         setError(
           "Recording was too short. Please speak after clicking 'Start answer' or type your answer above."
         );
+      } else if (hasBrowserSpeech) {
+        if (!userEditedDuringRecordingRef.current) {
+          const finalAnswer = baseText
+            ? `${baseText} ${browserCandidate}`
+            : browserCandidate;
+          setText(finalAnswer);
+          textRef.current = finalAnswer;
+        }
+        setError("");
       } else {
+        if (!userEditedDuringRecordingRef.current) {
+          setText(initialTextRef.current);
+          textRef.current = initialTextRef.current;
+        }
         setError(
           "No clear speech was detected. Please speak into your microphone or type your answer above."
         );
@@ -2562,6 +2629,8 @@ export function InterviewRoom() {
               setError("");
               interimRef.current = "";
               setInterim("");
+              speechSessionInterimRef.current = "";
+              userEditedDuringRecordingRef.current = true;
               setText(e.target.value);
               textRef.current = e.target.value;
             }}

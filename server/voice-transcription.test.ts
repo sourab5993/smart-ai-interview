@@ -145,4 +145,98 @@ describe("Gemini audio transcription fallback", () => {
       text: "",
     });
   });
+
+  it("handles valid WAV audio and formats inlineData correctly", async () => {
+    vi.stubEnv("GEMINI_API_KEY", "test-server-key");
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: { parts: [{ text: "I have five years of experience in system design." }] },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const wavBytes = Buffer.from("RIFF....WAVEfmt ");
+
+    const result = await transcribeAudioBuffer({
+      audioBuffer: wavBytes,
+      mimeType: "audio/wav",
+      language: "en",
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const payload = JSON.parse(String(init.body));
+    expect(payload.contents[0].parts[1].inlineData).toEqual({
+      mimeType: "audio/wav",
+      data: wavBytes.toString("base64"),
+    });
+    expect(result).toMatchObject({
+      task: "transcribe",
+      text: "I have five years of experience in system design.",
+    });
+  });
+
+  it("retries with candidate models when a model returns 503 high demand spike", async () => {
+    vi.stubEnv("GEMINI_API_KEY", "test-server-key");
+    let callCount = 0;
+    const fetchMock = vi.fn().mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) {
+        return Promise.resolve(new Response("High demand spike", { status: 503 }));
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: { parts: [{ text: "Candidate model successfully transcribed speech." }] },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        )
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await transcribeAudioBuffer({
+      audioBuffer: Buffer.from("audio bytes"),
+      mimeType: "audio/webm",
+      language: "en",
+    });
+
+    expect(callCount).toBeGreaterThanOrEqual(2);
+    expect(result).toMatchObject({
+      task: "transcribe",
+      text: "Candidate model successfully transcribed speech.",
+    });
+  });
+
+  it("returns safe empty text when transcription response contains no parts or only whitespace", async () => {
+    vi.stubEnv("GEMINI_API_KEY", "test-server-key");
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          candidates: [{ content: { parts: [{ text: "   \n\t  " }] } }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await transcribeAudioBuffer({
+      audioBuffer: Buffer.from("audio bytes"),
+      mimeType: "audio/webm",
+    });
+
+    expect(result).toMatchObject({
+      task: "transcribe",
+      text: "",
+    });
+  });
 });
