@@ -22,6 +22,9 @@ type Session = {
   completed_at: string | null;
   camera_summary?: LocalFramingSummary | null;
   report: any;
+  report_error?: string | null;
+  created_at?: string;
+  updated_at?: string;
 };
 type Turn = {
   id: string;
@@ -47,7 +50,22 @@ type SessionSummary = Pick<
   | "started_at"
   | "deadline_at"
   | "completed_at"
->;
+> & {
+  updated_at?: string;
+  report_error?: string | null;
+};
+export const STALE_FINALIZING_TIMEOUT_MS = 45_000;
+
+export function isFinalizingStale(
+  session: { status: string; updated_at?: string; started_at?: string },
+  now = Date.now()
+) {
+  if (session.status !== "finalizing") return false;
+  const ts = session.updated_at || session.started_at;
+  if (!ts) return false;
+  return now - Date.parse(ts) >= STALE_FINALIZING_TIMEOUT_MS;
+}
+
 export function hasLiveInterviewDeadlineElapsed(
   deadlineAt: string,
   now = Date.now()
@@ -150,16 +168,90 @@ function accepting(s: Session) {
       message: "The interview deadline passed or this session has ended.",
     });
 }
+async function autoExpireStaleSession(
+  ctx: Ctx,
+  session: { id: string; status: string; updated_at?: string; started_at?: string }
+): Promise<boolean> {
+  if (!isFinalizingStale(session)) return false;
+  try {
+    await rest(
+      ctx,
+      "rpc/force_end_live_interview",
+      "",
+      {
+        method: "POST",
+        body: JSON.stringify({ p_session_id: session.id, p_status: "failed" }),
+      }
+    ).catch(async () => {
+      await rest(
+        ctx,
+        "live_interview_sessions",
+        `?id=eq.${enc(session.id)}&${owner(ctx)}&status=eq.finalizing`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            status: "failed",
+            report_error: "Finalization timed out. Retry finalization or force end.",
+            updated_at: new Date().toISOString(),
+          }),
+        }
+      );
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function forceEndLiveSession(ctx: Ctx, id: string) {
+  await rest(
+    ctx,
+    "rpc/force_end_live_interview",
+    "",
+    {
+      method: "POST",
+      body: JSON.stringify({ p_session_id: id, p_status: "abandoned" }),
+    }
+  ).catch(async () => {
+    await rest(
+      ctx,
+      "live_interview_sessions",
+      `?id=eq.${enc(id)}&${owner(ctx)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          status: "abandoned",
+          report_error: "Session ended by user.",
+          completed_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        }),
+      }
+    );
+  });
+  return { success: true as const, sessionId: id };
+}
+
 export async function createLiveSession(
   ctx: Ctx,
   input: { role: string; durationMinutes: number; speechLanguage: string }
 ) {
-  const active = await rest<Session[]>(
+  const active = await rest<SessionSummary[]>(
     ctx,
     "live_interview_sessions",
-    `?${owner(ctx)}&status=in.(in_progress,failed,finalizing)&select=id&limit=1`
+    `?${owner(ctx)}&status=in.(in_progress,failed,finalizing)&select=id,status,deadline_at,started_at,updated_at&order=created_at.desc&limit=5`
   );
-  if (active.length)
+
+  for (const s of active) {
+    if (s.status === "finalizing" && isFinalizingStale(s)) {
+      await autoExpireStaleSession(ctx, s);
+    }
+  }
+
+  // Only an un-expired in_progress session blocks creation
+  const ongoing = active.find(
+    s => s.status === "in_progress" && !hasLiveInterviewDeadlineElapsed(s.deadline_at)
+  );
+  if (ongoing)
     throw new TRPCError({
       code: "CONFLICT",
       message: "Recover or finish your active Live Interview first.",
@@ -194,9 +286,17 @@ export async function getActiveLiveSession(ctx: Ctx) {
   const sessions = await rest<SessionSummary[]>(
     ctx,
     "live_interview_sessions",
-    `?${owner(ctx)}&status=in.(in_progress,failed,finalizing)&select=id,target_role,duration_minutes,status,started_at,deadline_at&order=created_at.desc&limit=1`
+    `?${owner(ctx)}&status=in.(in_progress,failed,finalizing)&select=id,target_role,duration_minutes,status,started_at,deadline_at,updated_at&order=created_at.desc&limit=1`
   );
-  return sessions[0] || null;
+  const session = sessions[0];
+  if (!session) return null;
+
+  if (session.status === "finalizing" && isFinalizingStale(session)) {
+    await autoExpireStaleSession(ctx, session);
+    return null;
+  }
+
+  return session;
 }
 export async function listLiveSessions(ctx: Ctx) {
   return rest<
@@ -415,39 +515,74 @@ export async function finalizeLiveSession(
       code: "PRECONDITION_FAILED",
       message: "The server-side deadline has not elapsed.",
     });
-  const claimToken = await rest<string>(
-    ctx,
-    "rpc/claim_interview_finalization",
-    "",
-    {
-      method: "POST",
-      body: JSON.stringify({ p_session_kind: "live", p_session_id: id }),
-    }
-  );
-  if (
-    typeof claimToken !== "string" ||
-    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-      claimToken
-    )
-  ) {
+
+  let claimToken: string | null = null;
+  try {
+    claimToken = await rest<string>(
+      ctx,
+      "rpc/claim_interview_finalization",
+      "",
+      {
+        method: "POST",
+        body: JSON.stringify({ p_session_kind: "live", p_session_id: id }),
+      }
+    );
+  } catch {
+    claimToken = null;
+  }
+
+  const isTokenFormatValid = (token: unknown): token is string =>
+    typeof token === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(token);
+
+  if (!isTokenFormatValid(claimToken)) {
     const current = await sessionFor(ctx, id);
     if (current.status === "completed")
       return { session: current, turns: await turnsFor(ctx, id) };
-    throw new TRPCError({
-      code: "CONFLICT",
-      message:
-        "This interview is already being finalized. Refresh in a moment to check its report.",
-    });
+
+    if (isFinalizingStale(current)) {
+      await autoExpireStaleSession(ctx, current);
+      try {
+        claimToken = await rest<string>(
+          ctx,
+          "rpc/claim_interview_finalization",
+          "",
+          {
+            method: "POST",
+            body: JSON.stringify({ p_session_kind: "live", p_session_id: id }),
+          }
+        );
+      } catch {
+        claimToken = null;
+      }
+    }
+
+    if (!isTokenFormatValid(claimToken)) {
+      const refreshed = await sessionFor(ctx, id);
+      if (refreshed.status === "completed")
+        return { session: refreshed, turns: await turnsFor(ctx, id) };
+      throw new TRPCError({
+        code: "CONFLICT",
+        message:
+          "This interview is already being finalized. Refresh in a moment to check its report.",
+      });
+    }
   }
+
+  let finalized = false;
   try {
     const finalizingRows = await rest<{ id: string }[]>(
       ctx,
       "live_interview_sessions",
-      `?id=eq.${enc(id)}&${owner(ctx)}&status=eq.${enc(s.status)}`,
+      `?id=eq.${enc(id)}&${owner(ctx)}`,
       {
         method: "PATCH",
         headers: { Prefer: "return=representation" },
-        body: JSON.stringify({ status: "finalizing", report_error: null }),
+        body: JSON.stringify({
+          status: "finalizing",
+          report_error: null,
+          updated_at: new Date().toISOString(),
+        }),
       }
     );
     if (!finalizingRows.length)
@@ -596,39 +731,76 @@ export async function finalizeLiveSession(
     );
     if (!completed) {
       const current = await sessionFor(ctx, id);
-      if (current.status === "completed")
+      if (current.status === "completed") {
+        finalized = true;
         return { session: current, turns: await turnsFor(ctx, id) };
+      }
       throw new TRPCError({
         code: "CONFLICT",
         message:
           "The report was prepared, but its finalization lease or session status changed. Refresh and retry.",
       });
     }
+    finalized = true;
     const [finalSession, finalTurns] = await Promise.all([
       sessionFor(ctx, id),
       turnsFor(ctx, id),
     ]);
     return { session: finalSession, turns: finalTurns };
   } catch (error) {
+    // Immediately clear finalizing state in DB so the session is never left locked
     await rest(
       ctx,
-      "rpc/release_interview_finalization",
-      "",
+      "live_interview_sessions",
+      `?id=eq.${enc(id)}&${owner(ctx)}&status=eq.finalizing`,
       {
-        method: "POST",
+        method: "PATCH",
         body: JSON.stringify({
-          p_session_kind: "live",
-          p_session_id: id,
-          p_claim_token: claimToken,
-          p_failure_message: "Live Interview evaluation/report failed; retry allowed.",
+          status: "failed",
+          report_error: "Live Interview evaluation/report failed; retry allowed.",
+          updated_at: new Date().toISOString(),
         }),
       }
     ).catch(() => undefined);
+
+    if (claimToken) {
+      await rest(
+        ctx,
+        "rpc/release_interview_finalization",
+        "",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            p_session_kind: "live",
+            p_session_id: id,
+            p_claim_token: claimToken,
+            p_failure_message: "Live Interview evaluation/report failed; retry allowed.",
+          }),
+        }
+      ).catch(() => undefined);
+    }
     if (error instanceof TRPCError) throw error;
     throw new TRPCError({
       code: "SERVICE_UNAVAILABLE",
       message:
         "Answers are saved, but evaluation/report generation failed. Retry finalization.",
     });
+  } finally {
+    if (!finalized) {
+      // Ensure session does not stay in 'finalizing' on any unhandled failure
+      await rest(
+        ctx,
+        "live_interview_sessions",
+        `?id=eq.${enc(id)}&${owner(ctx)}&status=eq.finalizing`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            status: "failed",
+            report_error: "Finalization interrupted. Retry finalization or force end.",
+            updated_at: new Date().toISOString(),
+          }),
+        }
+      ).catch(() => undefined);
+    }
   }
 }

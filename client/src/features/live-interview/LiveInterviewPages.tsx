@@ -109,6 +109,7 @@ export function LiveInterviewSetup() {
   const active = trpc.liveInterview.active.useQuery();
   const recent = trpc.liveInterview.recent.useQuery();
   const create = trpc.liveInterview.create.useMutation();
+  const forceEnd = trpc.liveInterview.forceEnd.useMutation();
   const saveQuestion = trpc.liveInterview.saveQuestion.useMutation();
   const generate = trpc.ai.generateQuestions.useMutation();
   const isStartingRef = useRef(false);
@@ -165,6 +166,12 @@ export function LiveInterviewSetup() {
     return () => window.clearTimeout(timer);
   }, [role, active.data, generate]);
 
+  const isBlockingActive = Boolean(
+    active.data &&
+      active.data.status === "in_progress" &&
+      Date.now() < Date.parse(active.data.deadline_at)
+  );
+
   async function start() {
     if (isStartingRef.current) return;
     const target = role.trim();
@@ -176,6 +183,9 @@ export function LiveInterviewSetup() {
     setError("");
     setRecoveryId("");
     try {
+      if (active.data?.id && !isBlockingActive) {
+        await forceEnd.mutateAsync({ id: active.data.id }).catch(() => undefined);
+      }
       const speechLang = inferredSpeechLocale();
       let generatedData = null;
       if (prefetchedRef.current?.role === target && prefetchedRef.current.lang === speechLang) {
@@ -253,12 +263,31 @@ export function LiveInterviewSetup() {
             {active.data.target_role} · {active.data.duration_minutes} minutes ·{" "}
             {active.data.status}
           </p>
-          <Link
-            className="button button-secondary"
-            href={`/live-interview/${active.data.id}`}
-          >
-            Resume session <ArrowRight size={14} />
-          </Link>
+          <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+            <Link
+              className="button button-secondary"
+              href={`/live-interview/${active.data.id}`}
+            >
+              Resume session <ArrowRight size={14} />
+            </Link>
+            <button
+              type="button"
+              className="button button-danger"
+              disabled={forceEnd.isPending}
+              onClick={async () => {
+                const targetId = active.data?.id;
+                if (!targetId) return;
+                try {
+                  await forceEnd.mutateAsync({ id: targetId });
+                  await Promise.all([active.refetch(), recent.refetch()]);
+                } catch {
+                  setError("Could not force end the session. Try again.");
+                }
+              }}
+            >
+              {forceEnd.isPending ? "Ending…" : "Discard / Force End"}
+            </button>
+          </div>
         </Panel>
       )}
       {recent.data?.length ? (
@@ -373,7 +402,7 @@ export function LiveInterviewSetup() {
         <button
           className="button button-primary"
           onClick={() => void start()}
-          disabled={busy || Boolean(active.data) || !role.trim()}
+          disabled={busy || forceEnd.isPending || isBlockingActive || !role.trim()}
         >
           {busy ? (
             <>
@@ -429,6 +458,7 @@ export function LiveInterviewRoom() {
   const evaluate = trpc.liveInterview.evaluateTurn.useMutation();
   const saveQuestion = trpc.liveInterview.saveQuestion.useMutation();
   const finalize = trpc.liveInterview.finalize.useMutation();
+  const forceEnd = trpc.liveInterview.forceEnd.useMutation();
   const saveCameraSummary = trpc.liveInterview.saveCameraSummary.useMutation();
   const generate = trpc.ai.generateQuestions.useMutation();
   const transcribe = trpc.voice.transcribeStoredAudio.useMutation();
@@ -482,11 +512,23 @@ export function LiveInterviewRoom() {
         cameraBaseRef.current = loaded.camera_summary;
         lastCameraSaveRef.current = loaded.camera_summary.sample_count;
       }
-      if (query.data.session.status === "completed") setPhase("COMPLETED");
-      else if (query.data.session.status === "failed")
+      if (query.data.session.status === "completed") {
+        setPhase("COMPLETED");
+        navigate(`/live-report/${id}`);
+      } else if (
+        query.data.session.status === "failed" ||
+        query.data.session.status === "abandoned"
+      ) {
         setPhase("RECOVERABLE_ERROR");
+        if (query.data.session.report_error) {
+          setError(query.data.session.report_error);
+        }
+      } else if (query.data.session.status === "finalizing") {
+        setPhase("FINALIZING");
+      }
     }
-  }, [query.data]);
+  }, [query.data, id, navigate]);
+
   useEffect(() => {
     if (!session) return;
     const tick = () =>
@@ -551,6 +593,46 @@ export function LiveInterviewRoom() {
     cameraStatusRef.current = "off";
     if (updateState) setCameraStatus("off");
   }, []);
+
+  useEffect(() => {
+    if (phase !== "FINALIZING") return;
+    let pollCount = 0;
+    const maxPolls = 20; // 20 * 3000ms = 60s
+    const timer = window.setInterval(async () => {
+      pollCount += 1;
+      try {
+        const refetched = await query.refetch();
+        const curStatus = refetched.data?.session?.status;
+        if (curStatus === "completed") {
+          window.clearInterval(timer);
+          stopCamera();
+          setPhase("COMPLETED");
+          navigate(`/live-report/${id}`);
+          return;
+        }
+        if (curStatus === "failed" || curStatus === "abandoned") {
+          window.clearInterval(timer);
+          setPhase("RECOVERABLE_ERROR");
+          setError(
+            refetched.data?.session?.report_error ||
+              "Finalization could not finish. You can retry finalization or abandon the session."
+          );
+          expiryRef.current = false;
+          return;
+        }
+      } catch {}
+      if (pollCount >= maxPolls) {
+        window.clearInterval(timer);
+        setPhase("RECOVERABLE_ERROR");
+        setError(
+          "Finalization timed out. Your answers are saved; click Retry finalization or Force End."
+        );
+        expiryRef.current = false;
+      }
+    }, 3000);
+
+    return () => window.clearInterval(timer);
+  }, [phase, id, query, navigate, stopCamera]);
   async function enableCamera() {
     const runId = ++cameraRunRef.current;
     setCameraError("");
@@ -892,12 +974,23 @@ export function LiveInterviewRoom() {
         setPhase("COMPLETED");
         navigate(`/live-report/${id}`);
       } catch (cause) {
+        const msg = cause instanceof Error ? cause.message : "";
+        if (msg.includes("already being finalized")) {
+          setPhase("FINALIZING");
+          setError("This interview is being finalized. Checking report status…");
+          return;
+        }
         try {
           const refetched = await query.refetch();
           if (refetched.data?.session?.status === "completed") {
             stopCamera();
             setPhase("COMPLETED");
             navigate(`/live-report/${id}`);
+            return;
+          }
+          if (refetched.data?.session?.status === "finalizing") {
+            setPhase("FINALIZING");
+            setError("This interview is being finalized. Checking report status…");
             return;
           }
         } catch {}
@@ -1439,6 +1532,16 @@ export function LiveInterviewRoom() {
         <h2>Live Interview complete</h2>
         <Link className="button button-primary" href={`/live-report/${id}`}>
           Open saved report <ArrowRight size={15} />
+        </Link>
+      </div>
+    );
+  if (session.status === "abandoned")
+    return (
+      <div className="center-screen">
+        <h2>Live Interview ended</h2>
+        <p style={{ margin: "12px 0 20px" }}>This interview session was abandoned.</p>
+        <Link className="button button-primary" href="/live-interview">
+          Back to Live Interview <ArrowRight size={15} />
         </Link>
       </div>
     );
@@ -2018,6 +2121,33 @@ export function LiveInterviewRoom() {
                 >
                   Retry saving recognized answer
                 </button>
+              )}
+              {phase === "RECOVERABLE_ERROR" && (
+                <div style={{ display: "flex", gap: "8px", marginTop: "8px", flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    onClick={() => void finalizeSession("manual")}
+                    disabled={busy}
+                  >
+                    Retry finalization
+                  </button>
+                  <button
+                    type="button"
+                    className="button button-danger"
+                    onClick={async () => {
+                      try {
+                        await forceEnd.mutateAsync({ id });
+                        navigate("/live-interview");
+                      } catch {
+                        setError("Could not force end the session. Try again.");
+                      }
+                    }}
+                    disabled={busy || forceEnd.isPending}
+                  >
+                    {forceEnd.isPending ? "Ending…" : "Force End / Abandon Session"}
+                  </button>
+                </div>
               )}
 
             </div>

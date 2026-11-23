@@ -49,6 +49,7 @@ vi.mock("@/lib/trpc", () => {
         evaluateTurn: mutation,
         saveQuestion: mutation,
         finalize: mutation,
+        forceEnd: mutation,
         saveCameraSummary: mutation,
       },
       ai: { generateQuestions: mutation },

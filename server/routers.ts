@@ -24,6 +24,7 @@ import {
   createLiveSession,
   evaluateLiveTurn,
   finalizeLiveSession,
+  forceEndLiveSession,
   getActiveLiveSession,
   getLiveSession,
   listLiveSessions,
@@ -355,6 +356,9 @@ export const appRouter = router({
       .mutation(({ ctx, input }) =>
         finalizeLiveSession(ctx, input.id, input.reason)
       ),
+    forceEnd: protectedProcedure
+      .input(z.object({ id: shortText(80) }))
+      .mutation(({ ctx, input }) => forceEndLiveSession(ctx, input.id)),
   }),
   admin: router({
     access: adminProcedure.query(({ ctx }) => {
