@@ -402,19 +402,74 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     ...(tools ? { tools } : {}),
     ...(choice ? { toolConfig: { functionCallingConfig: choice } } : {}),
   };
-  const response = await request(
-    `${GEMINI_API_BASE}/models/${encodeURIComponent(model)}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-goog-api-key": apiKey(),
-      },
-      body: JSON.stringify(payload),
-    }
+  const candidateModels = Array.from(
+    new Set(
+      [
+        params.model,
+        process.env.GEMINI_MODEL?.trim(),
+        "gemini-3.5-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-3-flash-preview",
+        "gemini-3.8-flash",
+      ].filter(Boolean) as string[]
+    )
   );
-  if (!response.ok) throw new Error(`LLM invoke failed: ${response.status}`);
-  return mapResponse(parseResponse<GeminiResponse>(response.body));
+
+  let lastResponse: { status: number; body: string } | null = null;
+  let lastError: unknown = null;
+
+  for (let i = 0; i < candidateModels.length; i++) {
+    const currentModel = candidateModels[i];
+    try {
+      const response = await request(
+        `${GEMINI_API_BASE}/models/${encodeURIComponent(currentModel)}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-goog-api-key": apiKey(),
+          },
+          body: JSON.stringify(payload),
+        }
+      );
+      if (response.ok) {
+        return mapResponse(parseResponse<GeminiResponse>(response.body));
+      }
+
+      lastResponse = response;
+      if (response.status === 400) {
+        console.error(`[Gemini LLM] Model "${currentModel}" failed with client error 400.`);
+        throw new Error(`LLM invoke failed: ${response.status}`);
+      }
+
+      console.error(
+        `[Gemini LLM] Model "${currentModel}" failed with status ${response.status}. Trying candidate model...`
+      );
+      if (i < candidateModels.length - 1 && (response.status === 503 || response.status === 429)) {
+        await new Promise(r => setTimeout(r, 400));
+      }
+    } catch (err) {
+      lastError = err;
+      if (err instanceof Error && err.message.startsWith("LLM invoke failed: 400")) {
+        throw err;
+      }
+      if (err instanceof Error && err.message.includes("timed out")) {
+        console.error(`[Gemini LLM] Model "${currentModel}" timed out.`);
+        throw err;
+      }
+      if (i < candidateModels.length - 1) {
+        continue;
+      }
+    }
+  }
+
+  if (lastResponse) {
+    throw new Error(`LLM invoke failed: ${lastResponse.status}`);
+  }
+  if (lastError instanceof Error) {
+    throw lastError;
+  }
+  throw new Error("LLM invoke failed: unknown error");
 }
 
 export async function listLLMModels(): Promise<ModelsResponse> {

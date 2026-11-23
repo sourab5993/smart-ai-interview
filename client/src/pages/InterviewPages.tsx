@@ -2263,23 +2263,52 @@ export function InterviewRoom() {
     const criteria = evaluationCriteriaFromContext(
       session.context_notes || ""
     );
-    let result: Eval;
-    try {
-      result = await evaluate.mutateAsync({
-        question: current.question_text,
-        answer: answerText,
-        course: session.course,
-        specialization: session.specialization,
-        semester: session.semester,
-        role: session.target_role,
-        type: session.interview_type,
-        skills: session.skills || [],
-        criteria,
-        language: session.language as "English" | "Hindi" | "Hinglish",
-      });
-      if (result.source !== "ai") {
-        throw new Error("A verified AI evaluation was not returned.");
+    let result: Eval | null = null;
+    let evalSuccess = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const evalRes = await evaluate.mutateAsync({
+          question: current.question_text,
+          answer: answerText,
+          course: session.course,
+          specialization: session.specialization,
+          semester: session.semester,
+          role: session.target_role,
+          type: session.interview_type,
+          skills: session.skills || [],
+          criteria,
+          language: session.language as "English" | "Hindi" | "Hinglish",
+        });
+        if (evalRes?.source === "ai") {
+          result = evalRes;
+          evalSuccess = true;
+          break;
+        }
+      } catch (evalAttemptErr) {
+        console.warn(`Evaluation attempt ${attempt + 1} failed:`, evalAttemptErr);
+        if (attempt < 1) {
+          await new Promise(r => setTimeout(r, 800));
+        }
       }
+    }
+    if (!result || !evalSuccess) {
+      console.warn("Evaluation step failed after retries");
+      submittingRef.current = false;
+      setSending(false);
+      setError(
+        "Your answer was saved successfully, but coaching evaluation is temporarily unavailable. You can retry evaluation or move to the next question."
+      );
+      if (session?.id && current?.id) {
+        if (user?.id) {
+          safeStorage.removeItem(
+            `practice_draft_${user.id}_${session.id}_${current.id}`
+          );
+        }
+        safeStorage.removeItem(`practice_draft_${session.id}_${current.id}`);
+      }
+      return;
+    }
+    try {
       const { data: savedEvaluation, error: evalError } = await c.rpc(
         "save_simple_answer_evaluation",
         {
@@ -2294,7 +2323,7 @@ export function InterviewRoom() {
           "This interview began finalizing before the evaluation could be saved."
         );
       }
-      setEvaluations(e => ({ ...e, [current.id]: result }));
+      setEvaluations(e => ({ ...e, [current.id]: result! }));
       setLatestEval(result);
     } catch (evalErr: any) {
       console.warn("Evaluation step failed:", evalErr);

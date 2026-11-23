@@ -879,6 +879,7 @@ export function LiveInterviewRoom() {
       if (phaseRef.current === "LISTENING") {
         stopListening();
       }
+      stopCamera(false);
       expiryRef.current = true;
       setPhase("FINALIZING");
       speechGenerationRef.current += 1;
@@ -1032,19 +1033,30 @@ export function LiveInterviewRoom() {
         ...accepted,
         evaluation_status: "not_started",
       };
-      try {
-        const result = await evaluate.mutateAsync({
-          sessionId: id,
-          turnId: current.id,
-        });
-        evaluated = {
-          ...accepted,
-          evaluation: result,
-          evaluation_status: "completed",
-        };
-        setTurns(old => old.map(t => (t.id === current.id ? evaluated : t)));
-      } catch (evalErr) {
-        console.warn("Live interview evaluation step warning:", evalErr);
+      let evalSuccess = false;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const result = await evaluate.mutateAsync({
+            sessionId: id,
+            turnId: current.id,
+          });
+          evaluated = {
+            ...accepted,
+            evaluation: result,
+            evaluation_status: "completed",
+          };
+          setTurns(old => old.map(t => (t.id === current.id ? evaluated : t)));
+          evalSuccess = true;
+          setError("");
+          break;
+        } catch (evalErr) {
+          console.warn(`Live interview evaluation attempt ${attempt + 1} warning:`, evalErr);
+          if (attempt < 1) {
+            await new Promise(res => setTimeout(res, 800));
+          }
+        }
+      }
+      if (!evalSuccess) {
         setPhase("RECOVERABLE_ERROR");
         setError("Your answer was saved, but its coaching evaluation is temporarily pending. Click Continue to retry evaluation or load the next question.");
         return;
@@ -1150,13 +1162,18 @@ export function LiveInterviewRoom() {
       if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error("Your browser does not support microphone access.");
       }
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+      } catch (constraintErr) {
+        console.warn("Advanced mic constraints rejected, retrying with simple audio:", constraintErr);
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
       streamRef.current = micStream;
       listeningStartedAt.current = Date.now();
     } catch (micErr) {
@@ -1320,10 +1337,10 @@ export function LiveInterviewRoom() {
         // Detect if browser speech recognition stalled/dropped speech:
         // If candidate spoke for >= 6 seconds and audio recording has substantial size (> 2500 bytes),
         // but browser transcript has fewer than 7 words, the browser speech engine dropped sentences!
-        const recognitionStalled = durationMs >= 6000 && audioBlob.size > 2500 && words < 7;
+        const recognitionStalled = durationMs >= 5000 && audioBlob.size > 1500 && words < 7;
         const noLiveText = words === 0;
 
-        if ((recognitionStalled || noLiveText) && audioBlob.size > 800) {
+        if ((recognitionStalled || noLiveText) && audioBlob.size > 200) {
           setCapturedAudio(audioBlob);
           void transcribeCapturedAudio(audioBlob);
           return;
@@ -1337,7 +1354,7 @@ export function LiveInterviewRoom() {
           return;
         }
 
-        if (audioBlob.size > 800) {
+        if (audioBlob.size > 200) {
           setCapturedAudio(audioBlob);
           void transcribeCapturedAudio(audioBlob);
           return;

@@ -210,25 +210,6 @@ async function persistInterviewCompletionClaimed(
             "Practice one targeted question from a priority skill.",
           ],
   };
-  if (answerSet.length) {
-    try {
-      const generatedAnalysis = await input.summarize({
-        course: session.course,
-        role: session.target_role,
-        answers: answerSet.slice(0, 12),
-      });
-      analysis = {
-        ...generatedAnalysis,
-        analysisSource: "ai",
-        analysisModelVersion: generatedAnalysis.modelVersion ?? null,
-        analysisPromptVersion: generatedAnalysis.promptVersion ?? null,
-      };
-    } catch {
-      // Do not save a misleading heuristic report when AI analysis is unavailable.
-      throw new Error("AI report analysis is unavailable. Please retry.");
-    }
-  }
-
   const dimensionValues = new Map<string, number[]>();
   for (const evaluation of scored)
     for (const dimension of evaluation.dimensions || []) {
@@ -248,23 +229,57 @@ async function persistInterviewCompletionClaimed(
       category: name,
     })
   );
-  if (dimensionRecords.length) {
-    const { error } = await client
-      .from("performance_metrics")
-      .upsert(dimensionRecords, {
-        onConflict: "owner_id,session_id,metric_name",
-      });
-    if (error) throw error;
+
+  // Concurrently run Gemini AI report analysis and independent DB queries
+  const [generatedAnalysis, metricsUpsertRes, historyRes, roleRes] = await Promise.all([
+    answerSet.length
+      ? input
+          .summarize({
+            course: session.course,
+            role: session.target_role,
+            answers: answerSet.slice(0, 12),
+          })
+          .catch(() => {
+            // Do not save a misleading heuristic report when AI analysis is unavailable.
+            throw new Error("AI report analysis is unavailable. Please retry.");
+          })
+      : Promise.resolve(null),
+    dimensionRecords.length
+      ? client
+          .from("performance_metrics")
+          .upsert(dimensionRecords, {
+            onConflict: "owner_id,session_id,metric_name",
+          })
+      : Promise.resolve({ error: null }),
+    client
+      .from("interview_sessions")
+      .select("id,course,target_role,overall_score,created_at,difficulty,status")
+      .eq("owner_id", ownerId)
+      .eq("status", "completed")
+      .order("created_at", { ascending: false })
+      .limit(150),
+    client
+      .from("job_roles")
+      .select("id")
+      .eq("name", session.target_role)
+      .eq("active", true)
+      .maybeSingle(),
+  ]);
+
+  if (metricsUpsertRes.error) throw metricsUpsertRes.error;
+  if (historyRes.error) throw historyRes.error;
+  if (roleRes.error) throw roleRes.error;
+
+  if (generatedAnalysis) {
+    analysis = {
+      ...generatedAnalysis,
+      analysisSource: "ai",
+      analysisModelVersion: generatedAnalysis.modelVersion ?? null,
+      analysisPromptVersion: generatedAnalysis.promptVersion ?? null,
+    };
   }
 
-  const { data: history, error: historyError } = await client
-    .from("interview_sessions")
-    .select("id,course,target_role,overall_score,created_at,difficulty,status")
-    .eq("owner_id", ownerId)
-    .eq("status", "completed")
-    .order("created_at", { ascending: false })
-    .limit(150);
-  if (historyError) throw historyError;
+  const history = historyRes.data;
   const matchingHistory = (history || []).filter(
     (row: any) =>
       row.course === session.course && row.target_role === session.target_role
@@ -273,13 +288,32 @@ async function persistInterviewCompletionClaimed(
     session.id,
     ...matchingHistory.map((row: any) => row.id),
   ].slice(0, 151);
-  const { data: historicalMetrics, error: historicalMetricError } = await client
-    .from("performance_metrics")
-    .select("session_id,metric_name,metric_value")
-    .eq("owner_id", ownerId)
-    .in("session_id", sessionIds)
-    .limit(1500);
-  if (historicalMetricError) throw historicalMetricError;
+
+  const role = roleRes.data;
+
+  // Run historical metrics and role requirements queries in parallel
+  const [historicalMetricsRes, roleSkillsRes] = await Promise.all([
+    client
+      .from("performance_metrics")
+      .select("session_id,metric_name,metric_value")
+      .eq("owner_id", ownerId)
+      .in("session_id", sessionIds)
+      .limit(1500),
+    role?.id
+      ? client
+          .from("role_skills")
+          .select("skill_id,required_score,skill:skills(name)")
+          .eq("role_id", role.id)
+          .eq("active", true)
+          .limit(100)
+      : Promise.resolve({ data: [] as any[], error: null }),
+  ]);
+
+  if (historicalMetricsRes.error) throw historicalMetricsRes.error;
+  if (roleSkillsRes.error) throw roleSkillsRes.error;
+
+  const historicalMetrics = historicalMetricsRes.data;
+  const requirements: any[] = (roleSkillsRes.data as any[]) || [];
 
   const metricGroups = new Map<string, number[]>();
   for (const row of historicalMetrics || []) {
@@ -293,25 +327,6 @@ async function persistInterviewCompletionClaimed(
   const currentDimensions = Array.from(metricGroups.entries()).map(
     ([name, values]) => ({ name, score: average(values) ?? 0 })
   );
-
-  const { data: role, error: roleError } = await client
-    .from("job_roles")
-    .select("id")
-    .eq("name", session.target_role)
-    .eq("active", true)
-    .maybeSingle();
-  if (roleError) throw roleError;
-  let requirements: any[] = [];
-  if (role?.id) {
-    const { data, error } = await client
-      .from("role_skills")
-      .select("skill_id,required_score,skill:skills(name)")
-      .eq("role_id", role.id)
-      .eq("active", true)
-      .limit(100);
-    if (error) throw error;
-    requirements = data || [];
-  }
   const gaps = new Map<string, any>();
   for (const dimension of currentDimensions) {
     const key = normalized(dimension.name);

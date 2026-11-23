@@ -507,7 +507,9 @@ export async function finalizeLiveSession(
         })
       );
     }
-    turns = await turnsFor(ctx, id);
+    if (unevaluated.length) {
+      turns = await turnsFor(ctx, id);
+    }
     const scored = turns.filter(
       t =>
         t.transcript &&
@@ -602,7 +604,11 @@ export async function finalizeLiveSession(
           "The report was prepared, but its finalization lease or session status changed. Refresh and retry.",
       });
     }
-    return { session: await sessionFor(ctx, id), turns: await turnsFor(ctx, id) };
+    const [finalSession, finalTurns] = await Promise.all([
+      sessionFor(ctx, id),
+      turnsFor(ctx, id),
+    ]);
+    return { session: finalSession, turns: finalTurns };
   } catch (error) {
     await rest(
       ctx,
