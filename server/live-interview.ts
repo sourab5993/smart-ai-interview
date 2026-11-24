@@ -463,21 +463,34 @@ export async function evaluateLiveTurn(
       code: "PRECONDITION_FAILED",
       message: "Save a recognized answer before evaluation.",
     });
-  const result =
-    t.evaluation_status === "completed" && t.evaluation?.source === "ai"
-      ? t.evaluation
-      : await evaluateAnswer({
-          question: t.question_text,
-          answer: t.transcript,
-          course: "General interview preparation",
-          role: s.target_role,
-          type: t.question_type,
-          skills: Array.isArray(t.competencies)
-            ? t.competencies.map(String).slice(0, 12)
-            : [],
-          language: s.speech_language,
-        });
-  if (result.source !== "ai")
+  let result: Turn["evaluation"];
+  try {
+    result =
+      t.evaluation_status === "completed" && t.evaluation?.source === "ai"
+        ? t.evaluation
+        : await evaluateAnswer({
+            question: t.question_text,
+            answer: t.transcript,
+            course: "General interview preparation",
+            role: s.target_role,
+            type: t.question_type,
+            skills: Array.isArray(t.competencies)
+              ? t.competencies.map(String).slice(0, 12)
+              : [],
+            language: s.speech_language,
+          });
+  } catch (evalErr: any) {
+    console.error(
+      `[evaluateLiveTurn] Evaluation failed for session ${i.sessionId}, turn ${i.turnId}:`,
+      evalErr?.message || evalErr
+    );
+    throw new TRPCError({
+      code: "SERVICE_UNAVAILABLE",
+      message: `Evaluation failed: ${evalErr?.message || "AI service temporarily unavailable."}`,
+      cause: evalErr,
+    });
+  }
+  if (!result || result.source !== "ai")
     throw new TRPCError({
       code: "SERVICE_UNAVAILABLE",
       message: "A verified AI evaluation is temporarily unavailable. Retry later.",

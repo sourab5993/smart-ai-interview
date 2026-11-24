@@ -1194,58 +1194,43 @@ export function LiveInterviewRoom() {
       const accepted = {
         ...current,
         transcript,
-        transcript_status: "accepted",
+        transcript_status: "accepted" as const,
       };
       setTurns(old => old.map(t => (t.id === current.id ? accepted : t)));
-      setPhase("EVALUATING");
-      let evaluated: Turn = {
-        ...accepted,
-        evaluation_status: "not_started",
-      };
-      let evalSuccess = false;
-      for (let attempt = 0; attempt < 2; attempt++) {
-        if (abortCapture.current || controller.signal.aborted) return;
-        try {
-          const result = await evaluate.mutateAsync({
-            sessionId: id,
-            turnId: current.id,
-          });
+
+      // Decouple full coaching evaluation into asynchronous execution
+      // so candidate advances to the next question within 1-2 seconds.
+      void evaluate
+        .mutateAsync({
+          sessionId: id,
+          turnId: current.id,
+        })
+        .then(result => {
           if (abortCapture.current || controller.signal.aborted) return;
-          evaluated = {
+          const evaluated: Turn = {
             ...accepted,
             evaluation: result,
             evaluation_status: "completed",
           };
           setTurns(old => old.map(t => (t.id === current.id ? evaluated : t)));
-          evalSuccess = true;
-          setError("");
-          break;
-        } catch (evalErr) {
-          if (abortCapture.current || controller.signal.aborted) return;
-          console.warn(`Live interview evaluation attempt ${attempt + 1} warning:`, evalErr);
-          if (attempt < 1) {
-            await new Promise(res => setTimeout(res, 800));
-          }
-        }
-      }
-      if (abortCapture.current || controller.signal.aborted) return;
-      if (!evalSuccess) {
-        setPhase("RECOVERABLE_ERROR");
-        setError("Your answer was saved, but its coaching evaluation is temporarily pending. Click Continue to retry evaluation or load the next question.");
-        return;
-      }
+        })
+        .catch(evalErr => {
+          console.warn(`[LiveInterview] Background evaluation for turn ${current.id} notice:`, evalErr);
+        });
+
       if (Date.now() >= Date.parse(session!.deadline_at)) {
         setBusy(false);
         await finalizeSession("deadline");
         return;
       }
+      setError("");
       try {
-        await beginAdaptiveTurn(evaluated);
+        await beginAdaptiveTurn(accepted);
       } catch (turnErr) {
         if (abortCapture.current || controller.signal.aborted) return;
         console.warn("Live interview adaptive turn step warning:", turnErr);
         setPhase("RECOVERABLE_ERROR");
-        setError("Your answer was evaluated, but loading the next question had a network pause. Click Continue interview to load it.");
+        setError("Your answer was saved, but loading the next question had a network pause. Click Continue to load it.");
       }
     } catch {
       if (abortCapture.current || controller.signal.aborted) return;
@@ -1735,21 +1720,27 @@ export function LiveInterviewRoom() {
     if (!current?.transcript) return;
     setError("");
     setBusy(true);
+    setPhase("EVALUATING");
     try {
       let evaluated = current;
       if (current.evaluation_status !== "completed" || !current.evaluation) {
-        setPhase("EVALUATING");
-        const result = await evaluate.mutateAsync({
-          sessionId: id,
-          turnId: current.id,
-        });
-        evaluated = {
-          ...current,
-          evaluation: result,
-          evaluation_status: "completed",
-        };
-        setTurns(old => old.map(t => (t.id === current.id ? evaluated : t)));
+        try {
+          const result = await evaluate.mutateAsync({
+            sessionId: id,
+            turnId: current.id,
+          });
+          evaluated = {
+            ...current,
+            evaluation: result,
+            evaluation_status: "completed",
+          };
+          setTurns(old => old.map(t => (t.id === current.id ? evaluated : t)));
+        } catch (evalErr) {
+          console.warn("[LiveInterview] Continue evaluation background warning:", evalErr);
+          // If evaluation is temporarily unavailable, do not trap the user—proceed to the next question
+        }
       }
+      setError("");
       await beginAdaptiveTurn(evaluated);
     } catch (cause) {
       setPhase("RECOVERABLE_ERROR");
@@ -2379,7 +2370,7 @@ export function LiveInterviewRoom() {
               </div>
             </div>
           )}
-          {current?.transcript && (
+          {current?.transcript && phase !== "RECOVERABLE_ERROR" && (
             <button
               className="button button-secondary live-continue-button"
               onClick={() => void continueSaved()}
@@ -2387,7 +2378,7 @@ export function LiveInterviewRoom() {
             >
               {current.evaluation_status === "completed"
                 ? "Continue interview"
-                : "Continue processing saved answer"}
+                : "Continue to next question"}
             </button>
           )}
           {error && (
@@ -2399,7 +2390,7 @@ export function LiveInterviewRoom() {
                   onClick={() => void continueSaved()}
                   disabled={busy}
                 >
-                  Retry saved answer
+                  Continue to next question
                 </button>
               )}
               {audioRetryAction === "transcribe" && capturedAudio && (
