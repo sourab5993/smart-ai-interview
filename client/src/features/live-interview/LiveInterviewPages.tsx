@@ -468,6 +468,8 @@ export function LiveInterviewRoom() {
   const baseTranscript = useRef("");
   const latestRecognizedText = useRef("");
   const stopping = useRef(false);
+  const isRecordingRef = useRef(false);
+  const committedTextRef = useRef("");
   const streamRef = useRef<MediaStream | null>(null);
   const recorder = useRef<MediaRecorder | null>(null);
   const chunks = useRef<Blob[]>([]);
@@ -1329,7 +1331,7 @@ export function LiveInterviewRoom() {
   }
 
   const startSpeechEngine = useCallback(() => {
-    if (abortCapture.current || stopping.current || phaseRef.current !== "LISTENING") return;
+    if (abortCapture.current || stopping.current || !isRecordingRef.current) return;
     const Speech = browserSpeech();
     if (!Speech) return;
 
@@ -1351,81 +1353,108 @@ export function LiveInterviewRoom() {
       r.continuous = true;
       r.interimResults = true;
 
-      // sessionBase holds whatever text was established prior to this SpeechRecognition session
-      const sessionBase = (baseTranscript.current || "").trim();
-
       r.onresult = (event: any) => {
-        if (abortCapture.current || stopping.current || phaseRef.current !== "LISTENING") return;
-        let finals = "";
+        if (abortCapture.current || stopping.current || !isRecordingRef.current) return;
         let interim = "";
-        for (let n = 0; n < event.results.length; n++) {
-          const item = event.results[n];
-          if (item.isFinal) finals += `${item[0]?.transcript || ""} `;
-          else interim += `${item[0]?.transcript || ""} `;
+        let finalChunk = "";
+
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          const item = event.results[i];
+          const transcript = item[0]?.transcript || "";
+          if (item.isFinal) {
+            finalChunk += `${transcript} `;
+          } else {
+            interim += `${transcript} `;
+          }
         }
-        finals = finals.trim();
+
+        finalChunk = finalChunk.trim();
         interim = interim.trim();
 
-        const resolvedFinals = sessionBase
-          ? (finals ? `${sessionBase} ${finals}` : sessionBase)
-          : finals;
-        finalText.current = resolvedFinals;
+        if (finalChunk) {
+          const base = committedTextRef.current.trim();
+          committedTextRef.current = base ? `${base} ${finalChunk}` : finalChunk;
+        }
 
-        const combined = interim
-          ? (resolvedFinals ? `${resolvedFinals} ${interim}` : interim)
-          : resolvedFinals;
-        latestRecognizedText.current = combined;
+        const currentCommitted = committedTextRef.current.trim();
+        const display = interim
+          ? (currentCommitted ? `${currentCommitted} ${interim}` : interim)
+          : currentCommitted;
 
-        // Synchronize both draft states so the textarea and draft card are always in sync
-        setPartial(combined);
-        setTranscriptDraft(combined);
+        finalText.current = currentCommitted;
+        latestRecognizedText.current = display;
+
+        setPartial(display);
+        setTranscriptDraft(display);
       };
 
       r.onerror = (event: any) => {
         if (abortCapture.current || stopping.current) return;
         const err = event?.error;
-        if (err === "no-speech" || err === "aborted") {
+        if (err === "no-speech") {
+          // Normal silence; browser will fire onend next, which will auto-restart
           return;
         }
-        console.warn("Speech recognition non-fatal error:", err);
-        if (err === "not-allowed" || err === "service-not-allowed") {
-          setError("Microphone or speech permission was denied. You can type your answer in the box below.");
+        if (err === "aborted") {
+          return;
         }
+        if (err === "not-allowed" || err === "service-not-allowed") {
+          setError("Microphone permission was denied. Please allow microphone in your browser URL bar or use Type mode.");
+          stopListening();
+          return;
+        }
+        if (err === "network") {
+          console.warn("SpeechRecognition network warning, parallel audio recording is active");
+          setError("Speech recognition service network warning. Background audio recording is active and will transcribe upon stopping.");
+          return;
+        }
+        console.warn("Speech recognition warning:", err);
       };
 
       r.onend = () => {
-        if (abortCapture.current || stopping.current) return;
-        if (phaseRef.current === "LISTENING") {
-          const currentTotal = (finalText.current || latestRecognizedText.current || transcriptDraft || "").trim();
-          if (currentTotal) {
-            baseTranscript.current = currentTotal;
-          }
-          if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
-          restartTimerRef.current = window.setTimeout(() => {
-            if (!stopping.current && !abortCapture.current && phaseRef.current === "LISTENING") {
-              startSpeechEngine();
+        // If the user hasn't clicked "Stop" yet and the browser auto-stops recognition due to silence,
+        // automatically restart recognition.start() inside a try/catch block.
+        if (abortCapture.current || stopping.current || !isRecordingRef.current) return;
+
+        if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
+        restartTimerRef.current = window.setTimeout(() => {
+          if (!abortCapture.current && !stopping.current && isRecordingRef.current) {
+            try {
+              if (recognition.current) {
+                recognition.current.start();
+              } else {
+                startSpeechEngine();
+              }
+            } catch (startErr) {
+              console.warn("Auto-restart recognition attempt caught:", startErr);
+              try {
+                startSpeechEngine();
+              } catch (recreateErr) {
+                console.warn("Re-create recognition caught:", recreateErr);
+              }
             }
-          }, 100);
-        }
+          }
+        }, 100);
       };
 
       r.start();
     } catch (speechErr) {
       console.warn("Web Speech start failed:", speechErr);
-      if (phaseRef.current === "LISTENING" && !stopping.current && !abortCapture.current) {
+      if (isRecordingRef.current && !stopping.current && !abortCapture.current) {
         if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
         restartTimerRef.current = window.setTimeout(() => {
-          if (!stopping.current && !abortCapture.current && phaseRef.current === "LISTENING") {
+          if (isRecordingRef.current && !stopping.current && !abortCapture.current) {
             startSpeechEngine();
           }
-        }, 250);
+        }, 200);
       }
     }
-  }, [session?.speech_language, transcriptDraft]);
+  }, [session?.speech_language]);
 
   const restartSpeechEngine = useCallback((baseText: string) => {
-    if (abortCapture.current || stopping.current || phaseRef.current !== "LISTENING") return;
+    if (abortCapture.current || stopping.current || !isRecordingRef.current) return;
     cleanupSpeechEngine();
+    committedTextRef.current = baseText;
     baseTranscript.current = baseText;
     finalText.current = baseText;
     latestRecognizedText.current = baseText;
@@ -1436,8 +1465,10 @@ export function LiveInterviewRoom() {
     if (!session || !current || busy || remaining <= 0) return;
     abortCapture.current = false;
     stopping.current = false;
+    isRecordingRef.current = true;
     setError("");
     const existing = (transcriptDraft || partial || latestRecognizedText.current || finalText.current).trim();
+    committedTextRef.current = existing;
     baseTranscript.current = existing;
     finalText.current = existing;
     latestRecognizedText.current = existing;
@@ -1476,6 +1507,7 @@ export function LiveInterviewRoom() {
       listeningStartedAt.current = Date.now();
     } catch (micErr) {
       setBusy(false);
+      isRecordingRef.current = false;
       setPhase("READY");
       setError(
         micErr instanceof Error
@@ -1549,6 +1581,7 @@ export function LiveInterviewRoom() {
   }
 
   function stopListening() {
+    isRecordingRef.current = false;
     const durationMs = listeningStartedAt.current ? Date.now() - listeningStartedAt.current : 0;
     listeningStartedAt.current = 0;
     if (phaseRef.current !== "LISTENING") return;
@@ -1566,6 +1599,7 @@ export function LiveInterviewRoom() {
     cleanupSpeechEngine();
 
     const liveText = (
+      committedTextRef.current.trim() ||
       finalText.current.trim() ||
       latestRecognizedText.current.trim() ||
       transcriptDraft.trim() ||
@@ -1583,13 +1617,12 @@ export function LiveInterviewRoom() {
         const liveTrimmed = liveText.trim();
         const words = liveTrimmed ? liveTrimmed.split(/\s+/).filter(Boolean).length : 0;
 
-        // Detect if browser speech recognition stalled/dropped speech:
-        // If candidate spoke for >= 5 seconds and audio recording has substantial size (> 1500 bytes),
-        // but browser transcript has fewer than 7 words, the browser speech engine dropped sentences!
-        const recognitionStalled = durationMs >= 5000 && audioBlob.size > 1500 && words < 7;
-        const noLiveText = words === 0;
+        // Fallback Audio Transcription:
+        // If the real-time transcript is empty or incomplete, send the audio blob to backend
+        const realtimeIncomplete = words < 2 && audioBlob.size > 500 && durationMs >= 1500;
+        const noRealtimeText = words === 0;
 
-        if ((recognitionStalled || noLiveText) && audioBlob.size > 200) {
+        if ((realtimeIncomplete || noRealtimeText) && audioBlob.size > 200) {
           setCapturedAudio(audioBlob);
           void transcribeCapturedAudio(audioBlob, liveTrimmed);
           return;
@@ -1598,9 +1631,9 @@ export function LiveInterviewRoom() {
         if (liveTrimmed.length >= 1) {
           setTranscriptDraft(liveTrimmed);
           setPartial(liveTrimmed);
+          committedTextRef.current = liveTrimmed;
           finalText.current = liveTrimmed;
           latestRecognizedText.current = liveTrimmed;
-          baseTranscript.current = liveTrimmed;
           if (audioBlob.size > 200) {
             setCapturedAudio(audioBlob);
           }
@@ -1633,7 +1666,7 @@ export function LiveInterviewRoom() {
         if (liveText) {
           setTranscriptDraft(liveText);
           setPartial(liveText);
-          baseTranscript.current = liveText;
+          committedTextRef.current = liveText;
           setBusy(false);
           setPhase("READY");
         }
@@ -1646,7 +1679,7 @@ export function LiveInterviewRoom() {
     if (liveText) {
       setTranscriptDraft(liveText);
       setPartial(liveText);
-      baseTranscript.current = liveText;
+      committedTextRef.current = liveText;
       setBusy(false);
       setPhase("READY");
       return;
@@ -1660,6 +1693,7 @@ export function LiveInterviewRoom() {
 
   function handleReRecord() {
     if (busy || remaining <= 0) return;
+    isRecordingRef.current = false;
     stopping.current = true;
     if (answerTimeout.current) window.clearTimeout(answerTimeout.current);
     answerTimeout.current = null;
@@ -1674,6 +1708,7 @@ export function LiveInterviewRoom() {
 
     setTranscriptDraft("");
     setPartial("");
+    committedTextRef.current = "";
     finalText.current = "";
     latestRecognizedText.current = "";
     baseTranscript.current = "";
@@ -2143,11 +2178,12 @@ export function LiveInterviewRoom() {
                   style={{
                     display: "flex",
                     alignItems: "center",
+                    justifyContent: "space-between",
                     gap: "10px",
                     padding: "8px 12px",
                     borderRadius: "6px",
-                    background: "rgba(34, 197, 94, 0.08)",
-                    border: "1px solid rgba(34, 197, 94, 0.25)",
+                    background: "rgba(239, 68, 68, 0.08)",
+                    border: "1px solid rgba(239, 68, 68, 0.3)",
                     marginBottom: "10px",
                   }}
                 >
@@ -2155,20 +2191,28 @@ export function LiveInterviewRoom() {
                     style={{
                       display: "inline-flex",
                       alignItems: "center",
-                      gap: "6px",
-                      color: "#22c55e",
-                      fontWeight: 600,
-                      fontSize: "0.82rem",
+                      gap: "8px",
+                      color: "#f87171",
+                      fontWeight: 700,
+                      fontSize: "0.84rem",
                     }}
                   >
-                    <span className="live-camera-indicator">
-                      <i className="is-active" />
-                    </span>
+                    <span
+                      style={{
+                        width: "10px",
+                        height: "10px",
+                        borderRadius: "50%",
+                        background: "#ef4444",
+                        display: "inline-block",
+                        boxShadow: "0 0 8px #ef4444",
+                      }}
+                    />
                     Listening to microphone:
                   </span>
                   <div
                     style={{
                       flex: 1,
+                      maxWidth: "200px",
                       height: "8px",
                       background: "rgba(255,255,255,0.1)",
                       borderRadius: "4px",
@@ -2216,6 +2260,7 @@ export function LiveInterviewRoom() {
                   setError("");
                   setTranscriptDraft(newText);
                   setPartial(newText);
+                  committedTextRef.current = newText;
                   finalText.current = newText;
                   latestRecognizedText.current = newText;
                   baseTranscript.current = newText;
@@ -2237,7 +2282,7 @@ export function LiveInterviewRoom() {
                 placeholder={
                   answerMode === "type"
                     ? "Type or paste your answer here in detail..."
-                    : "Click 'Start speaking' below or type your answer here..."
+                    : "Click 'Start recording' below or type your answer here..."
                 }
                 disabled={
                   busy ||
@@ -2275,7 +2320,21 @@ export function LiveInterviewRoom() {
                   )}
                   {answerMode === "speak" && phase !== "LISTENING" && (
                     <>
-                      {(transcriptDraft.trim() || partial.trim()) ? (
+                      <button
+                        type="button"
+                        className="button button-primary"
+                        onClick={() => void startListening()}
+                        disabled={
+                          busy ||
+                          questionAudioPending ||
+                          phase === "ASKING" ||
+                          !current ||
+                          remaining <= 0
+                        }
+                      >
+                        <Mic size={14} /> {(transcriptDraft.trim() || partial.trim()) ? "Resume recording" : "Start recording"}
+                      </button>
+                      {(transcriptDraft.trim() || partial.trim()) && (
                         <button
                           type="button"
                           className="button button-secondary"
@@ -2288,22 +2347,7 @@ export function LiveInterviewRoom() {
                             remaining <= 0
                           }
                         >
-                          <RotateCcw size={14} /> Re-record / Speak again
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          className="button button-secondary"
-                          onClick={() => void startListening()}
-                          disabled={
-                            busy ||
-                            questionAudioPending ||
-                            phase === "ASKING" ||
-                            !current ||
-                            remaining <= 0
-                          }
-                        >
-                          <Mic size={14} /> Start speaking
+                          <RotateCcw size={14} /> Re-record
                         </button>
                       )}
                     </>
@@ -2409,72 +2453,6 @@ export function LiveInterviewRoom() {
         <div className="live-room-controls">
           {answerMode === "speak" ? (
             <>
-              {phase === "LISTENING" ? (
-                <div style={{ display: "inline-flex", gap: "8px" }}>
-                  <button className="button button-danger" onClick={stopListening}>
-                    <Square size={15} /> Stop recording
-                  </button>
-                  {(transcriptDraft.trim() || partial.trim()) && (
-                    <button
-                      className="button button-primary"
-                      onClick={() =>
-                        void acceptTranscript(transcriptDraft || partial)
-                      }
-                      disabled={busy}
-                    >
-                      <Send size={15} /> Submit answer
-                    </button>
-                  )}
-                </div>
-              ) : (transcriptDraft.trim() || partial.trim()) ? (
-                <div style={{ display: "inline-flex", gap: "8px" }}>
-                  <button
-                    className="button button-secondary"
-                    onClick={() => void handleReRecord()}
-                    disabled={
-                      busy ||
-                      phase === "PROCESSING_ANSWER" ||
-                      phase === "EVALUATING" ||
-                      !current ||
-                      remaining <= 0 ||
-                      Boolean(current?.transcript)
-                    }
-                  >
-                    <RotateCcw size={15} /> Re-record
-                  </button>
-                  <button
-                    className="button button-primary"
-                    onClick={() =>
-                      void acceptTranscript(transcriptDraft || partial)
-                    }
-                    disabled={
-                      busy ||
-                      phase === "PROCESSING_ANSWER" ||
-                      phase === "EVALUATING" ||
-                      !current ||
-                      remaining <= 0 ||
-                      Boolean(current?.transcript)
-                    }
-                  >
-                    <Send size={15} /> Submit answer
-                  </button>
-                </div>
-              ) : (
-                <button
-                  className="button button-primary live-start-answer"
-                  onClick={() => void startListening()}
-                  disabled={
-                    busy ||
-                    questionAudioPending ||
-                    phase === "ASKING" ||
-                    !current ||
-                    remaining <= 0 ||
-                    Boolean(current?.transcript)
-                  }
-                >
-                  <Mic size={17} /> Start speaking
-                </button>
-              )}
               <span
                 className="live-microphone-status"
                 role="status"
@@ -2488,7 +2466,7 @@ export function LiveInterviewRoom() {
                       ? "Question audio is starting"
                       : phase === "PROCESSING_ANSWER" || phase === "EVALUATING"
                         ? "Processing your answer..."
-                        : "Voice mode active · click Start speaking to answer"}
+                        : "Voice mode active · click Start recording to answer"}
               </span>
               <button
                 type="button"
@@ -2511,23 +2489,6 @@ export function LiveInterviewRoom() {
             </>
           ) : (
             <>
-              <button
-                className="button button-primary"
-                onClick={() =>
-                  void acceptTranscript(transcriptDraft || partial)
-                }
-                disabled={
-                  busy ||
-                  !(transcriptDraft.trim() || partial.trim()) ||
-                  phase === "PROCESSING_ANSWER" ||
-                  phase === "EVALUATING" ||
-                  !current ||
-                  remaining <= 0 ||
-                  Boolean(current?.transcript)
-                }
-              >
-                <Send size={15} /> Submit typed answer
-              </button>
               <span
                 className="live-microphone-status"
                 role="status"
