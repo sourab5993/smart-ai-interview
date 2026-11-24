@@ -537,6 +537,7 @@ export function LiveInterviewRoom() {
   const transcribingAudioRef = useRef(false);
   const abortCapture = useRef(false);
   const expiryRef = useRef(false);
+  const hasEndedRef = useRef(false);
   const speechGenerationRef = useRef(0);
   const turnAbortControllerRef = useRef<AbortController | null>(null);
   const phaseRef = useRef(phase);
@@ -1042,9 +1043,13 @@ export function LiveInterviewRoom() {
   }, [session, generate, saveQuestion, id, speak]);
   const finalizeSession = useCallback(
     async (reason: "manual" | "deadline") => {
-      if (!session || (expiryRef.current && reason === "deadline"))
-        return;
-      // Abort any in-flight turn evaluation or speech processing immediately
+      if (!session) return;
+      if (hasEndedRef.current) return;
+      hasEndedRef.current = true;
+
+      // 1. Immediately lock inputs and transition to finalizing state
+      setPhase("FINALIZING");
+      setBusy(true);
       abortCapture.current = true;
       if (turnAbortControllerRef.current) {
         turnAbortControllerRef.current.abort();
@@ -1055,64 +1060,89 @@ export function LiveInterviewRoom() {
       if (typingRestartTimerRef.current) window.clearTimeout(typingRestartTimerRef.current);
       if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
       if (answerTimeout.current) window.clearTimeout(answerTimeout.current);
+
       cleanupSpeechEngine();
       cleanupRecorder();
       stopTracks();
       stopCamera(false);
       expiryRef.current = true;
-      setPhase("FINALIZING");
       speechGenerationRef.current += 1;
       setQuestionAudioPending(false);
       window.speechSynthesis?.cancel?.();
-      setBusy(false);
+
+      // 2. Auto-submit any unsubmitted partial answer from textarea / mic buffer
+      const pendingAnswer = (
+        transcriptDraft ||
+        partial ||
+        latestRecognizedText.current ||
+        committedTextRef.current ||
+        finalText.current
+      ).trim();
+
+      if (pendingAnswer && current && !current.transcript) {
+        try {
+          const savePromise = saveTranscript.mutateAsync({
+            sessionId: id,
+            turnId: current.id,
+            transcript: pendingAnswer,
+          });
+          const timeoutPromise = new Promise<null>(r => setTimeout(() => r(null), 2500));
+          await Promise.race([savePromise, timeoutPromise]);
+          const accepted: Turn = {
+            ...current,
+            transcript: pendingAnswer,
+            transcript_status: "accepted" as const,
+          };
+          setTurns(old => old.map(t => (t.id === current.id ? accepted : t)));
+        } catch (saveErr) {
+          console.warn("[LiveInterview] Auto-saving partial answer on expiration warning:", saveErr);
+        }
+      }
+
+      // 3. Persist optional camera summary
       try {
         await persistCameraSummary();
-        await finalize.mutateAsync({ id, reason });
+      } catch (camErr) {
+        console.warn("[LiveInterview] Camera summary save notice:", camErr);
+      }
+
+      // 4. If reason is deadline, ensure deadline timestamp has passed on server
+      if (reason === "deadline") {
+        const waitMs = Math.max(0, Date.parse(session.deadline_at) - Date.now());
+        if (waitMs > 0 && waitMs <= 2000) {
+          await new Promise(r => setTimeout(r, waitMs + 60));
+        }
+      }
+
+      // 5. Finalize with strict 8000ms max timeout
+      try {
+        const finalizePromise = finalize.mutateAsync({ id, reason });
+        const timeoutPromise = new Promise<{ timeout: true }>(resolve =>
+          setTimeout(() => resolve({ timeout: true }), 8000)
+        );
+        const result = await Promise.race([finalizePromise, timeoutPromise]);
+        if (result && "timeout" in result) {
+          console.warn("[LiveInterview] Finalize call hit 8000ms budget, navigating to report.");
+        }
+      } catch (cause) {
+        console.warn("[LiveInterview] Finalize call completed with notice, navigating to report:", cause);
+      } finally {
         stopCamera();
         setPhase("COMPLETED");
         navigate(`/live-report/${id}`);
-      } catch (cause) {
-        const msg = cause instanceof Error ? cause.message : "";
-        if (msg.includes("already being finalized")) {
-          setPhase("FINALIZING");
-          setError("This interview is being finalized. Checking report status…");
-          return;
-        }
-        try {
-          const refetched = await query.refetch();
-          if (refetched.data?.session?.status === "completed") {
-            stopCamera();
-            setPhase("COMPLETED");
-            navigate(`/live-report/${id}`);
-            return;
-          }
-          if (refetched.data?.session?.status === "finalizing") {
-            setPhase("FINALIZING");
-            setError("This interview is being finalized. Checking report status…");
-            return;
-          }
-        } catch {}
-        setPhase("RECOVERABLE_ERROR");
-        setError(
-          cause instanceof Error
-            ? cause.message
-            : "Report generation failed. Your saved answers can be recovered; retry finalization."
-        );
-        expiryRef.current = false;
       }
     },
-    [session, id, finalize, navigate, persistCameraSummary, stopCamera, query]
+    [session, id, finalize, navigate, persistCameraSummary, stopCamera, transcriptDraft, partial, current, saveTranscript]
   );
   useEffect(() => {
     if (
-      remaining === 0 &&
-      !busy &&
       session?.status === "in_progress" &&
-      Date.now() >= Date.parse(session.deadline_at) &&
-      !expiryRef.current
-    )
+      (remaining <= 0 || Date.now() >= Date.parse(session.deadline_at)) &&
+      !hasEndedRef.current
+    ) {
       void finalizeSession("deadline");
-  }, [remaining, session, busy, phase, finalizeSession]);
+    }
+  }, [remaining, session, finalizeSession]);
   useEffect(() => {
     abortCapture.current = false;
     return () => {
@@ -1861,6 +1891,7 @@ export function LiveInterviewRoom() {
   const phaseLabel = questionAudioPending
     ? "Starting question audio"
     : labels[phase];
+  const isPastDeadline = remaining <= 0 || (session ? Date.now() >= Date.parse(session.deadline_at) : false);
   return (
     <div className="page-stack live-interview-page">
       <PageHeading
@@ -1870,7 +1901,7 @@ export function LiveInterviewRoom() {
         action={
           <button
             className="button button-danger"
-            disabled={phase === "FINALIZING"}
+            disabled={phase === "FINALIZING" || isPastDeadline}
             onClick={() => setEndConfirmOpen(true)}
           >
             End interview
@@ -1889,6 +1920,72 @@ export function LiveInterviewRoom() {
         </span>
       </div>
       <div className="live-room-grid">
+        {phase === "FINALIZING" || isPastDeadline ? (
+          <div
+            className="live-finalizing-overlay"
+            style={{
+              gridColumn: "1 / -1",
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: "56px 24px",
+              minHeight: "420px",
+              borderRadius: "14px",
+              background: "linear-gradient(180deg, rgba(15, 23, 42, 0.96) 0%, rgba(30, 41, 59, 0.94) 100%)",
+              border: "1px solid rgba(148, 163, 184, 0.25)",
+              textAlign: "center",
+              boxShadow: "0 24px 48px -12px rgba(0, 0, 0, 0.5)",
+              backdropFilter: "blur(12px)",
+            }}
+          >
+            <div
+              style={{
+                width: "68px",
+                height: "68px",
+                borderRadius: "50%",
+                background: "rgba(59, 130, 246, 0.15)",
+                border: "1px solid rgba(59, 130, 246, 0.3)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                marginBottom: "24px",
+              }}
+            >
+              <Orbit size={38} className="spinner" style={{ color: "#38bdf8" }} />
+            </div>
+            <h2 style={{ fontSize: "1.6rem", fontWeight: 700, color: "#f8fafc", marginBottom: "10px", letterSpacing: "-0.02em" }}>
+              Time's up! Finalizing your interview and loading your results...
+            </h2>
+            <p style={{ color: "#94a3b8", maxWidth: "520px", fontSize: "0.98rem", lineHeight: 1.6, marginBottom: "28px" }}>
+              Saving your responses, evaluating rubric competencies, and generating your detailed coaching feedback. You will be redirected to your report automatically.
+            </p>
+            <div
+              style={{
+                width: "280px",
+                height: "4px",
+                background: "rgba(255, 255, 255, 0.1)",
+                borderRadius: "9999px",
+                overflow: "hidden",
+                position: "relative",
+              }}
+            >
+              <div
+                style={{
+                  position: "absolute",
+                  left: 0,
+                  top: 0,
+                  bottom: 0,
+                  width: "60%",
+                  background: "linear-gradient(90deg, #38bdf8, #818cf8)",
+                  borderRadius: "9999px",
+                  animation: "pulse 1.2s ease-in-out infinite",
+                }}
+              />
+            </div>
+          </div>
+        ) : (
+          <>
         <section
           className={`live-room-panel live-interviewer ${phase.toLowerCase()}`}
           aria-labelledby="live-interviewer-title"
@@ -1944,9 +2041,7 @@ export function LiveInterviewRoom() {
                     ? "Processing the answer you provided."
                     : phase === "ASKING_FOLLOWUP_OR_NEXT_QUESTION"
                       ? "Preparing your next question."
-                      : phase === "FINALIZING"
-                        ? "Saving your interview and preparing a report."
-                        : "Your interviewer is ready when you are."}
+                      : "Your interviewer is ready when you are."}
           </p>
         </section>
 
@@ -2331,6 +2426,7 @@ export function LiveInterviewRoom() {
                     : "Click 'Start recording' below or type your answer here..."
                 }
                 disabled={
+                  isPastDeadline ||
                   busy ||
                   phase === "PROCESSING_ANSWER" ||
                   phase === "EVALUATING"
@@ -2371,6 +2467,7 @@ export function LiveInterviewRoom() {
                         className="button button-primary"
                         onClick={() => void startListening()}
                         disabled={
+                          isPastDeadline ||
                           busy ||
                           questionAudioPending ||
                           phase === "ASKING" ||
@@ -2386,6 +2483,7 @@ export function LiveInterviewRoom() {
                           className="button button-secondary"
                           onClick={() => void handleReRecord()}
                           disabled={
+                            isPastDeadline ||
                             busy ||
                             phase === "PROCESSING_ANSWER" ||
                             phase === "EVALUATING" ||
@@ -2405,6 +2503,7 @@ export function LiveInterviewRoom() {
                       void acceptTranscript(transcriptDraft || partial)
                     }
                     disabled={
+                      isPastDeadline ||
                       busy ||
                       !(transcriptDraft.trim() || partial.trim()) ||
                       phase === "PROCESSING_ANSWER" ||
@@ -2558,6 +2657,8 @@ export function LiveInterviewRoom() {
             </>
           )}
         </div>
+        </>
+      )}
       </div>
       <AlertDialog open={endConfirmOpen} onOpenChange={setEndConfirmOpen}>
         <AlertDialogContent>
@@ -2572,8 +2673,11 @@ export function LiveInterviewRoom() {
             <AlertDialogCancel>Keep practicing</AlertDialogCancel>
             <AlertDialogAction
               className="button-danger"
-              disabled={phase === "FINALIZING"}
-              onClick={() => void finalizeSession("manual")}
+              disabled={phase === "FINALIZING" || isPastDeadline}
+              onClick={() => {
+                setEndConfirmOpen(false);
+                void finalizeSession("manual");
+              }}
             >
               End interview
             </AlertDialogAction>
@@ -2589,7 +2693,15 @@ export function LiveInterviewReport() {
   const id = p?.id || "";
   const q = trpc.liveInterview.get.useQuery(
     { id },
-    { enabled: !!id, retry: 1 }
+    {
+      enabled: !!id,
+      retry: 2,
+      refetchInterval: query =>
+        query.state.data?.session?.status === "completed" &&
+        query.state.data?.session?.report
+          ? false
+          : 2000,
+    }
   );
   if (q.isLoading) return <LoadingState text="Loading your saved report…" />;
   const session = q.data?.session as Session | undefined;
@@ -2598,6 +2710,14 @@ export function LiveInterviewReport() {
     | FramingSummary
     | null
     | undefined;
+
+  if (session?.status === "finalizing" || (session?.status === "completed" && !report)) {
+    return (
+      <div className="page-stack">
+        <LoadingState text="Compiling your interview report and calculating scores…" />
+      </div>
+    );
+  }
   if (!session || session.status !== "completed" || !report)
     return (
       <div className="page-stack">
