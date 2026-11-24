@@ -111,16 +111,16 @@ export async function transcribeAudioBuffer(options: {
   // 1. Google Gemini Audio Transcription
   if (geminiApiKey) {
     await enforceGeminiRateLimit("audio_transcription");
-    const primaryModel = process.env.GEMINI_AUDIO_MODEL?.trim() || "gemini-2.5-flash";
+    const primaryModel =
+      process.env.GEMINI_AUDIO_MODEL?.trim() && process.env.GEMINI_AUDIO_MODEL.trim() !== "gemini-3.5-flash-lite"
+        ? process.env.GEMINI_AUDIO_MODEL.trim()
+        : "gemini-2.5-flash";
     const candidateModels = Array.from(
       new Set(
         [
           primaryModel,
-          process.env.GEMINI_MODEL?.trim(),
-          "gemini-3.5-flash-lite",
-          "gemini-3.8-flash",
-          "gemini-3.5-flash",
-          "gemini-3-flash-preview",
+          "gemini-2.5-flash",
+          "gemini-2.5-flash-lite",
         ].filter(Boolean) as string[]
       )
     );

@@ -51,9 +51,13 @@ export type InvokeParams = {
   outputSchema?: JsonSchema;
   output_schema?: JsonSchema;
   model?: string;
+  temperature?: number;
+  timeoutMs?: number;
   reasoning_effort?: "low" | "medium" | "high";
   thinking?: Record<string, unknown>;
   reasoning?: Record<string, unknown>;
+  thinkingConfig?: Record<string, unknown>;
+  generationConfig?: Record<string, unknown>;
 };
 export type ToolCall = {
   id: string;
@@ -139,19 +143,40 @@ function backoff(attempt: number, retryAfter?: number): number {
 
 async function request(
   url: string,
-  init: RequestInit
+  init: RequestInit,
+  options?: { timeoutMs?: number; maxRetries?: number }
 ): Promise<{ ok: boolean; status: number; statusText: string; body: string }> {
-  for (let attempt = 0; attempt <= RETRY_MAX_RETRIES; attempt++) {
+  const timeoutMs = options?.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  const maxRetries = options?.maxRetries ?? RETRY_MAX_RETRIES;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const timeout = setTimeout(() => {
+      controller.abort(new DOMException("The operation timed out", "TimeoutError"));
+    }, timeoutMs);
+
+    let signal: AbortSignal = controller.signal;
+    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+      try {
+        const timeoutSignal = AbortSignal.timeout(timeoutMs);
+        if (typeof AbortSignal.any === "function") {
+          signal = AbortSignal.any(
+            [controller.signal, timeoutSignal, ...(init.signal ? [init.signal] : [])].filter(Boolean)
+          );
+        }
+      } catch {
+        // Fallback to controller.signal if AbortSignal.timeout or any is unavailable
+      }
+    }
+
     try {
-      const response = await fetch(url, { ...init, signal: controller.signal });
+      const response = await fetch(url, { ...init, signal });
       const retryable =
         response.status === 408 ||
         response.status === 425 ||
         response.status === 429 ||
         response.status >= 500;
-      if (retryable && attempt < RETRY_MAX_RETRIES) {
+      if (retryable && attempt < maxRetries) {
         const delay = backoff(
           attempt,
           retryAfterMs(response.headers.get("retry-after"))
@@ -171,13 +196,14 @@ async function request(
     } catch (error) {
       clearTimeout(timeout);
       if (
+        signal.aborted ||
         controller.signal.aborted ||
-        (error instanceof Error && error.name === "AbortError")
+        (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError"))
       ) {
         throw new Error("LLM request timed out");
       }
-      if (attempt === RETRY_MAX_RETRIES) throw error;
-      console.warn(`Gemini request retry ${attempt + 1}/${RETRY_MAX_RETRIES}`);
+      if (attempt === maxRetries) throw error;
+      console.warn(`Gemini request retry ${attempt + 1}/${maxRetries}`);
       await sleep(backoff(attempt));
     } finally {
       clearTimeout(timeout);
@@ -363,7 +389,6 @@ function parseResponse<T>(body: string): T {
 
 export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
   const { system, contents } = geminiContents(params.messages);
-  const model = params.model ?? process.env.GEMINI_MODEL?.trim() ?? "gemini-3-flash-preview";
   const generationConfig: Record<string, unknown> = {};
   const maxOutputTokens = params.max_tokens ?? params.maxTokens;
   if (typeof maxOutputTokens === "number") {
@@ -375,10 +400,18 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     generationConfig.responseMimeType = "application/json";
     if (responseSchema) generationConfig.responseSchema = responseSchema;
   }
-  if (params.reasoning_effort) {
+  if (typeof params.temperature === "number") {
+    generationConfig.temperature = params.temperature;
+  }
+  if (params.thinkingConfig) {
+    generationConfig.thinkingConfig = params.thinkingConfig;
+  } else if (params.reasoning_effort) {
     generationConfig.thinkingConfig = {
       thinkingLevel: params.reasoning_effort.toUpperCase(),
     };
+  }
+  if (params.generationConfig) {
+    Object.assign(generationConfig, params.generationConfig);
   }
   const tools =
     params.tools?.length
@@ -402,19 +435,25 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     ...(tools ? { tools } : {}),
     ...(choice ? { toolConfig: { functionCallingConfig: choice } } : {}),
   };
+  const configuredModel = process.env.GEMINI_MODEL?.trim();
+  const primaryModel =
+    params.model && params.model !== "gemini-3.5-flash-lite"
+      ? params.model
+      : configuredModel && configuredModel !== "gemini-3.5-flash-lite"
+        ? configuredModel
+        : "gemini-2.5-flash";
+
   const candidateModels = Array.from(
     new Set(
       [
-        params.model,
-        process.env.GEMINI_MODEL?.trim(),
-        "gemini-3.5-flash-lite",
-        "gemini-3.5-flash",
-        "gemini-3-flash-preview",
-        "gemini-3.8-flash",
+        primaryModel,
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
       ].filter(Boolean) as string[]
     )
   );
 
+  const attemptTimeoutMs = params.timeoutMs ?? 3500;
   let lastResponse: { status: number; body: string } | null = null;
   let lastError: unknown = null;
 
@@ -430,7 +469,8 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
             "x-goog-api-key": apiKey(),
           },
           body: JSON.stringify(payload),
-        }
+        },
+        { timeoutMs: attemptTimeoutMs, maxRetries: 0 }
       );
       if (response.ok) {
         return mapResponse(parseResponse<GeminiResponse>(response.body));
@@ -445,8 +485,8 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
       console.error(
         `[Gemini LLM] Model "${currentModel}" failed with status ${response.status}. Trying candidate model...`
       );
-      if (i < candidateModels.length - 1 && (response.status === 503 || response.status === 429)) {
-        await new Promise(r => setTimeout(r, 400));
+      if (i < candidateModels.length - 1) {
+        continue;
       }
     } catch (err) {
       lastError = err;
@@ -455,6 +495,9 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
       }
       if (err instanceof Error && err.message.includes("timed out")) {
         console.error(`[Gemini LLM] Model "${currentModel}" timed out.`);
+        if (i < candidateModels.length - 1) {
+          continue;
+        }
         throw err;
       }
       if (i < candidateModels.length - 1) {
