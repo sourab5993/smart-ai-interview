@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { invokeLLM, listLLMModels } from "./_core/llm";
+import { clearModelCooldowns, invokeLLM, listLLMModels } from "./_core/llm";
 
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
+  clearModelCooldowns();
 });
 
 const response = (body: unknown, status = 200) =>

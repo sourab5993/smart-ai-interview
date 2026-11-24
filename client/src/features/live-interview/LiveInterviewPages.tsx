@@ -421,6 +421,43 @@ export function LiveInterviewSetup() {
   );
 }
 
+function getClientAdaptiveFallbackQuestion(role: string, index: number): string {
+  const r = (role || "").toLowerCase();
+  if (/data analytic|bi analyst|business intelligence|data science|sql|tableau|power bi|metrics/i.test(r)) {
+    const list = [
+      "How would you approach investigating an unexpected 20% drop in a core conversion metric?",
+      "Can you walk me through when you would use window functions like RANK() or ROW_NUMBER() in SQL versus a standard GROUP BY?",
+      "How do you ensure data quality and handle missing or corrupted records in your reporting pipelines?",
+      "How would you explain the trade-offs of an A/B test result to a non-technical stakeholder who wants to launch immediately?",
+      "Can you describe how you model facts and dimensions when designing a reporting dashboard?",
+    ];
+    return list[index % list.length];
+  }
+  if (/software|engineer|developer|frontend|backend|full stack/i.test(r)) {
+    const list = [
+      "How do you diagnose and resolve performance bottlenecks or latency spikes in a production service?",
+      "Can you explain how you design resilient APIs with proper error handling and rate limiting?",
+      "Walk through how you decide when to refactor existing code versus building a new abstraction.",
+      "How do you ensure data consistency across multiple services or asynchronous operations?",
+    ];
+    return list[index % list.length];
+  }
+  const defaultList = [
+    `Can you walk me through a complex challenge you encountered in your work as a ${role || "professional"} and how you solved it?`,
+    "How do you prioritize competing deadlines and balance speed with quality in high-pressure situations?",
+    "Can you provide an example of how you navigated trade-offs and feedback from peers or stakeholders?",
+  ];
+  return defaultList[index % defaultList.length];
+}
+
+function getClientOpeningFallbackQuestion(role: string): string {
+  const r = (role || "").toLowerCase();
+  if (/data analytic|bi analyst|business intelligence|data science|sql|tableau|power bi|metrics/i.test(r)) {
+    return "To start, could you briefly introduce yourself and share an overview of your experience working with data analytics and SQL?";
+  }
+  return `To get started, please introduce yourself and tell me about your background and key experience as a ${role || "candidate"}.`;
+}
+
 export function LiveInterviewRoom() {
   const params = useParams<{ id: string }>();
   const id = params?.id || "";
@@ -892,25 +929,18 @@ export function LiveInterviewRoom() {
         return;
       }
       setPhase("ASKING_FOLLOWUP_OR_NEXT_QUESTION");
+      const conciseQuestion = (prior.question_text || "").slice(0, 160);
+      const conciseAnswer = (prior.transcript || "").slice(0, 240);
       const context = JSON.stringify({
-        previousQuestion: prior.question_text,
-        recognizedAnswer: prior.transcript,
-        answerEvaluation: prior.evaluation
-          ? {
-              score: prior.evaluation.overall_score,
-              strengths: prior.evaluation.strengths,
-              weaknesses: prior.evaluation.weaknesses,
-              missingPoints: prior.evaluation.missing_points,
-            }
-          : null,
-        instruction:
-          "Ask one relevant follow-up grounded in the candidate's answer if it is incomplete or raises an important point. Otherwise continue with a distinct role-relevant competency. Never assume evidence not in the transcript.",
-      }).slice(0, 3000);
+        q: conciseQuestion,
+        a: conciseAnswer,
+        missing: prior.evaluation?.missing_points?.[0] || undefined,
+      });
       let nextQuestionText = "";
-      let nextDifficulty = prior.evaluation?.overall_score >= 80 ? "Hard" : "Medium";
+      let nextDifficulty = prior.evaluation?.overall_score && prior.evaluation.overall_score >= 80 ? "Hard" : "Medium";
       let nextTopic = session.target_role;
       try {
-        const next = await generate.mutateAsync({
+        const generatePromise = generate.mutateAsync({
           course: "General interview preparation",
           role: session.target_role,
           type: "Adaptive live interview follow-up",
@@ -918,12 +948,14 @@ export function LiveInterviewRoom() {
           skills: ((prior.evaluation?.missing_points as string[] | undefined) || [])
             .map((point: string) => point.trim().slice(0, 100))
             .filter(Boolean)
-            .slice(0, 8),
+            .slice(0, 3),
           count: 1,
           language: questionLanguage(session.speech_language),
           context,
         });
-        const q = next.questions?.[0];
+        const timeoutPromise = new Promise<null>(resolve => setTimeout(() => resolve(null), 8000));
+        const next = await Promise.race([generatePromise, timeoutPromise]);
+        const q = next?.questions?.[0];
         if (q?.question?.trim()) {
           nextQuestionText = q.question.trim();
           if (q.difficulty) nextDifficulty = q.difficulty;
@@ -933,7 +965,7 @@ export function LiveInterviewRoom() {
         console.warn("Live interview adaptive question generation fallback:", genError);
       }
       if (!nextQuestionText) {
-        nextQuestionText = `Can you provide a specific example of how you navigate trade-offs and edge cases in your work as a ${session.target_role}?`;
+        nextQuestionText = getClientAdaptiveFallbackQuestion(session.target_role, prior.turn_index + 1);
       }
       const saved = await saveQuestion.mutateAsync({
         sessionId: id,
@@ -956,8 +988,11 @@ export function LiveInterviewRoom() {
     setBusy(true);
     setPhase("ASKING_FOLLOWUP_OR_NEXT_QUESTION");
     setError("");
+    let openingQuestionText = "";
+    let openingDifficulty = "Medium";
+    let openingCompetency = session.target_role;
     try {
-      const result = await generate.mutateAsync({
+      const openingPromise = generate.mutateAsync({
         course: "General interview preparation",
         role: session.target_role,
         type: "Live Interview opening question",
@@ -968,16 +1003,28 @@ export function LiveInterviewRoom() {
         context:
           "This is the opening turn. Ask a concise, natural question that lets the candidate introduce role-relevant experience without assuming prior background.",
       });
-      const q = result.questions?.[0];
-      if (!q?.question?.trim())
-        throw new Error("No valid opening question was returned.");
+      const timeoutPromise = new Promise<null>(resolve => setTimeout(() => resolve(null), 8000));
+      const result = await Promise.race([openingPromise, timeoutPromise]);
+      const q = result?.questions?.[0];
+      if (q?.question?.trim()) {
+        openingQuestionText = q.question.trim();
+        if (q.difficulty) openingDifficulty = q.difficulty;
+        if (q.topic) openingCompetency = q.topic;
+      }
+    } catch (cause) {
+      console.warn("Live interview opening question generation fallback:", cause);
+    }
+    if (!openingQuestionText) {
+      openingQuestionText = getClientOpeningFallbackQuestion(session.target_role);
+    }
+    try {
       const saved = await saveQuestion.mutateAsync({
         sessionId: id,
         turnIndex: 0,
-        question: q.question,
+        question: openingQuestionText,
         type: "opening",
-        difficulty: q.difficulty || "Medium",
-        competencies: [q.topic || session.target_role],
+        difficulty: openingDifficulty,
+        competencies: [openingCompetency],
         idempotencyKey: `${id}:turn:0`,
       });
       setTurns([saved as Turn]);

@@ -116,6 +116,12 @@ const RETRY_BASE_DELAY_MS = 500;
 const RETRY_MAX_DELAY_MS = 30_000;
 const REQUEST_TIMEOUT_MS = 90_000;
 
+const modelCooldowns = new Map<string, number>();
+
+export function clearModelCooldowns(): void {
+  modelCooldowns.clear();
+}
+
 const apiKey = () => {
   const key = process.env.GEMINI_API_KEY?.trim();
   if (!key) throw new Error("GEMINI_API_KEY is not configured");
@@ -437,22 +443,31 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
   };
   const configuredModel = process.env.GEMINI_MODEL?.trim();
   const primaryModel =
-    params.model || configuredModel || "gemini-flash-lite-latest";
+    params.model || configuredModel || "gemini-2.5-flash";
 
-  const candidateModels = Array.from(
+  const allCandidateModels = Array.from(
     new Set(
       [
         primaryModel,
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
         "gemini-flash-lite-latest",
         "gemini-3.5-flash-lite",
         "gemini-3-flash-preview",
-        "gemini-3.8-flash",
-        "gemini-3.1-flash-lite-preview",
       ].filter(Boolean) as string[]
     )
   );
 
-  const attemptTimeoutMs = params.timeoutMs ?? 10000;
+  const now = Date.now();
+  let candidateModels = allCandidateModels.filter(
+    model => (modelCooldowns.get(model) ?? 0) <= now
+  );
+  if (candidateModels.length === 0) {
+    modelCooldowns.clear();
+    candidateModels = allCandidateModels;
+  }
+
+  const attemptTimeoutMs = params.timeoutMs ?? 4500;
   let lastResponse: { status: number; body: string } | null = null;
   let lastError: unknown = null;
 
@@ -478,6 +493,7 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
         { timeoutMs: attemptTimeoutMs, maxRetries: 0 }
       );
       if (response.ok) {
+        modelCooldowns.delete(currentModel);
         return mapResponse(parseResponse<GeminiResponse>(response.body));
       }
 
@@ -485,6 +501,10 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
       if (response.status === 400) {
         console.error(`[Gemini LLM] Model "${currentModel}" failed with client error 400.`);
         throw new Error(`LLM invoke failed: ${response.status}`);
+      }
+
+      if (response.status === 503 || response.status === 429 || response.status >= 500) {
+        modelCooldowns.set(currentModel, Date.now() + 60_000);
       }
 
       console.error(
@@ -498,6 +518,7 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
       if (err instanceof Error && err.message.startsWith("LLM invoke failed: 400")) {
         throw err;
       }
+      modelCooldowns.set(currentModel, Date.now() + 60_000);
       if (err instanceof Error && err.message.includes("timed out")) {
         console.error(`[Gemini LLM] Model "${currentModel}" timed out.`);
         if (i < candidateModels.length - 1) {

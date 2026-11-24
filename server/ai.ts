@@ -12,7 +12,7 @@ import {
 } from "../shared/scoring";
 
 export const AI_MODEL =
-  process.env.GEMINI_MODEL?.trim() || "gemini-flash-lite-latest";
+  process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
 export const QUESTION_PROMPT_VERSION = "interview-questions-v2";
 export const ANSWER_PROMPT_VERSION = "answer-evaluation-v3";
 export const ANSWER_RUBRIC_VERSION = "answer-rubric-v3";
@@ -506,6 +506,14 @@ export type EvaluationCriterion = {
   weight: number;
 };
 const fallbackByCourse: Record<string, string[]> = {
+  data_analytics: [
+    "How would you handle missing, outlier, or inconsistent values in an analytical dataset before presenting metrics to leadership?",
+    "Explain the difference between WHERE and HAVING in SQL, and when you would use window functions like ROW_NUMBER() or RANK().",
+    "If a key business metric suddenly drops by 15% week-over-week, what step-by-step framework would you use to diagnose the root cause?",
+    "How do you design an A/B test analysis to ensure statistical significance without drawing premature conclusions?",
+    "How do you communicate complex statistical findings or dashboard insights to non-technical business stakeholders?",
+    "What criteria do you use to choose between a STAR schema and a Snowflake schema in a data warehouse?",
+  ],
   technology: [
     "Explain how you would debug a performance regression in a service you maintain.",
     "How would you choose an appropriate data structure for a growing set of keyed records?",
@@ -625,6 +633,12 @@ function categoryFor(
   role: string
 ): keyof typeof fallbackByCourse {
   const c = `${course} ${specialization} ${role}`.toLowerCase();
+  if (
+    /data analytic|bi analyst|business intelligence|data science|tableau|power bi|sql|pandas|metrics|data engineer/.test(
+      c
+    )
+  )
+    return "data_analytics";
   if (/mechanical|thermodynamic|machine design|manufactur|cad|g\&?d.?t/.test(c))
     return "mechanical";
   if (/civil|structural|survey|geotechnical|concrete/.test(c)) return "civil";
@@ -754,13 +768,13 @@ Output Schema:
     const result = await invokeLLM({
       model: AI_MODEL,
       temperature: 0.4,
-      max_tokens: 600,
+      max_tokens: input.count === 1 ? 250 : 600,
       timeoutMs: 3500,
       thinkingConfig: { thinkingBudget: 0 },
       generationConfig: {
         responseMimeType: "application/json",
         temperature: 0.4,
-        maxOutputTokens: 600,
+        maxOutputTokens: input.count === 1 ? 250 : 600,
         thinkingConfig: { thinkingBudget: 0 },
       },
       messages: [
