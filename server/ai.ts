@@ -12,7 +12,7 @@ import {
 } from "../shared/scoring";
 
 export const AI_MODEL =
-  process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
+  process.env.GEMINI_MODEL?.trim() || "gemini-flash-lite-latest";
 export const QUESTION_PROMPT_VERSION = "interview-questions-v2";
 export const ANSWER_PROMPT_VERSION = "answer-evaluation-v3";
 export const ANSWER_RUBRIC_VERSION = "answer-rubric-v3";
@@ -752,7 +752,7 @@ Output Schema:
   try {
     await enforceGeminiRateLimit("question_generation");
     const result = await invokeLLM({
-      model: "gemini-2.5-flash",
+      model: AI_MODEL,
       temperature: 0.4,
       max_tokens: 600,
       timeoutMs: 3500,
@@ -809,7 +809,7 @@ Output Schema:
     return {
       questions,
       source: "ai" as const,
-      modelVersion: "gemini-2.5-flash",
+      modelVersion: AI_MODEL,
       promptVersion: QUESTION_PROMPT_VERSION,
     };
   } catch (error) {

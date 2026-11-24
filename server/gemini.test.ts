@@ -207,7 +207,7 @@ describe("server-side Gemini integration", () => {
     const assertion = expect(pending).rejects.toThrow("LLM request timed out");
     await vi.advanceTimersByTimeAsync(90_000);
     await assertion;
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(7);
   });
 
   it("normalizes Google's model catalog response", async () => {

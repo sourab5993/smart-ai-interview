@@ -437,16 +437,17 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
   };
   const configuredModel = process.env.GEMINI_MODEL?.trim();
   const primaryModel =
-    params.model && params.model !== "gemini-3.5-flash-lite"
-      ? params.model
-      : configuredModel && configuredModel !== "gemini-3.5-flash-lite"
-        ? configuredModel
-        : "gemini-2.5-flash";
+    params.model || configuredModel || "gemini-flash-lite-latest";
 
   const candidateModels = Array.from(
     new Set(
       [
         primaryModel,
+        "gemini-flash-lite-latest",
+        "gemini-3.5-flash-lite",
+        "gemini-3.8-flash",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-3-flash-preview",
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
       ].filter(Boolean) as string[]

@@ -112,13 +112,16 @@ export async function transcribeAudioBuffer(options: {
   if (geminiApiKey) {
     await enforceGeminiRateLimit("audio_transcription");
     const primaryModel =
-      process.env.GEMINI_AUDIO_MODEL?.trim() && process.env.GEMINI_AUDIO_MODEL.trim() !== "gemini-3.5-flash-lite"
-        ? process.env.GEMINI_AUDIO_MODEL.trim()
-        : "gemini-2.5-flash";
+      process.env.GEMINI_AUDIO_MODEL?.trim() || "gemini-2.5-flash";
     const candidateModels = Array.from(
       new Set(
         [
           primaryModel,
+          "gemini-3.5-transcribe",
+          "gemini-flash-lite-latest",
+          "gemini-3.5-flash-lite",
+          "gemini-3.8-flash",
+          "gemini-3.1-flash-lite-preview",
           "gemini-2.5-flash",
           "gemini-2.5-flash-lite",
         ].filter(Boolean) as string[]
@@ -128,7 +131,7 @@ export async function transcribeAudioBuffer(options: {
     for (let i = 0; i < candidateModels.length; i++) {
       const model = candidateModels[i];
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      const timeout = setTimeout(() => controller.abort(), 10_000);
       try {
         const response = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
@@ -166,17 +169,7 @@ CRITICAL INSTRUCTION: Transcribe only genuine spoken human speech verbatim. If t
           console.error(
             `[AudioTranscription] Provider: Google Gemini | Model: "${model}" | Stage: gemini_generate_content | Status: ${response.status} ${response.statusText} | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error: ${errorBody.slice(0, 300)}`
           );
-          // Retry on model 404, 503, 429, 5xx or transient provider errors if another model is available
-          const isRetryable =
-            response.status === 404 ||
-            response.status === 503 ||
-            response.status === 429 ||
-            response.status >= 500 ||
-            errorBody.includes("is not available") ||
-            errorBody.includes("not supported") ||
-            errorBody.includes("RESOURCE_EXHAUSTED");
-
-          if (isRetryable && i < candidateModels.length - 1) {
+          if (i < candidateModels.length - 1) {
             continue;
           }
           break;
