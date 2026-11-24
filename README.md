@@ -31,6 +31,10 @@ Rotate any credentials previously disclosed in chat. Store replacements only in 
 
 Apply the 13 ordered SQL migrations in `supabase/migrations/` only after a backup and reconciliation of the target schema and migration ledger. Follow [Supabase setup](supabase/SETUP.md); never reset or delete existing data. The latest migration enables the shared database-backed per-user Gemini token bucket and must be applied before production AI calls are enabled.
 
+## Architecture and Directory Structure
+
+See [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md) for a comprehensive diagram, module tree, and data flow guide covering the client, server, and database architecture.
+
 ## Interview behavior and limitations
 
 Simple Interview, Live Interview, and Behavioral Interview are authenticated routes. The Live Interview route uses the three-panel room and existing persisted session/turn/finalization handlers. Browser speech recognition and synthesis are feature-dependent; audio transcription uses a server-side Gemini request. Camera use is optional and user-initiated. Resume files are checked and parsed locally, then stored in the user's private Supabase `resumes` bucket.
