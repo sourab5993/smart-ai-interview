@@ -2058,6 +2058,10 @@ export function InterviewRoom() {
 
     const baseText = initialTextRef.current.trim();
 
+    const currentAnswer = textRef.current.trim();
+    const hasValidExistingAnswer =
+      currentAnswer.length >= 2 && !isSilenceHallucination(currentAnswer);
+
     // 1. Authoritative Backend Transcription
     if (audioBlob && audioBlob.size > 200 && durationMs >= 500) {
       setTranscribing(true);
@@ -2093,14 +2097,19 @@ export function InterviewRoom() {
           }
           setError("");
         } else {
-          // No clear speech detected from either source
+          // No new clear speech detected from this recording attempt
           if (!userEditedDuringRecordingRef.current) {
             setText(initialTextRef.current);
             textRef.current = initialTextRef.current;
           }
-          setError(
-            "No clear speech was detected. Please speak into your microphone or type your answer above."
-          );
+          // Only show speech validation error if mode is voice AND there is no existing valid answer
+          if (mode === "voice" && !hasValidExistingAnswer && !userEditedDuringRecordingRef.current) {
+            setError(
+              "No clear speech was detected. Please speak into your microphone or type your answer above."
+            );
+          } else {
+            setError("");
+          }
         }
       } catch (sttErr: any) {
         console.warn("Backend transcription failed:", sttErr);
@@ -2117,19 +2126,23 @@ export function InterviewRoom() {
           }
           setError("");
         } else {
-          // Preserve existing text and show honest error
+          // Preserve existing text and only show error if no valid text exists and in voice mode
           if (!userEditedDuringRecordingRef.current) {
             setText(initialTextRef.current);
             textRef.current = initialTextRef.current;
           }
-          const raw = sttErr?.message || String(sttErr || "");
-          const isNetwork = /failed to fetch|networkerror|load failed/i.test(raw);
-          setError(
-            isNetwork
-              ? "Unable to connect to the audio transcription server. Please verify your connection or type your answer above."
-              : sttErr?.message ||
-                "Audio transcription could not be completed. Please try again or type your answer above."
-          );
+          if (mode === "voice" && !hasValidExistingAnswer && !userEditedDuringRecordingRef.current) {
+            const raw = sttErr?.message || String(sttErr || "");
+            const isNetwork = /failed to fetch|networkerror|load failed/i.test(raw);
+            setError(
+              isNetwork
+                ? "Unable to connect to the audio transcription server. Please verify your connection or type your answer above."
+                : sttErr?.message ||
+                  "Audio transcription could not be completed. Please try again or type your answer above."
+            );
+          } else {
+            setError("");
+          }
         }
       } finally {
         if (recordingSessionIdRef.current === sessionId) {
@@ -2137,15 +2150,7 @@ export function InterviewRoom() {
         }
       }
     } else if (wasRecording) {
-      if (durationMs < 500 || !audioBlob || audioBlob.size <= 200) {
-        if (!userEditedDuringRecordingRef.current) {
-          setText(initialTextRef.current);
-          textRef.current = initialTextRef.current;
-        }
-        setError(
-          "Recording was too short. Please speak after clicking 'Start answer' or type your answer above."
-        );
-      } else if (hasBrowserSpeech) {
+      if (hasBrowserSpeech) {
         if (!userEditedDuringRecordingRef.current) {
           const finalAnswer = baseText
             ? `${baseText} ${browserCandidate}`
@@ -2159,9 +2164,19 @@ export function InterviewRoom() {
           setText(initialTextRef.current);
           textRef.current = initialTextRef.current;
         }
-        setError(
-          "No clear speech was detected. Please speak into your microphone or type your answer above."
-        );
+        if (mode === "voice" && !hasValidExistingAnswer && !userEditedDuringRecordingRef.current) {
+          if (durationMs < 500 || !audioBlob || audioBlob.size <= 200) {
+            setError(
+              "Recording was too short. Please speak after clicking 'Start answer' or type your answer above."
+            );
+          } else {
+            setError(
+              "No clear speech was detected. Please speak into your microphone or type your answer above."
+            );
+          }
+        } else {
+          setError("");
+        }
       }
     }
   }
@@ -2279,8 +2294,16 @@ export function InterviewRoom() {
       answerText = existingAnswer.answer_text;
     }
 
+    if (answerText && !isSilenceHallucination(answerText) && answerText.length >= 2) {
+      setError("");
+    }
+
     if (!answerText || isSilenceHallucination(answerText) || answerText.length < 2) {
-      setError("Please speak into your microphone or type your answer before submitting.");
+      setError(
+        mode === "voice"
+          ? "Please speak into your microphone or type your answer before submitting."
+          : "Please enter your answer before submitting."
+      );
       return;
     }
     if (answerText.length > 12000) {
@@ -2613,7 +2636,14 @@ export function InterviewRoom() {
             <button
               className={mode === "text" ? "active" : ""}
               onClick={() => {
-                if (recording) stopVoice();
+                if (recording) void stopVoice();
+                setError(prev =>
+                  prev.includes("speech") ||
+                  prev.includes("microphone") ||
+                  prev.includes("Recording")
+                    ? ""
+                    : prev
+                );
                 setMode("text");
               }}
             >
@@ -2621,7 +2651,16 @@ export function InterviewRoom() {
             </button>
             <button
               className={mode === "voice" ? "active" : ""}
-              onClick={() => setMode("voice")}
+              onClick={() => {
+                setError(prev =>
+                  prev.includes("speech") ||
+                  prev.includes("microphone") ||
+                  prev.includes("Recording")
+                    ? ""
+                    : prev
+                );
+                setMode("voice");
+              }}
             >
               VOICE
             </button>

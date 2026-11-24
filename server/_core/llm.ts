@@ -445,22 +445,26 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
         primaryModel,
         "gemini-flash-lite-latest",
         "gemini-3.5-flash-lite",
+        "gemini-3-flash-preview",
         "gemini-3.8-flash",
         "gemini-3.1-flash-lite-preview",
-        "gemini-3-flash-preview",
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
       ].filter(Boolean) as string[]
     )
   );
 
-  const attemptTimeoutMs = params.timeoutMs ?? 3500;
+  const attemptTimeoutMs = params.timeoutMs ?? 10000;
   let lastResponse: { status: number; body: string } | null = null;
   let lastError: unknown = null;
 
   for (let i = 0; i < candidateModels.length; i++) {
     const currentModel = candidateModels[i];
     try {
+      const isLite = /flash-lite/i.test(currentModel);
+      let requestPayload = payload;
+      if (isLite && payload.generationConfig && (payload.generationConfig as any).thinkingConfig) {
+        const { thinkingConfig: _, ...restGen } = payload.generationConfig as any;
+        requestPayload = { ...payload, generationConfig: restGen };
+      }
       const response = await request(
         `${GEMINI_API_BASE}/models/${encodeURIComponent(currentModel)}:generateContent`,
         {
@@ -469,7 +473,7 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
             "content-type": "application/json",
             "x-goog-api-key": apiKey(),
           },
-          body: JSON.stringify(payload),
+          body: JSON.stringify(requestPayload),
         },
         { timeoutMs: attemptTimeoutMs, maxRetries: 0 }
       );

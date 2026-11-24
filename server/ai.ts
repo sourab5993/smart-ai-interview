@@ -466,7 +466,7 @@ async function structured<T>(
   ];
   const result = await invokeLLM({
     model: AI_MODEL,
-    reasoning_effort: "low",
+    timeoutMs: 15000,
     max_tokens:
       name === "interview_analysis"
         ? 2048
