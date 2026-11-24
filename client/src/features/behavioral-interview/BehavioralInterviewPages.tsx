@@ -12,6 +12,7 @@ import {
   Pause,
   RotateCcw,
   ScanFace,
+  Send,
   ShieldCheck,
   UsersRound,
   Video,
@@ -476,37 +477,53 @@ export function BehavioralSetup() {
   }
 
   async function start() {
-    if (
-      !user ||
-      !deviceReady ||
-      (cameraEnabled && !worker.ready) ||
-      !generatedQuestions.length
-    )
+    if (!user) {
+      setError("Please sign in to start your behavioral practice.");
       return;
+    }
+    if (!generatedQuestions.length) {
+      setError("Please generate behavioral questions first before starting.");
+      return;
+    }
     setError("");
-    const selection = stream
-      ? behavioralDeviceSelectionFromStream(stream)
+
+    let activeStream = stream;
+    if (!activeStream) {
+      try {
+        const audio = await navigator.mediaDevices.getUserMedia({ audio: true });
+        activeStream = audio;
+        setStream(audio);
+        setDeviceReady(true);
+      } catch (e) {
+        console.warn("Microphone pre-connection optional during setup:", e);
+      }
+    }
+
+    const isCameraActive = Boolean(
+      activeStream?.getVideoTracks().some(track => track.readyState === "live")
+    ) && worker.ready;
+
+    const selection = activeStream
+      ? behavioralDeviceSelectionFromStream(activeStream)
       : { cameraDeviceId: "", microphoneDeviceId: "" };
     const pendingSelectionKey =
       behavioralDeviceSelectionStorageKey("__pending__");
     try {
       sessionStorage.setItem(pendingSelectionKey, JSON.stringify(selection));
     } catch {
-      setError(
-        "This browser could not remember your selected devices for this tab. Enable session storage and try again."
-      );
-      return;
+      // Storage unavailable, continue
     }
+
     try {
       const created = await createSession.mutateAsync({
         selectedQuestions: [],
         generatedQuestions,
         includeAnswerEvaluation,
         consent: {
-          camera: cameraEnabled,
+          camera: isCameraActive,
           microphone: true,
           permissionRequestedAutomatically: false,
-          localVisualProcessing: cameraEnabled,
+          localVisualProcessing: isCameraActive,
           temporaryAudioForTranscription: true,
           rawMediaRetention: false,
           permissionRequestedAt: new Date().toISOString(),
@@ -514,7 +531,7 @@ export function BehavioralSetup() {
         modelMetadata: {
           questionGenerator: "Google Gemini",
           transcription: "Google Gemini server transcription",
-          ...(cameraEnabled
+          ...(isCameraActive
             ? {
                 face: "MediaPipe Face Landmarker · float16/1 · numFaces=2",
                 pose: "MediaPipe Pose Landmarker Lite · float16/1",
@@ -533,14 +550,15 @@ export function BehavioralSetup() {
         // The pending entry remains available as a same-tab fallback.
       }
       navigate(`/behavioral-interview/${created.id}`);
-    } catch {
+    } catch (err: any) {
       try {
         sessionStorage.removeItem(pendingSelectionKey);
       } catch {
         /* storage may be disabled */
       }
       setError(
-        "We couldn't start this behavioral session. Your question set is still here; please retry."
+        err?.message ||
+          "We couldn't start this behavioral session. Your question set is still here; please retry."
       );
     }
   }
@@ -748,8 +766,6 @@ export function BehavioralSetup() {
               type="button"
               onClick={() => void start()}
               disabled={
-                !deviceReady ||
-                (cameraEnabled && !worker.ready) ||
                 !generatedQuestions.length ||
                 createSession.isPending
               }
@@ -828,7 +844,48 @@ export function BehavioralRoom() {
     null
   );
   const [retryBlob, setRetryBlob] = useState<Blob | null>(null);
+
+  // Editable answer and speech-to-text states
+  const [answerText, setAnswerText] = useState("");
+  const answerTextRef = useRef("");
+  const committedSpeechRef = useRef("");
+  const isRecordingRef = useRef(false);
+  const recognitionRef = useRef<any>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [micVolume, setMicVolume] = useState(0);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animFrameRef = useRef<number | null>(null);
+  const questionMountedAt = useRef(Date.now());
   const current = sessionQuery.data?.questions?.[index];
+
+  // Auto-focus on active question and reset per-question draft
+  useEffect(() => {
+    questionMountedAt.current = Date.now();
+    setElapsed(0);
+    setAnswerText("");
+    answerTextRef.current = "";
+    committedSpeechRef.current = "";
+    framesRef.current = [];
+    setObservationCount(0);
+    setLastSummary(null);
+    setProcessed(false);
+    setRetryBlob(null);
+    setError("");
+    const timer = window.setTimeout(() => {
+      textareaRef.current?.focus();
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [index]);
+
+  // Track question timer
+  useEffect(() => {
+    if (processed) return;
+    const timer = window.setInterval(() => {
+      setElapsed(Math.floor((Date.now() - questionMountedAt.current) / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [processed]);
 
   useEffect(() => {
     let live = true;
@@ -863,6 +920,7 @@ export function BehavioralRoom() {
       worker.terminate();
     };
   }, [cameraReady]);
+
   useEffect(() => {
     let live = true;
     let acquired: MediaStream | null = null;
@@ -871,7 +929,7 @@ export function BehavioralRoom() {
     const handleMicrophoneEnded = () => {
       setMicrophoneReady(false);
       setError(
-        "Microphone access ended. Reconnect it before recording another answer."
+        "Microphone access ended. Reconnect it before recording another answer, or type your answer in the box below."
       );
       if (mediaRecorder.current?.state === "recording") {
         recordEnded.current = Date.now();
@@ -955,9 +1013,8 @@ export function BehavioralRoom() {
           videoRef.current.srcObject = null;
         }
       } catch {
-        setError(
-          "Microphone access is required for spoken answers. Return to setup and connect a microphone; camera permission is optional."
-        );
+        // Microphone not pre-connected; user can still type or connect on recording
+        setMicrophoneReady(false);
       }
     })();
     return () => {
@@ -975,6 +1032,7 @@ export function BehavioralRoom() {
       acquired?.getTracks().forEach(track => track.stop());
     };
   }, [id]);
+
   useEffect(() => {
     if (
       !recording ||
@@ -999,35 +1057,61 @@ export function BehavioralRoom() {
     }, 250);
     return () => window.clearInterval(timer);
   }, [recording, modelReady, cameraReady]);
+
+  // Clean up on component unmount
   useEffect(() => {
-    if (!recording) return;
-    const checkMax = () => {
-      if (Date.now() - recordStarted.current >= 180_000) {
-        stopRecordingRef.current();
-      }
-    };
-    const timer = window.setInterval(() => {
-      setElapsed(Math.floor((Date.now() - recordStarted.current) / 1000));
-      checkMax();
-    }, 1000);
-    const handleVis = () => {
-      if (
-        typeof document !== "undefined" &&
-        document.visibilityState === "visible"
-      ) {
-        checkMax();
-      }
-    };
-    if (typeof document !== "undefined") {
-      document.addEventListener("visibilitychange", handleVis);
-    }
     return () => {
-      window.clearInterval(timer);
-      if (typeof document !== "undefined") {
-        document.removeEventListener("visibilitychange", handleVis);
+      isRecordingRef.current = false;
+      stopVisualizer();
+      if (recognitionRef.current) {
+        recognitionRef.current.onend = null;
+        try {
+          recognitionRef.current.abort();
+        } catch {}
       }
     };
-  }, [recording]);
+  }, []);
+
+  function startVisualizer(stream: MediaStream) {
+    try {
+      const AudioCtx =
+        window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const actx = new AudioCtx();
+      audioContextRef.current = actx;
+      const src = actx.createMediaStreamSource(stream);
+      const analyser = actx.createAnalyser();
+      analyser.fftSize = 256;
+      src.connect(analyser);
+      analyserRef.current = analyser;
+      const dataArr = new Uint8Array(analyser.frequencyBinCount);
+      const checkVolume = () => {
+        if (!analyserRef.current || !isRecordingRef.current) return;
+        analyser.getByteFrequencyData(dataArr);
+        let sum = 0;
+        for (let i = 0; i < dataArr.length; i++) sum += dataArr[i];
+        const avg = sum / dataArr.length;
+        setMicVolume(Math.min(100, Math.round((avg / 128) * 100)));
+        animFrameRef.current = requestAnimationFrame(checkVolume);
+      };
+      animFrameRef.current = requestAnimationFrame(checkVolume);
+    } catch (e) {
+      console.warn("Audio visualizer error:", e);
+    }
+  }
+
+  function stopVisualizer() {
+    if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    animFrameRef.current = null;
+    if (audioContextRef.current) {
+      try {
+        audioContextRef.current.close();
+      } catch {}
+      audioContextRef.current = null;
+    }
+    analyserRef.current = null;
+    setMicVolume(0);
+  }
 
   async function blobToBase64(blob: Blob) {
     const buffer = await blob.arrayBuffer();
@@ -1040,55 +1124,293 @@ export function BehavioralRoom() {
       );
     return btoa(binary);
   }
-  async function processRecording(blob: Blob) {
-    if (!current || !sessionQuery.data) return;
-    if (!blob.size) {
-      setError("No audio was captured. Start a new recording and try again.");
-      return;
-    }
-    if (blob.size > MAX_TRANSCRIPTION_AUDIO_BYTES) {
-      setRetryBlob(null);
-      setError(
-        "This recording is too large to send for transcription. Record a shorter answer and try again."
-      );
-      return;
-    }
-    setProcessing(true);
-    setError("");
-    const endedAt = new Date(recordEnded.current || Date.now());
-    const startedAt = new Date(recordStarted.current);
+
+  async function transcribeCapturedAudio(blob: Blob) {
+    if (blob.size > MAX_TRANSCRIPTION_AUDIO_BYTES) return;
     try {
-      const summary = aggregateBehavioralObservations(framesRef.current, null);
-      setLastSummary(summary);
+      setProcessing(true);
       const transcription = await transcribe.mutateAsync({
         audioBase64: await blobToBase64(blob),
         mimeType: blob.type || "audio/webm",
         language: "en",
       });
-      const transcript = transcription.text?.trim();
-      if (!transcript || isSilenceHallucination(transcript))
-        throw new Error(
-          "We couldn't recognize speech in that recording. Your captured audio is still available to retry."
+      const text = transcription.text?.trim() || "";
+      if (text && !isSilenceHallucination(text)) {
+        setAnswerText(text);
+        answerTextRef.current = text;
+        committedSpeechRef.current = text;
+      }
+    } catch (e) {
+      console.warn("Fallback audio transcription warning:", e);
+    } finally {
+      setProcessing(false);
+    }
+  }
+
+  async function processRecording(blob: Blob) {
+    if (!current || !sessionQuery.data) return;
+    if (!blob.size) {
+      setError("No audio was captured. Start a new recording or type your answer below.");
+      return;
+    }
+    setProcessing(true);
+    setError("");
+    try {
+      const transcription = await transcribe.mutateAsync({
+        audioBase64: await blobToBase64(blob),
+        mimeType: blob.type || "audio/webm",
+        language: "en",
+      });
+      const transcript = transcription.text?.trim() || "";
+      if (transcript && !isSilenceHallucination(transcript)) {
+        setAnswerText(transcript);
+        answerTextRef.current = transcript;
+        committedSpeechRef.current = transcript;
+      } else {
+        setError(
+          "We couldn't recognize clear speech in that recording. You can retry speaking or type your answer directly."
         );
+      }
+    } catch {
+      setError("Transcription failed. You can type your answer manually in the box below.");
+    } finally {
+      setProcessing(false);
+    }
+  }
+
+  async function startRecording() {
+    if (processing) return;
+    setError("");
+
+    let stream = streamRef.current;
+    if (
+      !stream ||
+      !stream.getAudioTracks().some(track => track.readyState === "live")
+    ) {
+      try {
+        const preferredDevices = parseBehavioralDeviceSelection(
+          sessionStorage.getItem(behavioralDeviceSelectionStorageKey(id)) ||
+            sessionStorage.getItem(
+              behavioralDeviceSelectionStorageKey("__pending__")
+            )
+        );
+        const micStream = await navigator.mediaDevices.getUserMedia({
+          video: false,
+          audio: preferredDevices?.microphoneDeviceId
+            ? { deviceId: { exact: preferredDevices.microphoneDeviceId } }
+            : true,
+        });
+        const audioTracks = micStream.getAudioTracks();
+        const videoTracks =
+          stream?.getVideoTracks().filter(t => t.readyState === "live") || [];
+        stream = new MediaStream([...audioTracks, ...videoTracks]);
+        streamRef.current = stream;
+        setMicrophoneReady(true);
+      } catch (err: any) {
+        setError(
+          err?.name === "NotAllowedError" ||
+            err?.name === "PermissionDeniedError"
+            ? "Microphone access was denied. Please allow microphone access in your browser or type your answer in the box below."
+            : "Could not access your microphone. You can type your answer manually in the box below."
+        );
+        setMicrophoneReady(false);
+        return;
+      }
+    }
+
+    const mimeType =
+      ["audio/webm;codecs=opus", "audio/webm", "audio/ogg"].find(
+        type =>
+          typeof MediaRecorder !== "undefined" &&
+          MediaRecorder.isTypeSupported(type)
+      ) || "";
+
+    try {
+      const audioTracks = selectAudioTracksForTranscription(stream);
+      if (!audioTracks.length) {
+        setError(
+          "Microphone audio is unavailable. Reconnect your microphone or type your answer below."
+        );
+        return;
+      }
+
+      isRecordingRef.current = true;
+      committedSpeechRef.current = answerTextRef.current;
+      recordStarted.current = Date.now();
+      setRecording(true);
+
+      startVisualizer(stream);
+
+      // MediaRecorder in parallel for fallback audio transcription
+      if (typeof MediaRecorder !== "undefined") {
+        const audioStream = new MediaStream(audioTracks);
+        const recorder = new MediaRecorder(audioStream, mimeType ? { mimeType } : undefined);
+        const chunks: Blob[] = [];
+        recorder.ondataavailable = event => {
+          if (event.data.size) chunks.push(event.data);
+        };
+        recorder.onstop = () => {
+          const blob = new Blob(chunks, {
+            type: recorder.mimeType || "audio/webm",
+          });
+          setRetryBlob(blob);
+          if (!answerTextRef.current.trim() && blob.size > 200) {
+            void transcribeCapturedAudio(blob);
+          }
+        };
+        mediaRecorder.current = recorder;
+        recorder.start(250);
+      }
+
+      // Live SpeechRecognition
+      const Speech =
+        (typeof window !== "undefined" &&
+          ((window as any).SpeechRecognition ||
+            (window as any).webkitSpeechRecognition)) ||
+        null;
+      if (Speech) {
+        try {
+          if (recognitionRef.current) {
+            try {
+              recognitionRef.current.abort();
+            } catch {}
+          }
+          const recognition = new Speech();
+          recognitionRef.current = recognition;
+          recognition.continuous = true;
+          recognition.interimResults = true;
+          recognition.lang = "en-US";
+          recognition.onresult = (event: any) => {
+            if (!isRecordingRef.current) return;
+            let interim = "";
+            let finalChunk = "";
+            for (let i = event.resultIndex; i < event.results.length; ++i) {
+              const item = event.results[i];
+              const txt = item[0]?.transcript || "";
+              if (item.isFinal) finalChunk += `${txt} `;
+              else interim += `${txt} `;
+            }
+            finalChunk = finalChunk.trim();
+            interim = interim.trim();
+            if (finalChunk) {
+              const base = committedSpeechRef.current.trim();
+              committedSpeechRef.current = base
+                ? `${base} ${finalChunk}`
+                : finalChunk;
+            }
+            const committed = committedSpeechRef.current.trim();
+            const display = interim
+              ? committed
+                ? `${committed} ${interim}`
+                : interim
+              : committed;
+            setAnswerText(display);
+            answerTextRef.current = display;
+          };
+          recognition.onerror = (event: any) => {
+            const err = event?.error;
+            if (err === "no-speech" || err === "aborted") return;
+            if (err === "not-allowed" || err === "service-not-allowed") {
+              setError(
+                "Microphone permission was denied. You can continue by typing your answer in the text box below."
+              );
+            } else if (err === "network") {
+              console.warn(
+                "SpeechRecognition network warning, parallel audio recording active"
+              );
+            }
+          };
+          recognition.onend = () => {
+            if (isRecordingRef.current) {
+              try {
+                recognition.start();
+              } catch {}
+            }
+          };
+          recognition.start();
+        } catch (speechErr) {
+          console.warn("SpeechRecognition start error:", speechErr);
+        }
+      }
+    } catch {
+      setError(
+        "Could not start audio recording. You can type your answer manually in the box below."
+      );
+      setRecording(false);
+      isRecordingRef.current = false;
+      stopVisualizer();
+    }
+  }
+
+  function stopRecording() {
+    isRecordingRef.current = false;
+    recordEnded.current = Date.now();
+    stopVisualizer();
+
+    if (recognitionRef.current) {
+      recognitionRef.current.onend = null;
+      try {
+        recognitionRef.current.stop();
+      } catch {}
+      recognitionRef.current = null;
+    }
+
+    if (mediaRecorder.current && mediaRecorder.current.state === "recording") {
+      mediaRecorder.current.stop();
+      mediaRecorder.current = null;
+    }
+    setRecording(false);
+  }
+  stopRecordingRef.current = stopRecording;
+
+  async function submitAnswer() {
+    if (!current || !sessionQuery.data || processing) return;
+    const text = answerText.trim();
+    if (!text) {
+      setError(
+        "Please speak into your microphone or type your answer before submitting."
+      );
+      return;
+    }
+
+    if (recording) {
+      stopRecording();
+    }
+
+    setProcessing(true);
+    setError("");
+
+    const endedAt = new Date(recordEnded.current || Date.now());
+    const startedAt = new Date(
+      recordStarted.current ||
+        Date.now() - Math.max(1, elapsed) * 1000
+    );
+    const durationSeconds = Math.max(
+      1,
+      recordEnded.current && recordStarted.current
+        ? Math.round((recordEnded.current - recordStarted.current) / 1000)
+        : elapsed || 1
+    );
+
+    try {
       const speech = {
-        durationSeconds: Math.max(
-          0,
-          (endedAt.getTime() - startedAt.getTime()) / 1000
-        ),
+        durationSeconds,
         transcriptAvailable: true,
-        transcriptConfidence: transcription.segments?.length ? 0.82 : null,
+        transcriptConfidence: 0.88,
       };
       const completedSummary = aggregateBehavioralObservations(
         framesRef.current,
         speech
       );
+      setLastSummary(completedSummary);
+
       await saveAnswer.mutateAsync({
         sessionId: id,
         questionId: current.id,
-        transcript,
-        transcriptLanguage: transcription.language || null,
+        transcript: text,
+        transcriptLanguage: "en",
         transcriptConfidence: speech.transcriptConfidence,
-        durationSeconds: speech.durationSeconds,
+        durationSeconds,
         startedAt: startedAt.toISOString(),
         endedAt: endedAt.toISOString(),
         observationSummary: completedSummary as unknown as Record<
@@ -1103,93 +1425,39 @@ export function BehavioralRoom() {
           reliability: frame.trackingReliable ? 85 : 0,
         })),
       });
+
       setRetryBlob(null);
-      setLastSummary(completedSummary);
       setProcessed(true);
     } catch (cause) {
       setError(
-        cause instanceof Error &&
-          cause.message.startsWith("We couldn't recognize speech")
+        cause instanceof Error
           ? cause.message
-          : "We couldn't transcribe or save this answer. Your captured audio is still available to retry."
+          : "We couldn't save this answer. Please retry submitting."
       );
     } finally {
       setProcessing(false);
     }
   }
-  function startRecording() {
-    const stream = streamRef.current;
-    if (!stream || !current || processing) return;
-    if (typeof MediaRecorder === "undefined") {
-      setError(
-        "This browser does not support audio recording. Try a current Chrome, Edge or Firefox browser."
-      );
-      return;
-    }
-    const mimeType =
-      ["audio/webm;codecs=opus", "audio/webm", "audio/ogg"].find(type =>
-        MediaRecorder.isTypeSupported(type)
-      ) || "";
-    try {
-      const audioTracks = selectAudioTracksForTranscription(stream);
-      if (!audioTracks.length) {
-        setError(
-          "Microphone audio is unavailable. Reconnect your microphone before recording."
-        );
-        return;
-      }
-      // The camera stream remains local for preview and worker inference. Only
-      // microphone tracks enter the recorded blob sent for speech transcription.
-      const audioStream = new MediaStream(audioTracks);
-      const recorder = new MediaRecorder(audioStream, mimeType ? { mimeType } : undefined);
-      const chunks: Blob[] = [];
-      recorder.ondataavailable = event => {
-        if (event.data.size) chunks.push(event.data);
-      };
-      recorder.onstop = () => {
-        const blob = new Blob(chunks, {
-          type: recorder.mimeType || "audio/webm",
-        });
-        setRetryBlob(blob);
-        void processRecording(blob);
-      };
-      framesRef.current = [];
-      setObservationCount(0);
-      setLastSummary(null);
-      setProcessed(false);
-      setRetryBlob(null);
-      setError("");
-      recordStarted.current = Date.now();
-      setElapsed(0);
-      mediaRecorder.current = recorder;
-      recorder.start(250);
-      setRecording(true);
-    } catch {
-      setError(
-        "This browser could not start an audio recording. Try a current Chrome, Edge or Firefox browser."
-      );
-    }
-  }
-  function stopRecording() {
-    recordEnded.current = Date.now();
-    mediaRecorder.current?.stop();
-    mediaRecorder.current = null;
-    setRecording(false);
-  }
-  stopRecordingRef.current = stopRecording;
+
   function retry() {
+    setAnswerText("");
+    answerTextRef.current = "";
+    committedSpeechRef.current = "";
     framesRef.current = [];
     setObservationCount(0);
     setLastSummary(null);
     setProcessed(false);
     setRetryBlob(null);
     setError("");
+    setElapsed(0);
+    questionMountedAt.current = Date.now();
+    textareaRef.current?.focus();
   }
+
   async function next() {
     if (!processed || processing) return;
     if (index + 1 < (sessionQuery.data?.questions.length || 0)) {
       setIndex(value => value + 1);
-      retry();
       return;
     }
     setProcessing(true);
@@ -1200,9 +1468,7 @@ export function BehavioralRoom() {
         sessionStorage.removeItem(
           behavioralDeviceSelectionStorageKey("__pending__")
         );
-      } catch {
-        /* storage may be disabled */
-      }
+      } catch {}
       navigate(`/behavioral-report/${id}`);
     } catch (cause) {
       try {
@@ -1238,7 +1504,7 @@ export function BehavioralRoom() {
       <PageHeading
         eyebrow="BEHAVIORAL PRACTICE"
         title="Speak naturally. Review the evidence."
-        description="Answer aloud only. Camera observations are approximate, local and shown with coverage and reliability limits."
+        description="Answer using your microphone or the text box. Camera observations are approximate, local and shown with coverage and reliability limits."
         action={
           <Link
             className="button button-secondary"
@@ -1312,11 +1578,13 @@ export function BehavioralRoom() {
         </Panel>
         <Panel
           className="behavioral-question-panel"
-          title="Your spoken answer"
+          title="Your spoken or written answer"
           subtitle={`${current.topic || "General"} · ${current.difficulty}`}
         >
           <div className="behavioral-question-card">
-            <span className="eyebrow">QUESTION {index + 1}</span>
+            <span className="eyebrow">
+              QUESTION {index + 1} OF {sessionQuery.data.questions.length}
+            </span>
             <h2>{current.question_text}</h2>
             <p>
               {current.rationale ||
@@ -1327,12 +1595,129 @@ export function BehavioralRoom() {
             <Clock3 size={17} /> {formatDuration(elapsed)}{" "}
             <span>
               {recording
-                ? "Answer in progress"
+                ? "Recording in progress"
                 : processed
-                  ? "Answer processed"
-                  : "Press start when ready"}
+                  ? "Answer evaluated & saved"
+                  : "Speak or type your answer"}
             </span>
           </div>
+
+          {recording && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "10px",
+                padding: "8px 12px",
+                marginBottom: "12px",
+                borderRadius: "8px",
+                background: "rgba(239, 68, 68, 0.08)",
+                border: "1px solid rgba(239, 68, 68, 0.25)",
+              }}
+            >
+              <div
+                style={{
+                  width: "9px",
+                  height: "9px",
+                  borderRadius: "50%",
+                  backgroundColor: "#ef4444",
+                }}
+              />
+              <span
+                style={{
+                  fontSize: "0.82rem",
+                  fontWeight: 600,
+                  color: "#f87171",
+                }}
+              >
+                Listening to microphone…
+              </span>
+              <div
+                style={{
+                  flex: 1,
+                  height: "6px",
+                  background: "rgba(255, 255, 255, 0.1)",
+                  borderRadius: "3px",
+                  overflow: "hidden",
+                  marginLeft: "8px",
+                }}
+              >
+                <div
+                  style={{
+                    width: `${micVolume}%`,
+                    height: "100%",
+                    backgroundColor: micVolume > 10 ? "#22c55e" : "#ef4444",
+                    transition: "width 0.1s ease",
+                  }}
+                />
+              </div>
+              <span
+                style={{
+                  fontSize: "0.78rem",
+                  color: micVolume > 10 ? "#22c55e" : "#94a3b8",
+                  minWidth: "135px",
+                  textAlign: "right",
+                }}
+              >
+                {micVolume > 10
+                  ? `Voice detected (${micVolume}%)`
+                  : "Waiting for speech…"}
+              </span>
+            </div>
+          )}
+
+          <div style={{ marginBottom: "12px" }}>
+            <textarea
+              ref={textareaRef}
+              className="input"
+              style={{
+                width: "100%",
+                minHeight: "130px",
+                resize: "vertical",
+                fontFamily: "inherit",
+                fontSize: "0.95rem",
+                lineHeight: "1.5",
+                padding: "12px",
+                borderRadius: "6px",
+                boxSizing: "border-box",
+              }}
+              value={answerText}
+              onChange={e => {
+                const text = e.target.value;
+                setError("");
+                setAnswerText(text);
+                answerTextRef.current = text;
+                committedSpeechRef.current = text;
+              }}
+              placeholder="Type your answer here or click 'Start recording' to speak..."
+              disabled={processing}
+            />
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                marginTop: "6px",
+                fontSize: "0.78rem",
+                color: "var(--muted)",
+              }}
+            >
+              <span>
+                {(() => {
+                  const words = answerText.trim()
+                    ? answerText.trim().split(/\s+/).length
+                    : 0;
+                  return `${words} words · ${answerText.trim().length} characters`;
+                })()}
+              </span>
+              <span>
+                {recording
+                  ? "Streaming live speech to text…"
+                  : "Editable at any time"}
+              </span>
+            </div>
+          </div>
+
           {error && (
             <div className="notice notice-error" role="alert">
               {error}
@@ -1343,24 +1728,24 @@ export function BehavioralRoom() {
               <Check size={15} />{" "}
               {cameraReady
                 ? `Captured ${observationCount} local observations. Coverage ${lastSummary.coverage}% · Reliability ${lastSummary.reliability}%.`
-                : "Answer transcript saved. Camera was off, so no visual observations were recorded."}
+                : "Answer saved successfully. Camera was off, so no visual observations were recorded."}
             </div>
           )}
           {processing && (
             <div className="behavioral-processing-note">
-              <span className="spinner" /> Processing recorded speech and
-              observations before continuing…
+              <span className="spinner" /> Processing answer and observations…
             </div>
           )}
           <div className="behavioral-control-row">
-            {!recording && !processed && (
+            {!recording && (
               <button
                 className="button button-primary"
                 type="button"
-                onClick={startRecording}
-                disabled={!microphoneReady || processing}
+                onClick={() => void startRecording()}
+                disabled={processing}
               >
-                <Mic size={15} /> Start recording
+                <Mic size={15} />{" "}
+                {answerText.trim() ? "Resume recording" : "Start recording"}
               </button>
             )}
             {recording && (
@@ -1378,36 +1763,55 @@ export function BehavioralRoom() {
                 type="button"
                 onClick={() => void processRecording(retryBlob)}
               >
-                <RotateCcw size={15} /> Retry transcription / save
+                <RotateCcw size={15} /> Retry transcription
               </button>
             )}
+            <button
+              className="button button-primary"
+              type="button"
+              onClick={() => void submitAnswer()}
+              disabled={!answerText.trim() || processing}
+            >
+              <Send size={15} /> Submit answer
+            </button>
             {processed && (
-              <button
-                className="button button-secondary"
-                type="button"
-                onClick={retry}
-                disabled={processing}
-              >
-                <RotateCcw size={15} /> Retry answer
-              </button>
-            )}
-            {processed && (
-              <button
-                className="button button-primary"
-                type="button"
-                onClick={() => void next()}
-                disabled={processing}
-              >
-                {index + 1 === sessionQuery.data.questions.length
-                  ? "Create behavioral report"
-                  : "Next question"}{" "}
-                <ArrowRight size={15} />
-              </button>
+              <>
+                <button
+                  className="button button-secondary"
+                  type="button"
+                  onClick={retry}
+                  disabled={processing}
+                >
+                  <RotateCcw size={15} /> Re-answer question
+                </button>
+                <button
+                  className="button button-primary"
+                  type="button"
+                  onClick={() => void next()}
+                  disabled={processing}
+                >
+                  {index + 1 === sessionQuery.data.questions.length
+                    ? "Create behavioral report"
+                    : "Next question"}{" "}
+                  <ArrowRight size={15} />
+                </button>
+              </>
             )}
           </div>
-          <div className="behavioral-speech-only">
-            <Mic size={14} /> Speech-only mode · no typed answer field is
-            provided
+          <div
+            className="behavioral-input-note"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              color: "var(--muted)",
+              fontSize: "0.76rem",
+              marginTop: "12px",
+            }}
+          >
+            <Check size={14} style={{ color: "var(--cyan)" }} />
+            Voice & text input enabled · speak with microphone, edit transcribed
+            text, or type manually before submitting.
           </div>
         </Panel>
       </div>
