@@ -1319,8 +1319,12 @@ export function LiveInterviewRoom() {
         setPhase("READY");
       } else {
         setPhase("RECOVERABLE_ERROR");
+        const raw = cause instanceof Error ? cause.message : String(cause || "");
+        const isNetwork = /failed to fetch|networkerror|load failed/i.test(raw);
         setError(
-          cause instanceof Error
+          isNetwork
+            ? "Unable to connect to the transcription server. Please check your connection or type your answer below."
+            : cause instanceof Error
             ? cause.message
             : "The completed recording could not be transcribed. You can retry transcription or type your answer below."
         );
@@ -1749,8 +1753,12 @@ export function LiveInterviewRoom() {
       await beginAdaptiveTurn(evaluated);
     } catch (cause) {
       setPhase("RECOVERABLE_ERROR");
+      const raw = cause instanceof Error ? cause.message : String(cause || "");
+      const isNetwork = /failed to fetch|networkerror|load failed/i.test(raw);
       setError(
-        cause instanceof Error
+        isNetwork
+          ? "Unable to connect to the interview server. Please check your connection and retry."
+          : cause instanceof Error
           ? cause.message
           : "Could not continue this saved answer; retry."
       );

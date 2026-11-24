@@ -2122,9 +2122,13 @@ export function InterviewRoom() {
             setText(initialTextRef.current);
             textRef.current = initialTextRef.current;
           }
+          const raw = sttErr?.message || String(sttErr || "");
+          const isNetwork = /failed to fetch|networkerror|load failed/i.test(raw);
           setError(
-            sttErr?.message ||
-              "Audio transcription could not be completed. Please try again or type your answer above."
+            isNetwork
+              ? "Unable to connect to the audio transcription server. Please verify your connection or type your answer above."
+              : sttErr?.message ||
+                "Audio transcription could not be completed. Please try again or type your answer above."
           );
         }
       } finally {
@@ -2318,9 +2322,13 @@ export function InterviewRoom() {
       } catch (err: any) {
         submittingRef.current = false;
         setSending(false);
+        const raw = err?.message || String(err || "");
+        const isNetwork = /failed to fetch|networkerror|load failed/i.test(raw);
         setError(
-          err?.message ||
-            "We couldn't save this answer. Your text is still here—please try again."
+          isNetwork
+            ? "Connection to the interview server failed. Your answer is preserved in the box—please check your connection and click Submit again."
+            : err?.message ||
+              "We couldn't save this answer. Your text is still here—please try again."
         );
         return;
       }
@@ -2396,8 +2404,12 @@ export function InterviewRoom() {
       console.warn("Evaluation step failed:", evalErr);
       submittingRef.current = false;
       setSending(false);
+      const raw = evalErr?.message || String(evalErr || "");
+      const isNetwork = /failed to fetch|networkerror|load failed/i.test(raw);
       setError(
-        "Your answer was saved successfully, but coaching evaluation is temporarily unavailable. You can retry evaluation or move to the next question."
+        isNetwork
+          ? "Your answer was saved, but recording the coaching evaluation hit a connection issue. Click Submit to retry."
+          : "Your answer was saved successfully, but coaching evaluation is temporarily unavailable. You can retry evaluation or move to the next question."
       );
       if (session?.id && current?.id) {
         if (user?.id) {

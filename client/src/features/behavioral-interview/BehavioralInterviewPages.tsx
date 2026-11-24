@@ -1429,8 +1429,12 @@ export function BehavioralRoom() {
       setRetryBlob(null);
       setProcessed(true);
     } catch (cause) {
+      const raw = cause instanceof Error ? cause.message : String(cause || "");
+      const isNetwork = /failed to fetch|networkerror|load failed/i.test(raw);
       setError(
-        cause instanceof Error
+        isNetwork
+          ? "Unable to connect to the interview server. Please check your connection and retry submitting."
+          : cause instanceof Error
           ? cause.message
           : "We couldn't save this answer. Please retry submitting."
       );

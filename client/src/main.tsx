@@ -23,11 +23,23 @@ const trpcClient = trpc.createClient({
         const token = await currentAccessToken();
         return token ? { Authorization: `Bearer ${token}` } : {};
       },
-      fetch(input, init) {
-        return globalThis.fetch(input, {
-          ...(init ?? {}),
-          credentials: "include",
-        });
+      async fetch(input, init) {
+        try {
+          return await globalThis.fetch(input, {
+            ...(init ?? {}),
+            credentials: "include",
+          });
+        } catch (fetchErr: any) {
+          const raw = fetchErr?.message || String(fetchErr || "");
+          if (/failed to fetch|networkerror|load failed/i.test(raw)) {
+            await new Promise(r => setTimeout(r, 450));
+            return await globalThis.fetch(input, {
+              ...(init ?? {}),
+              credentials: "include",
+            });
+          }
+          throw fetchErr;
+        }
       },
     }),
   ],
