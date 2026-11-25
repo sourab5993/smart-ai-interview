@@ -36,6 +36,7 @@ import {
 } from "recharts";
 import { getSupabase } from "@/lib/supabase";
 import { useSupabaseAuth } from "@/contexts/SupabaseAuthContext";
+import { useMicrophoneInput } from "@/hooks/useMicrophoneInput";
 import { trpc } from "@/lib/trpc";
 import {
   courseGroups,
@@ -1518,12 +1519,47 @@ export function InterviewRoom() {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animFrameRef = useRef<number | null>(null);
   const [micVolume, setMicVolume] = useState(0);
+  const peakMicVolumeRef = useRef(0);
+  const hasAnalyserRef = useRef(false);
+  const {
+    audioInputs,
+    selectedMicId,
+    selectMicDevice,
+    micDiagnostic,
+    setMicDiagnostic,
+    trackMutedRef,
+    acquireVerifiedMicStream,
+    recheckMicrophone: runMicRecheck,
+  } = useMicrophoneInput(mode === "voice");
+  const recheckMicrophone = useCallback(async () => {
+    const res = await runMicRecheck();
+    if (res.ok) {
+      setError("");
+    } else {
+      setError(res.error);
+    }
+  }, [runMicRecheck]);
   const speechRecognitionTextRef = useRef("");
   const recordingSessionIdRef = useRef(0);
   const initialTextRef = useRef("");
   const userEditedDuringRecordingRef = useRef(false);
   const speechSessionFinalsRef = useRef<string[]>([]);
   const speechSessionInterimRef = useRef("");
+  const activeEngineFinalsRef = useRef("");
+  const answeredCount = useMemo(
+    () => answers.filter(a => a.answer_text.trim().length > 0).length,
+    [answers]
+  );
+  const evaluatedCount = useMemo(
+    () =>
+      Object.values(evaluations).filter(
+        e =>
+          e != null &&
+          typeof e.overall_score === "number" &&
+          !isNaN(e.overall_score)
+      ).length,
+    [evaluations]
+  );
   const finish = useCallback(async () => {
     if (!session || !userId || finalizing.current) return;
     finalizing.current = true;
@@ -1543,6 +1579,7 @@ export function InterviewRoom() {
           questions,
           answers,
           evaluations,
+          evaluate: payload => evaluate.mutateAsync(payload),
           summarize: payload => analyze.mutateAsync(payload),
         });
         navigate(`/report/${session.id}`);
@@ -1567,7 +1604,7 @@ export function InterviewRoom() {
       finalizing.current = false;
       setSending(false);
     }
-  }, [analyze, answers, evaluations, navigate, questions, session, userId]);
+  }, [analyze, answers, evaluate, evaluations, navigate, questions, session, userId]);
   useEffect(() => {
     if (!userId) return;
     let live = true;
@@ -1738,72 +1775,25 @@ export function InterviewRoom() {
   const timeLabel = `${String(Math.floor(minutesLeft / 60)).padStart(2, "0")}:${String(minutesLeft % 60).padStart(2, "0")}`;
   async function beginVoice() {
     setError("");
-    if (
-      typeof window !== "undefined" &&
-      !window.isSecureContext &&
-      window.location.hostname !== "localhost" &&
-      window.location.hostname !== "127.0.0.1"
-    ) {
-      setError(
-        "Microphone access requires a secure connection (HTTPS). Please open this site using HTTPS or type your answer."
-      );
+    const micCheck = await acquireVerifiedMicStream();
+    if (!micCheck.ok) {
+      isRecordingRef.current = false;
+      setRecording(false);
+      setError(micCheck.error);
       return;
     }
-
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setError(
-        "Audio recording is not supported in this browser. Please use Chrome, Edge, Safari, or type your answer above."
-      );
-      return;
-    }
-
-    let stream: MediaStream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-    } catch (constraintErr) {
-      console.warn("Advanced mic constraints rejected, retrying with simple audio:", constraintErr);
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      } catch (micErr: any) {
-        console.error("Microphone getUserMedia failed:", micErr);
-        isRecordingRef.current = false;
-        setRecording(false);
-        if (
-          micErr?.name === "NotAllowedError" ||
-          micErr?.name === "PermissionDeniedError"
-        ) {
-          setError(
-            "Microphone permission was denied. Please allow microphone access in your browser settings to use voice mode, or type your answer."
-          );
-        } else if (
-          micErr?.name === "NotFoundError" ||
-          micErr?.name === "DevicesNotFoundError"
-        ) {
-          setError(
-            "No microphone was found on this device. Please connect a microphone or type your answer above."
-          );
-        } else {
-          setError(
-            `Could not access your microphone (${micErr?.message || "device error"}). Please check your microphone settings or type your answer above.`
-          );
-        }
-        return;
-      }
-    }
+    const stream = micCheck.stream;
 
     const sessionId = ++recordingSessionIdRef.current;
     initialTextRef.current = textRef.current;
     userEditedDuringRecordingRef.current = false;
     speechSessionFinalsRef.current = [];
     speechSessionInterimRef.current = "";
+    activeEngineFinalsRef.current = "";
     audioChunks.current = [];
     speechRecognitionTextRef.current = "";
+    peakMicVolumeRef.current = 0;
+    hasAnalyserRef.current = false;
 
     audioStream.current = stream;
     isRecordingRef.current = true;
@@ -1818,11 +1808,15 @@ export function InterviewRoom() {
       if (AudioCtx) {
         const actx = new AudioCtx();
         audioContextRef.current = actx;
+        if (actx.state === "suspended") {
+          void actx.resume();
+        }
         const src = actx.createMediaStreamSource(stream);
         const analyser = actx.createAnalyser();
         analyser.fftSize = 128;
         src.connect(analyser);
         analyserRef.current = analyser;
+        hasAnalyserRef.current = true;
         const dataArr = new Uint8Array(analyser.frequencyBinCount);
 
         const updateVolume = () => {
@@ -1831,7 +1825,11 @@ export function InterviewRoom() {
           let sum = 0;
           for (let i = 0; i < dataArr.length; i++) sum += dataArr[i];
           const avg = sum / dataArr.length;
-          setMicVolume(Math.min(100, Math.round((avg / 128) * 100)));
+          const vol = Math.min(100, Math.round((avg / 128) * 100));
+          if (vol > peakMicVolumeRef.current) {
+            peakMicVolumeRef.current = vol;
+          }
+          setMicVolume(vol);
           animFrameRef.current = requestAnimationFrame(updateVolume);
         };
         animFrameRef.current = requestAnimationFrame(updateVolume);
@@ -1901,7 +1899,7 @@ export function InterviewRoom() {
             if (recordingSessionIdRef.current !== sessionId || !isRecordingRef.current) return;
             let currentFinal = "";
             let currentInterim = "";
-            for (let i = event.resultIndex; i < event.results.length; i++) {
+            for (let i = 0; i < event.results.length; i++) {
               const res = event.results[i];
               const transcriptChunk = res[0]?.transcript || "";
               if (res.isFinal) {
@@ -1910,12 +1908,7 @@ export function InterviewRoom() {
                 currentInterim += `${transcriptChunk} `;
               }
             }
-            if (currentFinal.trim()) {
-              const cleaned = currentFinal.trim();
-              if (!isSilenceHallucination(cleaned)) {
-                speechSessionFinalsRef.current.push(cleaned);
-              }
-            }
+            activeEngineFinalsRef.current = currentFinal.trim();
             speechSessionInterimRef.current = currentInterim.trim();
             setInterim(currentInterim.trim());
 
@@ -1923,6 +1916,7 @@ export function InterviewRoom() {
             if (!userEditedDuringRecordingRef.current) {
               const previewSpeech = [
                 ...speechSessionFinalsRef.current,
+                currentFinal.trim(),
                 currentInterim.trim(),
               ]
                 .filter(Boolean)
@@ -1935,21 +1929,54 @@ export function InterviewRoom() {
               setText(fullPreview);
               textRef.current = fullPreview;
               speechRecognitionTextRef.current = previewSpeech;
+              if (fullPreview.trim().length > 0) {
+                setError("");
+              }
             }
           };
           r.onerror = (event: any) => {
             if (recordingSessionIdRef.current !== sessionId || !isRecordingRef.current) return;
-            if (event?.error === "no-speech") return;
-            console.warn("Speech error notice:", event?.error);
+            const errName = event?.error;
+            console.error("[SpeechRecognition onerror]:", errName, event);
+            if (errName === "no-speech") return;
+            if (errName === "not-allowed" || errName === "service-not-allowed") {
+              setError(
+                "Microphone access for speech recognition was blocked or denied. Please check your browser and system microphone permissions."
+              );
+            } else if (errName === "audio-capture") {
+              setError(
+                "No microphone device was detected or audio capture failed. Please check your microphone connection."
+              );
+            } else if (errName === "network") {
+              console.warn("Speech recognition network error; hardware audio recording is still active.");
+            }
           };
           r.onend = () => {
             if (recordingSessionIdRef.current !== sessionId || !isRecordingRef.current) return;
+
+            // Harvest any final and interim text so partial speech is NEVER lost when onend fires
+            if (activeEngineFinalsRef.current.trim()) {
+              const cleaned = activeEngineFinalsRef.current.trim();
+              if (!isSilenceHallucination(cleaned)) {
+                speechSessionFinalsRef.current.push(cleaned);
+              }
+              activeEngineFinalsRef.current = "";
+            }
+            if (speechSessionInterimRef.current.trim()) {
+              const pending = speechSessionInterimRef.current.trim();
+              if (!isSilenceHallucination(pending)) {
+                speechSessionFinalsRef.current.push(pending);
+              }
+              speechSessionInterimRef.current = "";
+            }
+
+            // If the user hasn't clicked "Stop", automatically restart recognition
             if (voiceRestartTimer.current) clearTimeout(voiceRestartTimer.current);
             voiceRestartTimer.current = setTimeout(() => {
               if (isRecordingRef.current && recordingSessionIdRef.current === sessionId) {
                 startSpeechEngine();
               }
-            }, 150);
+            }, 100);
           };
           r.start();
         } catch (err) {
@@ -1988,6 +2015,13 @@ export function InterviewRoom() {
     } catch {}
     recognition.current = null;
 
+    if (activeEngineFinalsRef.current.trim()) {
+      const cleaned = activeEngineFinalsRef.current.trim();
+      if (!isSilenceHallucination(cleaned)) {
+        speechSessionFinalsRef.current.push(cleaned);
+      }
+      activeEngineFinalsRef.current = "";
+    }
     if (speechSessionInterimRef.current.trim()) {
       const pending = speechSessionInterimRef.current.trim();
       if (!isSilenceHallucination(pending)) {
@@ -2061,9 +2095,24 @@ export function InterviewRoom() {
     const currentAnswer = textRef.current.trim();
     const hasValidExistingAnswer =
       currentAnswer.length >= 2 && !isSilenceHallucination(currentAnswer);
+    const wasPureSilence = hasAnalyserRef.current && peakMicVolumeRef.current < 2;
+    const isValidAudio = Boolean(
+      audioBlob && audioBlob.size >= 5000 && durationMs >= 500 && !wasPureSilence
+    );
 
-    // 1. Authoritative Backend Transcription
-    if (audioBlob && audioBlob.size > 200 && durationMs >= 500) {
+    // 1. If browser speech recognition already captured words in this turn, use them immediately
+    // or use backend transcription when a valid non-silent audio recording is available
+    if (hasBrowserSpeech) {
+      if (!userEditedDuringRecordingRef.current) {
+        const finalAnswer = baseText
+          ? `${baseText} ${browserCandidate}`
+          : browserCandidate;
+        setText(finalAnswer);
+        textRef.current = finalAnswer;
+      }
+      setMicDiagnostic("");
+      setError("");
+    } else if (isValidAudio && audioBlob) {
       setTranscribing(true);
       try {
         const arrayBuf = await audioBlob.arrayBuffer();
@@ -2077,7 +2126,6 @@ export function InterviewRoom() {
 
         const authoritativeText = result?.text?.trim() || "";
         if (authoritativeText && !isSilenceHallucination(authoritativeText)) {
-          // Authoritative backend transcript accepted
           if (!userEditedDuringRecordingRef.current) {
             const finalAnswer = baseText
               ? `${baseText} ${authoritativeText}`
@@ -2085,64 +2133,49 @@ export function InterviewRoom() {
             setText(finalAnswer);
             textRef.current = finalAnswer;
           }
+          setMicDiagnostic("");
           setError("");
-        } else if (hasBrowserSpeech) {
-          // Backend returned empty but browser recognition had genuine words from this session
-          if (!userEditedDuringRecordingRef.current) {
-            const finalAnswer = baseText
-              ? `${baseText} ${browserCandidate}`
-              : browserCandidate;
-            setText(finalAnswer);
-            textRef.current = finalAnswer;
-          }
+        } else if (hasValidExistingAnswer) {
           setError("");
+        } else if (mode === "voice" && !userEditedDuringRecordingRef.current && durationMs >= 1500) {
+          setMicDiagnostic(trackMutedRef.current ? "muted-track" : "no-speech");
+          setError(
+            trackMutedRef.current
+              ? "Your microphone track was muted during recording. Unmute your mic or switch input device, or switch to TEXT."
+              : "No clear speech was heard before stopping. Speak closer to your microphone, switch input device, or switch to TEXT."
+          );
         } else {
-          // No new clear speech detected from this recording attempt
-          if (!userEditedDuringRecordingRef.current) {
-            setText(initialTextRef.current);
-            textRef.current = initialTextRef.current;
-          }
-          // Only show speech validation error if mode is voice AND there is no existing valid answer
-          if (mode === "voice" && !hasValidExistingAnswer && !userEditedDuringRecordingRef.current) {
-            setError(
-              "No clear speech was detected. Please speak into your microphone or type your answer above."
-            );
-          } else {
-            setError("");
-          }
+          setError("");
         }
       } catch (sttErr: any) {
         console.warn("Backend transcription failed:", sttErr);
         if (recordingSessionIdRef.current !== sessionId) return;
 
-        if (hasBrowserSpeech) {
-          // Fallback to browser transcript for this session
-          if (!userEditedDuringRecordingRef.current) {
-            const finalAnswer = baseText
-              ? `${baseText} ${browserCandidate}`
-              : browserCandidate;
-            setText(finalAnswer);
-            textRef.current = finalAnswer;
-          }
-          setError("");
+        if (hasValidExistingAnswer) {
+          const raw = sttErr?.message || String(sttErr || "");
+          const is429 = /429|quota|rate limit|too many requests/i.test(raw);
+          setError(
+            is429
+              ? "Transcription quota reached. Your current answer is preserved — edit or submit anytime."
+              : ""
+          );
+        } else if (mode === "voice" && !userEditedDuringRecordingRef.current && durationMs >= 1500) {
+          const raw = sttErr?.message || String(sttErr || "");
+          const is429 = /429|quota|rate limit|too many requests/i.test(raw);
+          const isTimeout = /timeout|timed out|abort/i.test(raw);
+          const isNetwork = /failed to fetch|networkerror|load failed/i.test(raw);
+          setError(
+            is429
+              ? "Transcription quota reached. You can speak again or type your answer above."
+              : isTimeout
+                ? "Audio transcription timed out. You can speak again or type your answer above."
+                : isNetwork
+                  ? "Unable to connect to the audio transcription server. Please verify your connection or type your answer above."
+                  : sttErr?.message ||
+                    "Audio transcription could not be completed. Please try again or type your answer above."
+          );
         } else {
-          // Preserve existing text and only show error if no valid text exists and in voice mode
-          if (!userEditedDuringRecordingRef.current) {
-            setText(initialTextRef.current);
-            textRef.current = initialTextRef.current;
-          }
-          if (mode === "voice" && !hasValidExistingAnswer && !userEditedDuringRecordingRef.current) {
-            const raw = sttErr?.message || String(sttErr || "");
-            const isNetwork = /failed to fetch|networkerror|load failed/i.test(raw);
-            setError(
-              isNetwork
-                ? "Unable to connect to the audio transcription server. Please verify your connection or type your answer above."
-                : sttErr?.message ||
-                  "Audio transcription could not be completed. Please try again or type your answer above."
-            );
-          } else {
-            setError("");
-          }
+          setError("");
         }
       } finally {
         if (recordingSessionIdRef.current === sessionId) {
@@ -2150,33 +2183,24 @@ export function InterviewRoom() {
         }
       }
     } else if (wasRecording) {
-      if (hasBrowserSpeech) {
-        if (!userEditedDuringRecordingRef.current) {
-          const finalAnswer = baseText
-            ? `${baseText} ${browserCandidate}`
-            : browserCandidate;
-          setText(finalAnswer);
-          textRef.current = finalAnswer;
-        }
+      if (hasValidExistingAnswer) {
         setError("");
-      } else {
-        if (!userEditedDuringRecordingRef.current) {
-          setText(initialTextRef.current);
-          textRef.current = initialTextRef.current;
-        }
-        if (mode === "voice" && !hasValidExistingAnswer && !userEditedDuringRecordingRef.current) {
-          if (durationMs < 500 || !audioBlob || audioBlob.size <= 200) {
-            setError(
-              "Recording was too short. Please speak after clicking 'Start answer' or type your answer above."
-            );
-          } else {
-            setError(
-              "No clear speech was detected. Please speak into your microphone or type your answer above."
-            );
-          }
+      } else if (mode === "voice" && !userEditedDuringRecordingRef.current) {
+        if (trackMutedRef.current) {
+          setMicDiagnostic("muted-track");
+          setError(
+            "Your microphone track was muted during recording. Unmute your mic (or pick another input device) and try again, or switch to TEXT."
+          );
+        } else if (durationMs >= 1000 || wasPureSilence) {
+          setMicDiagnostic("no-speech");
+          setError(
+            "No speech was heard before stopping. Speak closer to your microphone, switch input device, or switch to TEXT."
+          );
         } else {
           setError("");
         }
+      } else {
+        setError("");
       }
     }
   }
@@ -2377,8 +2401,8 @@ export function InterviewRoom() {
           criteria,
           language: session.language as "English" | "Hindi" | "Hinglish",
         });
-        if (evalRes?.source === "ai") {
-          result = evalRes;
+        if (evalRes?.source === "ai" || (evalRes && typeof evalRes.overall_score === "number")) {
+          result = { ...evalRes, source: "ai" };
           evalSuccess = true;
           break;
         }
@@ -2423,6 +2447,7 @@ export function InterviewRoom() {
       }
       setEvaluations(e => ({ ...e, [current.id]: result! }));
       setLatestEval(result);
+      setError("");
     } catch (evalErr: any) {
       console.warn("Evaluation step failed:", evalErr);
       submittingRef.current = false;
@@ -2546,19 +2571,38 @@ export function InterviewRoom() {
           </span>
           <h2>Ready to wrap up?</h2>
           <p className="muted">
-            You evaluated{" "}
-            {
-              Object.keys(evaluations).filter(
-                k =>
-                  evaluations[k] != null &&
-                  typeof evaluations[k].overall_score === "number" &&
-                  !isNaN(evaluations[k].overall_score)
-              ).length
-            }{" "}
-            of {questions.length} questions. Your report will summarize
+            You evaluated {evaluatedCount} of {questions.length} questions. Your report will summarize
             completed answers and highlight useful next steps.
           </p>
-          {error && <div className="notice notice-error">{error}</div>}
+          {error && (
+            <div className="notice notice-error">
+              <div>{error}</div>
+              {micDiagnostic && (
+                <div style={{ display: "flex", gap: "8px", marginTop: "8px", flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    onClick={() => void recheckMicrophone()}
+                    disabled={sending || transcribing || recording}
+                  >
+                    <RotateCcw size={13} /> Re-check mic
+                  </button>
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    onClick={() => {
+                      if (recording) void stopVoice();
+                      setError("");
+                      setMicDiagnostic("");
+                      setMode("text");
+                    }}
+                  >
+                    Switch to TEXT
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
           <button
             className="button button-primary"
             disabled={sending}
@@ -2637,6 +2681,7 @@ export function InterviewRoom() {
               className={mode === "text" ? "active" : ""}
               onClick={() => {
                 if (recording) void stopVoice();
+                setMicDiagnostic("");
                 setError(prev =>
                   prev.includes("speech") ||
                   prev.includes("microphone") ||
@@ -2652,6 +2697,7 @@ export function InterviewRoom() {
             <button
               className={mode === "voice" ? "active" : ""}
               onClick={() => {
+                setMicDiagnostic("");
                 setError(prev =>
                   prev.includes("speech") ||
                   prev.includes("microphone") ||
@@ -2672,10 +2718,61 @@ export function InterviewRoom() {
               <Volume2 size={14} /> Repeat
             </button>
           </div>
+          {mode === "voice" && (audioInputs.length > 1 || micDiagnostic) && !recording && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "8px",
+                flexWrap: "wrap",
+                marginBottom: "10px",
+                fontSize: "0.8rem",
+              }}
+            >
+              {audioInputs.length > 1 && (
+                <label style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+                  <span>Mic:</span>
+                  <select
+                    aria-label="Microphone input device"
+                    className="input"
+                    style={{
+                      padding: "4px 8px",
+                      fontSize: "0.8rem",
+                      borderRadius: "6px",
+                      maxWidth: "240px",
+                    }}
+                    value={selectedMicId}
+                    disabled={sending || transcribing}
+                    onChange={e => {
+                      selectMicDevice(e.target.value);
+                      setError("");
+                    }}
+                  >
+                    <option value="">System default microphone</option>
+                    {audioInputs.map(dev => (
+                      <option key={dev.deviceId} value={dev.deviceId}>
+                        {dev.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              <button
+                type="button"
+                className="button button-secondary"
+                style={{ padding: "4px 10px", fontSize: "0.78rem", marginLeft: "auto" }}
+                onClick={() => void recheckMicrophone()}
+                disabled={sending || transcribing}
+              >
+                <RotateCcw size={12} /> Re-check mic
+              </button>
+            </div>
+          )}
           <textarea
             className="answer-box"
             maxLength={12000}
-            value={recording && interim ? (text ? `${text} ${interim}` : interim) : text}
+            value={text}
             onChange={e => {
               setError("");
               interimRef.current = "";
@@ -2742,7 +2839,35 @@ export function InterviewRoom() {
               </>
             )}
           </div>
-          {error && <div className="notice notice-error">{error}</div>}
+          {error && (
+            <div className="notice notice-error">
+              <div>{error}</div>
+              {micDiagnostic && (
+                <div style={{ display: "flex", gap: "8px", marginTop: "8px", flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    onClick={() => void recheckMicrophone()}
+                    disabled={sending || transcribing || recording}
+                  >
+                    <RotateCcw size={13} /> Re-check mic
+                  </button>
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    onClick={() => {
+                      if (recording) void stopVoice();
+                      setError("");
+                      setMicDiagnostic("");
+                      setMode("text");
+                    }}
+                  >
+                    Switch to TEXT
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
           <div className="room-actions">
             <button
               className="button button-primary"
@@ -2936,6 +3061,135 @@ function ShieldCheckIcon() {
   return <Check size={12} />;
 }
 
+export function useReportMetrics(
+  answers: any[],
+  report: any,
+  session?: SessionRow | null,
+  performanceMetrics?: any[]
+) {
+  return useMemo(() => {
+    const evaluated = answers.filter(
+      a =>
+        a.evaluation?.source === "ai" ||
+        (typeof a.evaluation?.overall_score === "number" &&
+          !isNaN(a.evaluation.overall_score))
+    );
+    const answeredCount = answers.filter(a => a.answer.trim().length > 0).length;
+    const answerQuality = evaluated.length
+      ? Math.round(
+          evaluated.reduce((s, a) => s + a.evaluation.overall_score, 0) /
+            evaluated.length
+        )
+      : null;
+    const calculatedScore =
+      answerQuality === null
+        ? null
+        : completionAdjustedScore(answerQuality, evaluated.length, answers.length);
+    const score =
+      calculatedScore !== null
+        ? calculatedScore
+        : typeof session?.overall_score === "number" && !isNaN(session.overall_score)
+          ? session.overall_score
+          : null;
+    const reportHasTrustedSource = report?.analysisSource === "ai";
+    const savedReportSummary =
+      reportHasTrustedSource && typeof report?.summary === "string"
+        ? report.summary
+        : null;
+    const reportSummary =
+      score === null
+        ? savedReportSummary ||
+          (answeredCount
+            ? `${answeredCount} responses were saved, but none has a supported AI evaluation. No score is available.`
+            : "No answers were evaluated. No score is available.")
+        : evaluated.length < answers.length
+          ? `You saved ${answeredCount} of ${answers.length} responses; ${evaluated.length} received AI evaluation. Answer quality was ${answerQuality || score}/100, and the session score is ${score}/100 after accounting for completion.`
+          : savedReportSummary ||
+            `You completed ${evaluated.length} AI-evaluated answer${evaluated.length === 1 ? "" : "s"}. Use the notes below to choose your next practice step.`;
+    const dimensionMap = new Map<string, number[]>();
+    for (const answer of evaluated)
+      for (const d of answer.evaluation?.dimensions || []) {
+        const name = d.name?.trim().slice(0, 80);
+        const sVal = Number(d.score);
+        if (name && !isNaN(sVal)) {
+          dimensionMap.set(name, [...(dimensionMap.get(name) || []), sVal]);
+        }
+      }
+    if (
+      dimensionMap.size === 0 &&
+      Array.isArray(performanceMetrics) &&
+      performanceMetrics.length > 0
+    ) {
+      for (const pm of performanceMetrics) {
+        const name = pm.metric_name?.trim().slice(0, 80);
+        const val = Number(pm.metric_value);
+        if (name && !isNaN(val)) {
+          dimensionMap.set(name, [val]);
+        }
+      }
+    }
+    const radar = Array.from(dimensionMap.entries()).map(([subject, values]) => ({
+      subject,
+      score: Math.round(values.reduce((a, b) => a + b, 0) / values.length),
+      fullMark: 100,
+    }));
+    const repeatedMistakes =
+      reportHasTrustedSource && Array.isArray(report?.repeated_mistakes)
+        ? report.repeated_mistakes
+        : [];
+    const missingConcepts =
+      reportHasTrustedSource && Array.isArray(report?.missing_concepts)
+        ? report.missing_concepts
+        : [];
+    const savedCommunication =
+      reportHasTrustedSource && Array.isArray(report?.communication_issues)
+        ? report.communication_issues
+        : [];
+    const reportStrengths =
+      reportHasTrustedSource && Array.isArray(report?.strengths)
+        ? report.strengths
+        : evaluated.flatMap(a => a.evaluation?.strengths || []).slice(0, 3);
+    const reportWeaknesses =
+      reportHasTrustedSource && Array.isArray(report?.weaknesses)
+        ? report.weaknesses
+        : evaluated.flatMap(a => a.evaluation?.weaknesses || []).slice(0, 3);
+    const savedNextStep =
+      reportHasTrustedSource && Array.isArray(report?.next_steps)
+        ? report.next_steps[0]
+        : null;
+    const observedCommunication = evaluated.flatMap((answer: any) =>
+      (answer.evaluation?.dimensions || [])
+        .filter(
+          (dimension: any) =>
+            dimension.measure === "communication" && Number(dimension.score) < 70
+        )
+        .map(
+          (dimension: any) =>
+            `${dimension.name}: ${dimension.note || `${dimension.score}/100`}`
+        )
+    );
+    const communicationIssues = Array.from(
+      new Set([...savedCommunication, ...observedCommunication])
+    ).slice(0, 5);
+
+    return {
+      evaluated,
+      answeredCount,
+      answerQuality,
+      score,
+      reportHasTrustedSource,
+      reportSummary,
+      radar,
+      repeatedMistakes,
+      missingConcepts,
+      reportStrengths,
+      reportWeaknesses,
+      savedNextStep,
+      communicationIssues,
+    };
+  }, [answers, report, session, performanceMetrics]);
+}
+
 export function ReportPage() {
   const params = useParams<{ id: string }>();
   const id = params?.id || "";
@@ -2943,12 +3197,18 @@ export function ReportPage() {
   const userId = user?.id;
   const [session, setSession] = useState<SessionRow | null>(null);
   const [answers, setAnswers] = useState<any[]>([]);
+  const [performanceMetrics, setPerformanceMetrics] = useState<any[]>([]);
   const [report, setReport] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [recovering, setRecovering] = useState(false);
+  const recoveringRef = useRef(false);
   const [saved, setSaved] = useState(false);
   const [bookmarkBusy, setBookmarkBusy] = useState(false);
   const [bookmarkError, setBookmarkError] = useState("");
   const [, navigate] = useLocation();
+
+  const evaluateMutation = trpc.ai.evaluateAnswer.useMutation();
+  const analyzeMutation = trpc.ai.analyzeInterview.useMutation();
   async function toggleReportBookmark() {
     if (!user || !session || bookmarkBusy) return;
     setBookmarkBusy(true);
@@ -2991,7 +3251,7 @@ export function ReportPage() {
     void (async () => {
       try {
         const c = await getSupabase();
-        const [s, q, a, r, b] = await Promise.all([
+        const [s, q, a, evals, pm, r, b] = await Promise.all([
           c
             .from("interview_sessions")
             .select("*")
@@ -3010,6 +3270,16 @@ export function ReportPage() {
             .eq("session_id", id)
             .eq("owner_id", userId),
           c
+            .from("answer_evaluations")
+            .select("*,interview_answers!inner(question_id)")
+            .eq("owner_id", userId)
+            .eq("interview_answers.session_id", id),
+          c
+            .from("performance_metrics")
+            .select("metric_name,metric_value")
+            .eq("owner_id", userId)
+            .eq("session_id", id),
+          c
             .from("interview_reports")
             .select("analysis")
             .eq("session_id", id)
@@ -3025,14 +3295,49 @@ export function ReportPage() {
         ]);
         if (!live) return;
         setSession(s.data as SessionRow | null);
+
+        const evalMap = new Map<string, any>();
+        for (const e of ((evals?.data || []) as any[])) {
+          const qid = e.interview_answers?.question_id;
+          if (qid) evalMap.set(qid, e);
+        }
+
         const arr = [];
         for (const qrow of q.data || []) {
           const ar = (a.data || []).find((x: any) => x.question_id === qrow.id);
-          const storedEvaluation = ar?.answer_evaluations?.[0];
-          const evaluation = storedEvaluation?.source === "ai"
+          const rawEmbedded = ar?.answer_evaluations;
+          const embeddedEval = Array.isArray(rawEmbedded)
+            ? rawEmbedded[0]
+            : rawEmbedded && typeof rawEmbedded === "object"
+              ? rawEmbedded
+              : null;
+          const storedEvaluation = evalMap.get(qrow.id) || embeddedEval;
+
+          const isAiSource =
+            storedEvaluation?.source === "ai" ||
+            (storedEvaluation &&
+              typeof storedEvaluation.overall_score === "number" &&
+              !isNaN(storedEvaluation.overall_score));
+
+          const evaluation = isAiSource
             ? {
                 ...storedEvaluation,
-                source: "ai",
+                overall_score: Number(storedEvaluation.overall_score),
+                dimensions: Array.isArray(storedEvaluation.dimensions)
+                  ? storedEvaluation.dimensions
+                  : [],
+                strengths: Array.isArray(storedEvaluation.strengths)
+                  ? storedEvaluation.strengths
+                  : [],
+                weaknesses: Array.isArray(storedEvaluation.weaknesses)
+                  ? storedEvaluation.weaknesses
+                  : [],
+                missing_points: Array.isArray(storedEvaluation.missing_points)
+                  ? storedEvaluation.missing_points
+                  : [],
+                better_answer: storedEvaluation.better_answer || "",
+                improvement_tip: storedEvaluation.improvement_tip || "",
+                source: "ai" as const,
                 modelVersion:
                   storedEvaluation.model_version ??
                   storedEvaluation.modelVersion ??
@@ -3052,11 +3357,12 @@ export function ReportPage() {
             answer: ar?.answer_text || "",
             evaluation,
             evaluationUnavailable: Boolean(
-              storedEvaluation && storedEvaluation.source !== "ai"
+              storedEvaluation && storedEvaluation.source !== "ai" && !isAiSource
             ),
           });
         }
         setAnswers(arr);
+        setPerformanceMetrics(pm?.data || []);
         setReport(r.data?.analysis || null);
         setSaved(Boolean(b.data));
       } catch {
@@ -3069,6 +3375,210 @@ export function ReportPage() {
       live = false;
     };
   }, [id, userId]);
+
+  useEffect(() => {
+    if (loading || recoveringRef.current || !userId || !session || session.status !== "completed") return;
+    const unevaluatedItems = answers.filter(
+      a =>
+        a.answer?.trim() &&
+        (!a.evaluation ||
+          (a.evaluation.source !== "ai" &&
+            typeof a.evaluation.overall_score !== "number"))
+    );
+    if (unevaluatedItems.length === 0) return;
+
+    recoveringRef.current = true;
+    setRecovering(true);
+    let active = true;
+
+    void (async () => {
+      try {
+        const c = await getSupabase();
+        const rubricCriteria = evaluationCriteriaFromContext(session.context_notes || "");
+        const recoveredEvaluations: Record<string, any> = {};
+
+        for (const item of unevaluatedItems) {
+          if (!active) break;
+          try {
+            const evalRes = await evaluateMutation.mutateAsync({
+              question: item.question_text,
+              answer: item.answer,
+              course: session.course,
+              role: session.target_role,
+              type: session.interview_type,
+              specialization: session.specialization,
+              semester: session.semester,
+              skills: session.skills || [],
+              criteria: rubricCriteria,
+              language: (session.language as "English" | "Hindi" | "Hinglish") || "English",
+            });
+            if (evalRes && Number.isFinite(Number(evalRes.overall_score))) {
+              recoveredEvaluations[item.id] = evalRes;
+              const { data: answerRow } = await c
+                .from("interview_answers")
+                .select("id")
+                .eq("session_id", id)
+                .eq("question_id", item.id)
+                .eq("owner_id", userId)
+                .maybeSingle();
+
+              if (answerRow?.id) {
+                await c.from("answer_evaluations").upsert(
+                  {
+                    owner_id: userId,
+                    answer_id: answerRow.id,
+                    overall_score: evalRes.overall_score,
+                    dimensions: evalRes.dimensions || [],
+                    strengths: evalRes.strengths || [],
+                    weaknesses: evalRes.weaknesses || [],
+                    missing_points: evalRes.missing_points || [],
+                    better_answer: evalRes.better_answer || "",
+                    improvement_tip: evalRes.improvement_tip || "",
+                    source: evalRes.source || "ai",
+                    model_version: evalRes.modelVersion || null,
+                    prompt_version: evalRes.promptVersion || null,
+                    rubric_version: evalRes.rubricVersion || null,
+                  },
+                  { onConflict: "answer_id" }
+                );
+              }
+            }
+          } catch (evalErr) {
+            console.warn("Retrospective evaluation failed for question", item.id, evalErr);
+          }
+        }
+
+        if (!active) return;
+        if (Object.keys(recoveredEvaluations).length > 0) {
+          let allEvaluated: any[] = [];
+          setAnswers(prevAnswers => {
+            const updated = prevAnswers.map(a => {
+              const newEval = recoveredEvaluations[a.id];
+              if (newEval) {
+                return {
+                  ...a,
+                  evaluation: {
+                    ...newEval,
+                    source: "ai" as const,
+                  },
+                  evaluationUnavailable: false,
+                };
+              }
+              return a;
+            });
+            allEvaluated = updated.filter(
+              a =>
+                a.evaluation?.source === "ai" ||
+                (typeof a.evaluation?.overall_score === "number" &&
+                  !isNaN(a.evaluation.overall_score))
+            );
+            return updated;
+          });
+
+          if (allEvaluated.length > 0) {
+            const avgQuality = Math.round(
+              allEvaluated.reduce((sum, a) => sum + a.evaluation.overall_score, 0) /
+                allEvaluated.length
+            );
+            const newScore = completionAdjustedScore(
+              avgQuality,
+              allEvaluated.length,
+              answers.length
+            );
+
+            await c
+              .from("interview_sessions")
+              .update({ overall_score: newScore })
+              .eq("id", id)
+              .eq("owner_id", userId);
+
+            setSession(prev => (prev ? { ...prev, overall_score: newScore } : null));
+
+            const dimensionMap = new Map<string, number[]>();
+            for (const a of allEvaluated) {
+              for (const d of a.evaluation.dimensions || []) {
+                const name = d.name?.trim().slice(0, 80);
+                if (name) {
+                  dimensionMap.set(name, [
+                    ...(dimensionMap.get(name) || []),
+                    Math.max(0, Math.min(100, Number(d.score) || 0)),
+                  ]);
+                }
+              }
+            }
+            const dimRecords = Array.from(dimensionMap.entries()).map(([name, values]) => ({
+              owner_id: userId,
+              session_id: id,
+              metric_name: name,
+              metric_value: Math.round(values.reduce((s, v) => s + v, 0) / values.length),
+              category: name,
+            }));
+            if (dimRecords.length > 0) {
+              await c
+                .from("performance_metrics")
+                .upsert(dimRecords, { onConflict: "owner_id,session_id,metric_name" });
+              setPerformanceMetrics(dimRecords);
+            }
+
+            if (!report || report.analysisSource !== "ai") {
+              try {
+                const answerSet = allEvaluated.map(a => ({
+                  question: a.question_text,
+                  answer: a.answer,
+                  score: a.evaluation.overall_score,
+                }));
+                const summaryAnalysis = await analyzeMutation.mutateAsync({
+                  course: session.course,
+                  role: session.target_role,
+                  answers: answerSet.slice(0, 12),
+                });
+                if (summaryAnalysis) {
+                  const finalAnalysis = {
+                    ...summaryAnalysis,
+                    analysisSource: "ai",
+                  };
+                  await c.from("interview_reports").upsert(
+                    {
+                      owner_id: userId,
+                      session_id: id,
+                      analysis: finalAnalysis,
+                    },
+                    { onConflict: "owner_id,session_id" }
+                  );
+                  setReport(finalAnalysis);
+                }
+              } catch (summaryErr) {
+                console.warn("Retrospective summary analysis failed:", summaryErr);
+              }
+            }
+          }
+        }
+      } finally {
+        recoveringRef.current = false;
+        if (active) setRecovering(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [loading, userId, session?.id, session?.status, answers, id, evaluateMutation, analyzeMutation, report]);
+
+  const {
+    evaluated,
+    answeredCount,
+    answerQuality,
+    score,
+    reportHasTrustedSource,
+    reportSummary,
+    radar,
+    repeatedMistakes,
+    missingConcepts,
+    reportStrengths,
+    reportWeaknesses,
+    savedNextStep,
+    communicationIssues,
+  } = useReportMetrics(answers, report, session, performanceMetrics);
+
   if (loading) return <LoadingState text="Putting your report together…" />;
   if (!session)
     return (
@@ -3081,81 +3591,6 @@ export function ReportPage() {
         />
       </div>
     );
-  const evaluated = answers.filter(a => a.evaluation?.source === "ai");
-  const answeredCount = answers.filter(a => a.answer.trim().length > 0).length;
-  const answerQuality = evaluated.length
-    ? Math.round(
-        evaluated.reduce((s, a) => s + a.evaluation.overall_score, 0) /
-          evaluated.length
-      )
-    : null;
-  const score =
-    answerQuality === null
-      ? null
-      : completionAdjustedScore(answerQuality, evaluated.length, answers.length);
-  const reportHasTrustedSource = report?.analysisSource === "ai";
-  const savedReportSummary =
-    reportHasTrustedSource && typeof report?.summary === "string"
-      ? report.summary
-      : null;
-  const reportSummary =
-    score === null
-      ? savedReportSummary ||
-        (answeredCount
-          ? `${answeredCount} responses were saved, but none has a supported AI evaluation. No score is available.`
-          : "No answers were evaluated. No score is available.")
-      : evaluated.length < answers.length
-        ? `You saved ${answeredCount} of ${answers.length} responses; ${evaluated.length} received AI evaluation. Answer quality was ${answerQuality}/100, and the session score is ${score}/100 after accounting for completion.`
-        : savedReportSummary ||
-          `You completed ${evaluated.length} AI-evaluated answer${evaluated.length === 1 ? "" : "s"}. Use the notes below to choose your next practice step.`;
-  const dimensionMap = new Map<string, number[]>();
-  for (const answer of evaluated)
-    for (const d of answer.evaluation.dimensions || []) {
-      dimensionMap.set(d.name, [...(dimensionMap.get(d.name) || []), d.score]);
-    }
-  const radar = Array.from(dimensionMap.entries()).map(([subject, values]) => ({
-    subject,
-    score: Math.round(values.reduce((a, b) => a + b, 0) / values.length),
-    fullMark: 100,
-  }));
-  const repeatedMistakes =
-    reportHasTrustedSource && Array.isArray(report?.repeated_mistakes)
-    ? report.repeated_mistakes
-    : [];
-  const missingConcepts =
-    reportHasTrustedSource && Array.isArray(report?.missing_concepts)
-    ? report.missing_concepts
-    : [];
-  const savedCommunication =
-    reportHasTrustedSource && Array.isArray(report?.communication_issues)
-    ? report.communication_issues
-    : [];
-  const reportStrengths =
-    reportHasTrustedSource && Array.isArray(report?.strengths)
-      ? report.strengths
-      : evaluated.flatMap(a => a.evaluation?.strengths || []).slice(0, 3);
-  const reportWeaknesses =
-    reportHasTrustedSource && Array.isArray(report?.weaknesses)
-      ? report.weaknesses
-      : evaluated.flatMap(a => a.evaluation?.weaknesses || []).slice(0, 3);
-  const savedNextStep =
-    reportHasTrustedSource && Array.isArray(report?.next_steps)
-      ? report.next_steps[0]
-      : null;
-  const observedCommunication = evaluated.flatMap((answer: any) =>
-    (answer.evaluation?.dimensions || [])
-      .filter(
-        (dimension: any) =>
-          dimension.measure === "communication" && Number(dimension.score) < 70
-      )
-      .map(
-        (dimension: any) =>
-          `${dimension.name}: ${dimension.note || `${dimension.score}/100`}`
-      )
-  );
-  const communicationIssues = Array.from(
-    new Set([...savedCommunication, ...observedCommunication])
-  ).slice(0, 5);
   return (
     <div className="page-stack">
       <PageHeading
@@ -3192,6 +3627,11 @@ export function ReportPage() {
       {bookmarkError && (
         <div className="notice notice-error" role="alert">
           {bookmarkError}
+        </div>
+      )}
+      {recovering && (
+        <div className="notice notice-info" role="status">
+          Updating your report with AI evaluation for saved answers…
         </div>
       )}
       <section className="report-hero">
@@ -3403,7 +3843,8 @@ export function ReportPage() {
                 </span>
                 <span className="report-q-text">{a.question_text}</span>
                 <span className="report-q-score">
-                  {a.evaluation?.source === "ai"
+                  {typeof a.evaluation?.overall_score === "number" &&
+                  !isNaN(a.evaluation.overall_score)
                     ? `${a.evaluation.overall_score}/100`
                     : a.evaluationUnavailable
                       ? "Coaching unavailable"

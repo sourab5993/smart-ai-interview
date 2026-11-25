@@ -58,7 +58,7 @@ describe("Gemini audio transcription fallback", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     const payload = JSON.parse(String(init.body));
     expect(url).toBe(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent"
     );
     expect(init.headers).toMatchObject({ "x-goog-api-key": "test-server-key" });
     expect(url).not.toContain("test-server-key");
@@ -237,6 +237,74 @@ describe("Gemini audio transcription fallback", () => {
     expect(result).toMatchObject({
       task: "transcribe",
       text: "",
+    });
+  });
+
+  it("falls back to Groq Whisper when Gemini fails", async () => {
+    vi.stubEnv("GEMINI_API_KEY", "test-gemini-key");
+    vi.stubEnv("GROQ_API_KEY", "test-groq-key");
+
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.includes("generativelanguage.googleapis.com")) {
+        return Promise.resolve(new Response("Gemini Service Unavailable", { status: 503 }));
+      }
+      if (url.includes("api.groq.com")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ text: "Groq Whisper transcription success." }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })
+        );
+      }
+      return Promise.reject(new Error(`Unexpected url ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await transcribeAudioBuffer({
+      audioBuffer: Buffer.from("audio bytes"),
+      mimeType: "audio/webm",
+      language: "en",
+    });
+
+    expect(result).toMatchObject({
+      task: "transcribe",
+      text: "Groq Whisper transcription success.",
+    });
+  });
+
+  it("falls back to OpenAI Whisper when both Gemini and Groq fail", async () => {
+    vi.stubEnv("GEMINI_API_KEY", "test-gemini-key");
+    vi.stubEnv("GROQ_API_KEY", "test-groq-key");
+    vi.stubEnv("OPENAI_API_KEY", "test-openai-key");
+
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.includes("generativelanguage.googleapis.com")) {
+        return Promise.resolve(new Response("Gemini 500", { status: 500 }));
+      }
+      if (url.includes("api.groq.com")) {
+        return Promise.resolve(new Response("Groq 500", { status: 500 }));
+      }
+      if (url.includes("api.openai.com")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ text: "OpenAI Whisper transcription success." }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })
+        );
+      }
+      return Promise.reject(new Error(`Unexpected url ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await transcribeAudioBuffer({
+      audioBuffer: Buffer.from("audio bytes"),
+      mimeType: "audio/webm",
+      language: "en",
+    });
+
+    expect(result).toMatchObject({
+      task: "transcribe",
+      text: "OpenAI Whisper transcription success.",
     });
   });
 });

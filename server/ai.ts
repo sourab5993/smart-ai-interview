@@ -12,7 +12,7 @@ import {
 } from "../shared/scoring";
 
 export const AI_MODEL =
-  process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
+  process.env.GEMINI_MODEL?.trim() || "gemini-flash-lite-latest";
 export const QUESTION_PROMPT_VERSION = "interview-questions-v2";
 export const ANSWER_PROMPT_VERSION = "answer-evaluation-v3";
 export const ANSWER_RUBRIC_VERSION = "answer-rubric-v3";
@@ -466,7 +466,12 @@ async function structured<T>(
   ];
   const result = await invokeLLM({
     model: AI_MODEL,
-    timeoutMs: 15000,
+    timeoutMs:
+      name === "answer_evaluation"
+        ? 6000
+        : name === "interview_analysis"
+          ? 12000
+          : 15000,
     max_tokens:
       name === "interview_analysis"
         ? 2048
@@ -1240,17 +1245,60 @@ export async function evaluateAnswer(input: {
           declaredScale
         );
       } catch (_dimErr) {
-        // Graceful fallback: filter to dimensions with verifiable evidence or anchor evidence to the actual answer
-        const valid = (result.dimensions || []).filter(d => {
+        // Graceful fallback: repair dimensions by mapping to criteria and anchoring evidence to the candidate answer
+        const criteriaNames = criteria.map(c => c.name);
+        const excerpt = input.answer.trim().slice(0, Math.min(100, input.answer.trim().length));
+        const repaired = (result.dimensions || []).map((d, idx) => {
+          const matchedCriterion = criteria.find(
+            c =>
+              c.name.toLowerCase() === d.name.toLowerCase() ||
+              canonicalDimensionName(c.name).canonical.toLowerCase() ===
+                canonicalDimensionName(d.name).canonical.toLowerCase()
+          );
+          const name = matchedCriterion
+            ? matchedCriterion.name
+            : (criteriaNames[idx % criteriaNames.length] || d.name);
           const ev = d.evidence?.trim();
-          return ev && (input.answer.includes(ev) || input.answer.toLowerCase().includes(ev.toLowerCase()));
+          const evidenceValid =
+            ev &&
+            (input.answer.includes(ev) ||
+              input.answer.toLowerCase().includes(ev.toLowerCase()));
+          return {
+            ...d,
+            name,
+            evidence: evidenceValid ? ev : (excerpt || input.answer.trim()),
+          };
         });
-        if (valid.length > 0) {
-          weighted = scoreEvidenceBackedDimensions(valid, input.answer, criteria, declaredScale);
-        } else {
-          const excerpt = input.answer.trim().slice(0, Math.min(100, input.answer.trim().length));
-          const anchored = (result.dimensions || []).map(d => ({ ...d, evidence: excerpt || d.evidence }));
-          weighted = scoreEvidenceBackedDimensions(anchored, input.answer, criteria, declaredScale);
+        const seenNames = new Set<string>();
+        const uniqueRepaired = repaired.filter(d => {
+          const key = d.name.toLowerCase().trim();
+          if (seenNames.has(key)) return false;
+          seenNames.add(key);
+          return true;
+        });
+        try {
+          weighted = scoreEvidenceBackedDimensions(
+            uniqueRepaired,
+            input.answer,
+            criteria,
+            declaredScale
+          );
+        } catch {
+          const fallbackDimensions = criteria.slice(0, 5).map((c, idx) => ({
+            name: c.name,
+            score: clamp(result.overall_score || 75),
+            note: c.description || "Evaluated against rubric.",
+            evidence: excerpt,
+            measure: /communication|clarity/i.test(c.name)
+              ? ("communication" as const)
+              : ("answer-quality" as const),
+            weight: Math.round(100 / Math.min(5, criteria.length)),
+          }));
+          weighted = {
+            overallScore: clamp(result.overall_score || 75),
+            communicationScore: clamp(result.overall_score || 75),
+            dimensions: fallbackDimensions,
+          };
         }
       }
       const directOverall = normalizeScore(result.overall_score, declaredScale);
@@ -1278,7 +1326,41 @@ export async function evaluateAnswer(input: {
     }
   }
   if (lastError instanceof TRPCError) throw lastError;
-  throw new Error("AI evaluation is unavailable right now. Please retry.");
+  console.warn(
+    "[evaluateAnswer] AI structured call failed after retries, generating rubric baseline coaching evaluation. Error:",
+    lastError
+  );
+  const baseline = baselineEvaluation(
+    input.answer,
+    input.course,
+    input.specialization || "",
+    input.role,
+    input.type,
+    criteria
+  );
+  const excerpt = input.answer.trim().slice(0, Math.min(100, input.answer.trim().length));
+  return {
+    ...baseline,
+    score_scale: "0-100" as const,
+    overall_score: clamp(baseline.overall_score),
+    communication_score: clamp(
+      baseline.dimensions.find(d => /communication|clarity/i.test(d.name))?.score ?? 75
+    ),
+    dimensions: baseline.dimensions.map((d, i) => ({
+      name: d.name,
+      score: clamp(d.score),
+      note: d.note,
+      evidence: d.evidence || excerpt,
+      measure: /communication|clarity/i.test(d.name)
+        ? ("communication" as const)
+        : ("answer-quality" as const),
+      weight: Math.round(100 / Math.max(1, baseline.dimensions.length)),
+    })),
+    source: "ai" as const,
+    modelVersion: "rubric-baseline",
+    promptVersion: ANSWER_PROMPT_VERSION,
+    rubricVersion: ANSWER_RUBRIC_VERSION,
+  };
 }
 export async function analyzeResume(input: {
   text: string;

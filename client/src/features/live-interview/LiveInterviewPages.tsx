@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useParams } from "wouter";
+import { getSupabase } from "@/lib/supabase";
 import {
   ArrowLeft,
   ArrowRight,
@@ -30,6 +31,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { getLiveAudioRetryAction } from "./audio-retry";
+import { useMicrophoneInput } from "@/hooks/useMicrophoneInput";
 import { MAX_TRANSCRIPTION_AUDIO_BYTES } from "@shared/const";
 import { isSilenceHallucination } from "@shared/scoring";
 
@@ -474,6 +476,24 @@ export function LiveInterviewRoom() {
   const [answerMode, setAnswerMode] = useState<"speak" | "type">(() => {
     return (safeStorage.getItem("live_interview_mode") as "speak" | "type") || "type";
   });
+  const {
+    audioInputs,
+    selectedMicId,
+    selectMicDevice,
+    micDiagnostic,
+    setMicDiagnostic,
+    trackMutedRef,
+    acquireVerifiedMicStream,
+    recheckMicrophone: runMicRecheck,
+  } = useMicrophoneInput(answerMode === "speak");
+  const recheckMicrophone = useCallback(async () => {
+    const res = await runMicRecheck();
+    if (res.ok) {
+      setError("");
+    } else {
+      setError(res.error);
+    }
+  }, [runMicRecheck]);
   const [questionAudioPending, setQuestionAudioPending] = useState(false);
   const [endConfirmOpen, setEndConfirmOpen] = useState(false);
   const [cameraOptIn, setCameraOptIn] = useState(false);
@@ -504,9 +524,17 @@ export function LiveInterviewRoom() {
   const finalText = useRef("");
   const baseTranscript = useRef("");
   const latestRecognizedText = useRef("");
+  const finalTranscriptRef = useRef("");
+  const interimTranscriptRef = useRef("");
+  const restartCountRef = useRef(0);
+  const peakMicVolumeRef = useRef(0);
+  const hasAnalyserRef = useRef(false);
   const stopping = useRef(false);
   const isRecordingRef = useRef(false);
   const committedTextRef = useRef("");
+  const speechSessionFinalsRef = useRef<string[]>([]);
+  const activeEngineFinalsRef = useRef("");
+  const speechSessionInterimRef = useRef("");
   const streamRef = useRef<MediaStream | null>(null);
   const recorder = useRef<MediaRecorder | null>(null);
   const chunks = useRef<Blob[]>([]);
@@ -538,6 +566,7 @@ export function LiveInterviewRoom() {
   const abortCapture = useRef(false);
   const expiryRef = useRef(false);
   const hasEndedRef = useRef(false);
+  const isFinalizingRef = useRef(false);
   const speechGenerationRef = useRef(0);
   const turnAbortControllerRef = useRef<AbortController | null>(null);
   const phaseRef = useRef(phase);
@@ -548,6 +577,14 @@ export function LiveInterviewRoom() {
     if (query.data) {
       const loaded = query.data.session as Session;
       setSession(loaded);
+      if (loaded.deadline_at) {
+        setRemaining(
+          Math.max(
+            0,
+            Math.ceil((Date.parse(loaded.deadline_at) - Date.now()) / 1000)
+          )
+        );
+      }
       setTurns(query.data.turns as Turn[]);
       if (loaded.camera_summary) {
         setCameraCounts(loaded.camera_summary);
@@ -1044,12 +1081,14 @@ export function LiveInterviewRoom() {
   const finalizeSession = useCallback(
     async (reason: "manual" | "deadline") => {
       if (!session) return;
-      if (hasEndedRef.current) return;
+      if (isFinalizingRef.current) return;
+      isFinalizingRef.current = true;
       hasEndedRef.current = true;
 
       // 1. Immediately lock inputs and transition to finalizing state
       setPhase("FINALIZING");
       setBusy(true);
+      setError("");
       abortCapture.current = true;
       if (turnAbortControllerRef.current) {
         turnAbortControllerRef.current.abort();
@@ -1070,7 +1109,7 @@ export function LiveInterviewRoom() {
       setQuestionAudioPending(false);
       window.speechSynthesis?.cancel?.();
 
-      // 2. Auto-submit any unsubmitted partial answer from textarea / mic buffer
+      // 2. Auto-submit any unsubmitted partial answer from textarea / mic buffer and wait for DB save
       const pendingAnswer = (
         transcriptDraft ||
         partial ||
@@ -1081,13 +1120,11 @@ export function LiveInterviewRoom() {
 
       if (pendingAnswer && current && !current.transcript) {
         try {
-          const savePromise = saveTranscript.mutateAsync({
+          await saveTranscript.mutateAsync({
             sessionId: id,
             turnId: current.id,
             transcript: pendingAnswer,
           });
-          const timeoutPromise = new Promise<null>(r => setTimeout(() => r(null), 2500));
-          await Promise.race([savePromise, timeoutPromise]);
           const accepted: Turn = {
             ...current,
             transcript: pendingAnswer,
@@ -1114,30 +1151,65 @@ export function LiveInterviewRoom() {
         }
       }
 
-      // 5. Finalize with strict 8000ms max timeout
+      // 5. Finalize with backend verification and polling
       try {
-        const finalizePromise = finalize.mutateAsync({ id, reason });
-        const timeoutPromise = new Promise<{ timeout: true }>(resolve =>
-          setTimeout(() => resolve({ timeout: true }), 8000)
-        );
-        const result = await Promise.race([finalizePromise, timeoutPromise]);
-        if (result && "timeout" in result) {
-          console.warn("[LiveInterview] Finalize call hit 8000ms budget, navigating to report.");
+        const res = await finalize.mutateAsync({ id, reason });
+        if (res?.session?.status === "completed" && res?.session?.report) {
+          stopCamera();
+          setPhase("COMPLETED");
+          navigate(`/live-report/${id}`);
+          return;
         }
-      } catch (cause) {
-        console.warn("[LiveInterview] Finalize call completed with notice, navigating to report:", cause);
-      } finally {
-        stopCamera();
-        setPhase("COMPLETED");
-        navigate(`/live-report/${id}`);
+
+        // Poll for completion if async lease or evaluation is finalizing
+        let isComplete = false;
+        for (let poll = 0; poll < 10; poll++) {
+          await new Promise(r => setTimeout(r, 1200));
+          const refreshed = await query.refetch();
+          if (
+            refreshed.data?.session?.status === "completed" &&
+            refreshed.data?.session?.report
+          ) {
+            isComplete = true;
+            break;
+          }
+          if (refreshed.data?.session?.status === "failed") {
+            throw new Error(
+              refreshed.data.session.report_error ||
+                "Interview finalization encountered an error."
+            );
+          }
+        }
+
+        if (isComplete) {
+          stopCamera();
+          setPhase("COMPLETED");
+          navigate(`/live-report/${id}`);
+          return;
+        }
+
+        throw new Error(
+          "Finalization is still processing. Click 'Retry finalization' to complete report generation."
+        );
+      } catch (cause: any) {
+        console.error("[LiveInterview] Finalize call error:", cause);
+        isFinalizingRef.current = false;
+        hasEndedRef.current = false;
+        setBusy(false);
+        setPhase("RECOVERABLE_ERROR");
+        setError(
+          cause?.message ||
+            "Unable to complete final report. Your answers are saved—please click 'Retry finalization'."
+        );
       }
     },
-    [session, id, finalize, navigate, persistCameraSummary, stopCamera, transcriptDraft, partial, current, saveTranscript]
+    [session, id, finalize, navigate, persistCameraSummary, stopCamera, transcriptDraft, partial, current, saveTranscript, query]
   );
   useEffect(() => {
     if (
       session?.status === "in_progress" &&
-      (remaining <= 0 || Date.now() >= Date.parse(session.deadline_at)) &&
+      session.deadline_at &&
+      Date.now() >= Date.parse(session.deadline_at) &&
       !hasEndedRef.current
     ) {
       void finalizeSession("deadline");
@@ -1191,8 +1263,11 @@ export function LiveInterviewRoom() {
       : "";
     const key = `live_draft_${session.id}_${current.id}`;
     if (transcriptDraft.trim()) {
-      if (userScope) safeStorage.setItem(userScope, transcriptDraft);
-      safeStorage.setItem(key, transcriptDraft);
+      // Do not persist drafts containing non-English Devanagari Hindi characters
+      if (!/[\u0900-\u097F]/.test(transcriptDraft)) {
+        if (userScope) safeStorage.setItem(userScope, transcriptDraft);
+        safeStorage.setItem(key, transcriptDraft);
+      }
     }
   }, [transcriptDraft, session?.id, current?.id, session?.owner_id]);
 
@@ -1201,12 +1276,19 @@ export function LiveInterviewRoom() {
     const userScope = session.owner_id
       ? `live_draft_${session.owner_id}_${session.id}_${current.id}`
       : "";
+    const key = `live_draft_${session.id}_${current.id}`;
     const saved =
       (userScope ? safeStorage.getItem(userScope) : null) ||
-      safeStorage.getItem(`live_draft_${session.id}_${current.id}`);
-    if (saved && !current.transcript && !transcriptDraft) {
-      setTranscriptDraft(saved);
-      setPartial(saved);
+      safeStorage.getItem(key);
+    if (saved) {
+      // If a previously saved draft contains Devanagari Hindi characters or is a silence hallucination, purge it immediately
+      if (/[\u0900-\u097F]/.test(saved) || isSilenceHallucination(saved)) {
+        if (userScope) safeStorage.removeItem(userScope);
+        safeStorage.removeItem(key);
+      } else if (!current.transcript && !transcriptDraft) {
+        setTranscriptDraft(saved);
+        setPartial(saved);
+      }
     }
   }, [current?.id, session?.id, session?.owner_id]);
   async function acceptTranscript(text?: string) {
@@ -1222,12 +1304,38 @@ export function LiveInterviewRoom() {
       if (typingRestartTimerRef.current) window.clearTimeout(typingRestartTimerRef.current);
       typingRestartTimerRef.current = null;
 
+      try {
+        recognition.current?.stop?.();
+      } catch {}
       cleanupSpeechEngine();
       cleanupRecorder();
       stopTracks();
+
+      if (activeEngineFinalsRef.current.trim()) {
+        speechSessionFinalsRef.current.push(activeEngineFinalsRef.current.trim());
+        activeEngineFinalsRef.current = "";
+      }
+      if (speechSessionInterimRef.current.trim()) {
+        speechSessionFinalsRef.current.push(speechSessionInterimRef.current.trim());
+        speechSessionInterimRef.current = "";
+      }
     }
 
-    const transcript = (text || transcriptDraft || partial || finalText.current || latestRecognizedText.current).trim();
+    const sessionSpeech = speechSessionFinalsRef.current.join(" ").trim();
+    const base = baseTranscript.current.trim();
+    const derivedText = base
+      ? (sessionSpeech ? `${base} ${sessionSpeech}` : base)
+      : sessionSpeech;
+
+    const transcript = (
+      text ||
+      transcriptDraft ||
+      partial ||
+      derivedText ||
+      latestRecognizedText.current ||
+      committedTextRef.current ||
+      finalText.current
+    ).trim();
     if (!transcript) {
       setBusy(false);
       setPhase("READY");
@@ -1327,10 +1435,20 @@ export function LiveInterviewRoom() {
   }
   async function transcribeCapturedAudio(blob: Blob, fallbackLiveText = "") {
     if (!session || !blob.size || transcribingAudioRef.current) return;
+    if (blob.size < 5000) {
+      // Skip tiny/empty audio so we never trigger unnecessary 429s or hallucinations
+      setBusy(false);
+      setPhase("READY");
+      if (fallbackLiveText.trim()) {
+        setTranscriptDraft(fallbackLiveText);
+        setPartial(fallbackLiveText);
+      }
+      return;
+    }
     if (blob.size > MAX_TRANSCRIPTION_AUDIO_BYTES) {
       setBusy(false);
       setCapturedAudio(null);
-      setPhase("RECOVERABLE_ERROR");
+      setPhase("READY");
       setError(
         "This recording is too large to send for transcription. Record a shorter answer or use text mode."
       );
@@ -1343,19 +1461,25 @@ export function LiveInterviewRoom() {
     setPhase("PROCESSING_ANSWER");
     try {
       const mime = blob.type || "audio/webm";
-      const userLang = session.speech_language || "en-US";
+      // Enforce English-only audio fallback transcription
       const result = await transcribe.mutateAsync({
         audioBase64: bytesToBase64(new Uint8Array(await blob.arrayBuffer())),
         mimeType: mime,
-        language: userLang.startsWith("hi") ? "hi" : (userLang.includes("IN") ? "en-IN" : "en"),
+        language: "en",
       });
       const transcribedText = result?.text?.trim() || "";
       if (transcribedText && !isSilenceHallucination(transcribedText)) {
-        setTranscriptDraft(transcribedText);
-        setPartial(transcribedText);
-        finalText.current = transcribedText;
-        latestRecognizedText.current = transcribedText;
-        baseTranscript.current = transcribedText;
+        const base = fallbackLiveText.trim();
+        const fullAnswer = base ? `${base} ${transcribedText}` : transcribedText;
+        setTranscriptDraft(fullAnswer);
+        setPartial(fullAnswer);
+        finalText.current = fullAnswer;
+        latestRecognizedText.current = fullAnswer;
+        baseTranscript.current = fullAnswer;
+        committedTextRef.current = fullAnswer;
+        finalTranscriptRef.current = fullAnswer;
+        speechSessionFinalsRef.current = [fullAnswer];
+        setError("");
         setPhase("READY");
         setBusy(false);
       } else if (fallbackLiveText && fallbackLiveText.length >= 1) {
@@ -1364,6 +1488,9 @@ export function LiveInterviewRoom() {
         finalText.current = fallbackLiveText;
         latestRecognizedText.current = fallbackLiveText;
         baseTranscript.current = fallbackLiveText;
+        committedTextRef.current = fallbackLiveText;
+        finalTranscriptRef.current = fallbackLiveText;
+        setError("Audio recording finished. Your previous answer was preserved.");
         setPhase("READY");
         setBusy(false);
       } else {
@@ -1375,20 +1502,31 @@ export function LiveInterviewRoom() {
       }
     } catch (cause) {
       setBusy(false);
+      setPhase("READY");
       if (fallbackLiveText && fallbackLiveText.length >= 1) {
         setTranscriptDraft(fallbackLiveText);
         setPartial(fallbackLiveText);
-        setPhase("READY");
+        finalText.current = fallbackLiveText;
+        latestRecognizedText.current = fallbackLiveText;
+        baseTranscript.current = fallbackLiveText;
+        committedTextRef.current = fallbackLiveText;
+        finalTranscriptRef.current = fallbackLiveText;
+      }
+      const raw = cause instanceof Error ? cause.message : String(cause || "");
+      const is429 = /429|quota|rate limit|too many requests/i.test(raw);
+      const isTimeout = /timeout|timed out|abort/i.test(raw);
+      const isNetwork = /failed to fetch|networkerror|load failed/i.test(raw);
+      if (is429) {
+        setError("Transcription quota reached. Live speech active — edit or submit anytime.");
+      } else if (isTimeout) {
+        setError("Transcription timed out. Live speech active — edit or submit anytime.");
+      } else if (isNetwork) {
+        setError("Unable to connect to the transcription server. You can edit or submit your answer directly.");
       } else {
-        setPhase("RECOVERABLE_ERROR");
-        const raw = cause instanceof Error ? cause.message : String(cause || "");
-        const isNetwork = /failed to fetch|networkerror|load failed/i.test(raw);
         setError(
-          isNetwork
-            ? "Unable to connect to the transcription server. Please check your connection or type your answer below."
-            : cause instanceof Error
-            ? cause.message
-            : "The completed recording could not be transcribed. You can retry transcription or type your answer below."
+          fallbackLiveText.trim()
+            ? "Transcription service unavailable. Your current text is preserved — edit or submit anytime."
+            : "The completed recording could not be transcribed. You can speak again or type your answer below."
         );
       }
     } finally {
@@ -1414,105 +1552,150 @@ export function LiveInterviewRoom() {
     try {
       const r = new Speech();
       recognition.current = r;
-      const userLang = session?.speech_language || (typeof navigator !== "undefined" ? navigator.language : "en-IN") || "en-IN";
-      r.lang = userLang.startsWith("hi") ? "hi-IN" : (userLang.includes("IN") ? "en-IN" : "en-US");
+      // Enforce English-only speech recognition so it never defaults to Hindi or translates to Hindi script
+      const prefLang = session?.speech_language || (typeof navigator !== "undefined" ? navigator.language : "en-US") || "en-US";
+      r.lang = prefLang.includes("IN") ? "en-IN" : "en-US";
       r.continuous = true;
       r.interimResults = true;
+      r.maxAlternatives = 1;
+
+      r.onstart = () => {
+        restartCountRef.current = 0;
+      };
 
       r.onresult = (event: any) => {
         if (abortCapture.current || stopping.current || !isRecordingRef.current) return;
-        let interim = "";
-        let finalChunk = "";
+        let currentFinal = "";
+        let currentInterim = "";
 
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
+        for (let i = 0; i < event.results.length; ++i) {
           const item = event.results[i];
           const transcript = item[0]?.transcript || "";
           if (item.isFinal) {
-            finalChunk += `${transcript} `;
+            currentFinal += (currentFinal ? " " : "") + transcript.trim();
           } else {
-            interim += `${transcript} `;
+            currentInterim += (currentInterim ? " " : "") + transcript.trim();
           }
         }
 
-        finalChunk = finalChunk.trim();
-        interim = interim.trim();
+        activeEngineFinalsRef.current = currentFinal.trim();
+        speechSessionInterimRef.current = currentInterim.trim();
+        interimTranscriptRef.current = currentInterim.trim();
 
-        if (finalChunk) {
-          const base = committedTextRef.current.trim();
-          committedTextRef.current = base ? `${base} ${finalChunk}` : finalChunk;
-        }
+        const sessionSpeech = [
+          ...speechSessionFinalsRef.current,
+          currentFinal.trim(),
+          currentInterim.trim(),
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .trim();
 
-        const currentCommitted = committedTextRef.current.trim();
-        const display = interim
-          ? (currentCommitted ? `${currentCommitted} ${interim}` : interim)
-          : currentCommitted;
+        const rawBase = baseTranscript.current.trim();
+        const base = (/[\u0900-\u097F]/.test(rawBase) || isSilenceHallucination(rawBase)) ? "" : rawBase;
+        const display = base
+          ? (sessionSpeech ? `${base} ${sessionSpeech}` : base)
+          : sessionSpeech;
 
-        finalText.current = currentCommitted;
+        committedTextRef.current = display;
+        finalText.current = display;
         latestRecognizedText.current = display;
+        finalTranscriptRef.current = display;
 
         setPartial(display);
         setTranscriptDraft(display);
+        if (display.trim().length > 0) {
+          setError("");
+        }
       };
 
       r.onerror = (event: any) => {
         if (abortCapture.current || stopping.current) return;
         const err = event?.error;
-        if (err === "no-speech") {
-          // Normal silence; browser will fire onend next, which will auto-restart
-          return;
-        }
-        if (err === "aborted") {
+        console.warn("[LiveSpeechRecognition onerror]:", err, event);
+        if (err === "no-speech" || err === "aborted") {
           return;
         }
         if (err === "not-allowed" || err === "service-not-allowed") {
-          setError("Microphone permission was denied. Please allow microphone in your browser URL bar or use Type mode.");
-          stopListening();
+          setError("Microphone permission was denied. Please allow microphone access in your browser address bar or use Type mode.");
+          void stopListening();
+          return;
+        }
+        if (err === "audio-capture") {
+          setError("No audio was captured from your microphone. Please check your mic connection and system settings, or use Type mode.");
           return;
         }
         if (err === "network") {
-          console.warn("SpeechRecognition network warning, parallel audio recording is active");
-          setError("Speech recognition service network warning. Background audio recording is active and will transcribe upon stopping.");
+          console.warn("Speech recognition network warning; background audio recording is active and will transcribe upon stopping.");
           return;
         }
-        console.warn("Speech recognition warning:", err);
       };
 
       r.onend = () => {
-        // If the user hasn't clicked "Stop" yet and the browser auto-stops recognition due to silence,
-        // automatically restart recognition.start() inside a try/catch block.
         if (abortCapture.current || stopping.current || !isRecordingRef.current) return;
 
+        // Harvest any final and interim text so speech is NEVER lost when onend fires on pauses
+        if (activeEngineFinalsRef.current.trim()) {
+          const cleaned = activeEngineFinalsRef.current.trim();
+          if (!isSilenceHallucination(cleaned)) {
+            speechSessionFinalsRef.current.push(cleaned);
+          }
+          activeEngineFinalsRef.current = "";
+        }
+        if (speechSessionInterimRef.current.trim()) {
+          const pending = speechSessionInterimRef.current.trim();
+          if (!isSilenceHallucination(pending)) {
+            speechSessionFinalsRef.current.push(pending);
+          }
+          speechSessionInterimRef.current = "";
+          interimTranscriptRef.current = "";
+        }
+
+        const sessionSpeech = speechSessionFinalsRef.current.join(" ").trim();
+        const rawBase = baseTranscript.current.trim();
+        const base = (/[\u0900-\u097F]/.test(rawBase) || isSilenceHallucination(rawBase)) ? "" : rawBase;
+        const display = base
+          ? (sessionSpeech ? `${base} ${sessionSpeech}` : base)
+          : sessionSpeech;
+        committedTextRef.current = display;
+        finalText.current = display;
+        latestRecognizedText.current = display;
+        finalTranscriptRef.current = display;
+        setPartial(display);
+        setTranscriptDraft(display);
+
+        restartCountRef.current += 1;
+        if (restartCountRef.current > 15) {
+          console.warn("Speech recognition auto-restart limit reached; pausing restarts.");
+          return;
+        }
+
         if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
+        const backoff = restartCountRef.current > 5 ? 300 : 100;
         restartTimerRef.current = window.setTimeout(() => {
           if (!abortCapture.current && !stopping.current && isRecordingRef.current) {
             try {
-              if (recognition.current) {
-                recognition.current.start();
-              } else {
-                startSpeechEngine();
-              }
-            } catch (startErr) {
-              console.warn("Auto-restart recognition attempt caught:", startErr);
-              try {
-                startSpeechEngine();
-              } catch (recreateErr) {
-                console.warn("Re-create recognition caught:", recreateErr);
-              }
+              startSpeechEngine();
+            } catch (recreateErr) {
+              console.warn("Re-create recognition caught:", recreateErr);
             }
           }
-        }, 100);
+        }, backoff);
       };
 
       r.start();
     } catch (speechErr) {
       console.warn("Web Speech start failed:", speechErr);
       if (isRecordingRef.current && !stopping.current && !abortCapture.current) {
-        if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
-        restartTimerRef.current = window.setTimeout(() => {
-          if (isRecordingRef.current && !stopping.current && !abortCapture.current) {
-            startSpeechEngine();
-          }
-        }, 200);
+        restartCountRef.current += 1;
+        if (restartCountRef.current <= 15) {
+          if (restartTimerRef.current) window.clearTimeout(restartTimerRef.current);
+          restartTimerRef.current = window.setTimeout(() => {
+            if (isRecordingRef.current && !stopping.current && !abortCapture.current) {
+              startSpeechEngine();
+            }
+          }, 300);
+        }
       }
     }
   }, [session?.speech_language]);
@@ -1520,68 +1703,59 @@ export function LiveInterviewRoom() {
   const restartSpeechEngine = useCallback((baseText: string) => {
     if (abortCapture.current || stopping.current || !isRecordingRef.current) return;
     cleanupSpeechEngine();
+    speechSessionFinalsRef.current = [];
+    activeEngineFinalsRef.current = "";
+    speechSessionInterimRef.current = "";
+    interimTranscriptRef.current = "";
     committedTextRef.current = baseText;
     baseTranscript.current = baseText;
     finalText.current = baseText;
     latestRecognizedText.current = baseText;
+    finalTranscriptRef.current = baseText;
     startSpeechEngine();
   }, [cleanupSpeechEngine, startSpeechEngine]);
 
-  async function startListening() {
+  async function startListening(overrideBaseText?: string) {
     if (!session || !current || busy || remaining <= 0) return;
     abortCapture.current = false;
     stopping.current = false;
     isRecordingRef.current = true;
     setError("");
-    const existing = (transcriptDraft || partial || latestRecognizedText.current || finalText.current).trim();
+    setMicDiagnostic("");
+    const rawExisting = overrideBaseText !== undefined
+      ? overrideBaseText
+      : (transcriptDraft || partial || latestRecognizedText.current || finalText.current);
+    const existing = (/[\u0900-\u097F]/.test(rawExisting) || isSilenceHallucination(rawExisting) ? "" : rawExisting).trim();
+    chunks.current = [];
+    speechSessionFinalsRef.current = [];
+    activeEngineFinalsRef.current = "";
+    speechSessionInterimRef.current = "";
+    interimTranscriptRef.current = "";
+    restartCountRef.current = 0;
+    peakMicVolumeRef.current = 0;
+    hasAnalyserRef.current = false;
+    trackMutedRef.current = false;
     committedTextRef.current = existing;
     baseTranscript.current = existing;
     finalText.current = existing;
     latestRecognizedText.current = existing;
+    finalTranscriptRef.current = existing;
     setPartial(existing);
-    setCapturedAudio(null);
+    setTranscriptDraft(existing);
     setBusy(true);
 
-    let micStream: MediaStream;
-    try {
-      if (
-        typeof window !== "undefined" &&
-        !window.isSecureContext &&
-        window.location.hostname !== "localhost" &&
-        window.location.hostname !== "127.0.0.1"
-      ) {
-        throw new Error(
-          "Microphone access requires a secure connection (HTTPS). Please open this site using HTTPS or use Type mode."
-        );
-      }
-      if (!navigator.mediaDevices?.getUserMedia) {
-        throw new Error("Your browser does not support microphone access.");
-      }
-      try {
-        micStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
-      } catch (constraintErr) {
-        console.warn("Advanced mic constraints rejected, retrying with simple audio:", constraintErr);
-        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      }
-      streamRef.current = micStream;
-      listeningStartedAt.current = Date.now();
-    } catch (micErr) {
+    const micCheck = await acquireVerifiedMicStream();
+    if (!micCheck.ok) {
       setBusy(false);
       isRecordingRef.current = false;
       setPhase("READY");
-      setError(
-        micErr instanceof Error
-          ? `Microphone access denied: ${micErr.message}. Please check browser permissions or use Type mode.`
-          : "Microphone access denied. Please allow microphone in your browser URL bar or use Type mode."
-      );
+      setError(micCheck.error);
       return;
     }
+    const micStream = micCheck.stream;
+    streamRef.current = micStream;
+    listeningStartedAt.current = Date.now();
+    setCapturedAudio(null);
 
     // 1. Audio Visualizer using Web Audio API
     try {
@@ -1589,11 +1763,15 @@ export function LiveInterviewRoom() {
       if (AudioCtx) {
         const actx = new AudioCtx();
         audioContextRef.current = actx;
+        if (actx.state === "suspended") {
+          void actx.resume();
+        }
         const src = actx.createMediaStreamSource(micStream);
         const analyser = actx.createAnalyser();
         analyser.fftSize = 256;
         src.connect(analyser);
         analyserRef.current = analyser;
+        hasAnalyserRef.current = true;
         const dataArr = new Uint8Array(analyser.frequencyBinCount);
 
         const checkVolume = () => {
@@ -1602,7 +1780,11 @@ export function LiveInterviewRoom() {
           let sum = 0;
           for (let i = 0; i < dataArr.length; i++) sum += dataArr[i];
           const avg = sum / dataArr.length;
-          setMicVolume(Math.min(100, Math.round((avg / 128) * 100)));
+          const vol = Math.min(100, Math.round((avg / 128) * 100));
+          if (vol > peakMicVolumeRef.current) {
+            peakMicVolumeRef.current = vol;
+          }
+          setMicVolume(vol);
           animFrameRef.current = requestAnimationFrame(checkVolume);
         };
         animFrameRef.current = requestAnimationFrame(checkVolume);
@@ -1621,8 +1803,8 @@ export function LiveInterviewRoom() {
             ? "audio/mp4"
             : "";
       const rec = mime
-        ? new MediaRecorder(micStream, { mimeType: mime, audioBitsPerSecond: 32000 })
-        : new MediaRecorder(micStream, { audioBitsPerSecond: 32000 });
+        ? new MediaRecorder(micStream, { mimeType: mime, audioBitsPerSecond: 64000 })
+        : new MediaRecorder(micStream);
       recorder.current = rec;
       chunks.current = [];
       rec.ondataavailable = e => {
@@ -1641,12 +1823,12 @@ export function LiveInterviewRoom() {
     answerTimeout.current = window.setTimeout(() => {
       if (phaseRef.current === "LISTENING") {
         setError("Answer capture limit reached. Processing captured speech.");
-        stopListening();
+        void stopListening();
       }
     }, 180000);
   }
 
-  function stopListening() {
+  async function stopListening() {
     isRecordingRef.current = false;
     const durationMs = listeningStartedAt.current ? Date.now() - listeningStartedAt.current : 0;
     listeningStartedAt.current = 0;
@@ -1662,102 +1844,139 @@ export function LiveInterviewRoom() {
     stopping.current = true;
     setPhase("PROCESSING_ANSWER");
 
+    // Clean up speech recognition and harvest pending text
+    try {
+      recognition.current?.stop?.();
+    } catch {}
     cleanupSpeechEngine();
 
-    const liveText = (
-      committedTextRef.current.trim() ||
-      finalText.current.trim() ||
-      latestRecognizedText.current.trim() ||
-      transcriptDraft.trim() ||
-      partial.trim()
-    );
-
-    if (recorder.current && recorder.current.state === "recording") {
-      recorder.current.onstop = async () => {
-        const audioBlob = new Blob(chunks.current, {
-          type: recorder.current?.mimeType || "audio/webm",
-        });
-        cleanupRecorder();
-        stopTracks();
-
-        const liveTrimmed = liveText.trim();
-        const words = liveTrimmed ? liveTrimmed.split(/\s+/).filter(Boolean).length : 0;
-
-        // Fallback Audio Transcription:
-        // If the real-time transcript is empty or incomplete, send the audio blob to backend
-        const realtimeIncomplete = words < 2 && audioBlob.size > 500 && durationMs >= 1500;
-        const noRealtimeText = words === 0;
-
-        if ((realtimeIncomplete || noRealtimeText) && audioBlob.size > 200) {
-          setCapturedAudio(audioBlob);
-          void transcribeCapturedAudio(audioBlob, liveTrimmed);
-          return;
-        }
-
-        if (liveTrimmed.length >= 1) {
-          setTranscriptDraft(liveTrimmed);
-          setPartial(liveTrimmed);
-          committedTextRef.current = liveTrimmed;
-          finalText.current = liveTrimmed;
-          latestRecognizedText.current = liveTrimmed;
-          if (audioBlob.size > 200) {
-            setCapturedAudio(audioBlob);
-          }
-          setBusy(false);
-          setPhase("READY");
-          return;
-        }
-
-        if (audioBlob.size > 200) {
-          setCapturedAudio(audioBlob);
-          void transcribeCapturedAudio(audioBlob, "");
-          return;
-        }
-
-        setBusy(false);
-        setPhase("READY");
-        setError(
-          "No speech was detected from your microphone. Please check your mic connection or type your answer directly in the box below."
-        );
-      };
-
-      try {
-        recorder.current.requestData();
-      } catch {}
-      try {
-        recorder.current.stop();
-      } catch {
-        cleanupRecorder();
-        stopTracks();
-        if (liveText) {
-          setTranscriptDraft(liveText);
-          setPartial(liveText);
-          committedTextRef.current = liveText;
-          setBusy(false);
-          setPhase("READY");
-        }
+    if (activeEngineFinalsRef.current.trim()) {
+      const cleaned = activeEngineFinalsRef.current.trim();
+      if (!isSilenceHallucination(cleaned)) {
+        speechSessionFinalsRef.current.push(cleaned);
       }
-      return;
+      activeEngineFinalsRef.current = "";
+    }
+    if (speechSessionInterimRef.current.trim()) {
+      const pending = speechSessionInterimRef.current.trim();
+      if (!isSilenceHallucination(pending)) {
+        speechSessionFinalsRef.current.push(pending);
+      }
+      speechSessionInterimRef.current = "";
+    }
+
+    const sessionSpeech = speechSessionFinalsRef.current.join(" ").trim();
+    const base = baseTranscript.current.trim();
+    const liveText = base
+      ? (sessionSpeech ? `${base} ${sessionSpeech}` : base)
+      : (sessionSpeech || latestRecognizedText.current.trim() || transcriptDraft.trim() || partial.trim());
+
+    // Stop MediaRecorder and collect all audio chunks BEFORE stopping tracks
+    let audioBlob: Blob | null = null;
+    const rec = recorder.current;
+    if (rec && rec.state !== "inactive") {
+      const mimeType = rec.mimeType || "audio/webm";
+      const blobPromise = new Promise<Blob | null>(resolve => {
+        const timeout = setTimeout(() => {
+          const b = chunks.current.length > 0 ? new Blob(chunks.current, { type: mimeType }) : null;
+          resolve(b);
+        }, 1200);
+
+        rec.onstop = () => {
+          clearTimeout(timeout);
+          const b = chunks.current.length > 0 ? new Blob(chunks.current, { type: mimeType }) : null;
+          resolve(b);
+        };
+      });
+
+      try {
+        if (rec.state === "recording") {
+          rec.requestData();
+        }
+        rec.stop();
+      } catch (recErr) {
+        console.warn("MediaRecorder stop error:", recErr);
+      }
+
+      audioBlob = await blobPromise;
+    } else if (chunks.current.length > 0) {
+      audioBlob = new Blob(chunks.current, { type: "audio/webm" });
     }
 
     cleanupRecorder();
     stopTracks();
-    if (liveText) {
-      setTranscriptDraft(liveText);
-      setPartial(liveText);
-      committedTextRef.current = liveText;
+
+    const liveTrimmed = liveText.trim();
+    const newWords = sessionSpeech ? sessionSpeech.split(/\s+/).filter(Boolean).length : 0;
+    const totalWords = liveTrimmed ? liveTrimmed.split(/\s+/).filter(Boolean).length : 0;
+
+    // 1. If real-time recognition captured speech (newWords > 0 or existing base with words),
+    // use it immediately and NEVER call backend audio transcription!
+    if (newWords > 0 || (base && totalWords > 0)) {
+      setTranscriptDraft(liveTrimmed);
+      setPartial(liveTrimmed);
+      committedTextRef.current = liveTrimmed;
+      finalText.current = liveTrimmed;
+      latestRecognizedText.current = liveTrimmed;
+      baseTranscript.current = liveTrimmed;
+      finalTranscriptRef.current = liveTrimmed;
       setBusy(false);
       setPhase("READY");
+      setError("");
       return;
     }
 
+    // 2. Real-time recognition captured 0 words in this turn.
+    // Guard against tiny/empty audio (< 5000 bytes or < 500ms) or pure digital silence
+    if (audioBlob && audioBlob.size > 200) {
+      setCapturedAudio(audioBlob);
+    }
+    const isValidAudio = Boolean(audioBlob && audioBlob.size >= 5000 && durationMs >= 500);
+    const wasPureSilence = hasAnalyserRef.current && peakMicVolumeRef.current < 2;
+    if (isValidAudio && !wasPureSilence && audioBlob) {
+      setMicDiagnostic("");
+      void transcribeCapturedAudio(audioBlob, base);
+      return;
+    }
+
+    // 3. Keep previous text if it exists
+    if (base) {
+      setTranscriptDraft(base);
+      setPartial(base);
+      setBusy(false);
+      setPhase("READY");
+      if (trackMutedRef.current) {
+        setMicDiagnostic("muted-track");
+        setError(
+          "Your microphone track was muted during recording. Your previous text was preserved — unmute or switch input device to continue."
+        );
+      } else {
+        setMicDiagnostic("no-speech");
+        setError(
+          "No new speech was heard before stopping. Your previous text was kept — speak again or switch to Type (Text)."
+        );
+      }
+      return;
+    }
+
+    // 4. Both live recognition and audio capture yielded nothing
     setBusy(false);
     setPhase("READY");
-    setError("No speech was detected from your microphone. You can type your answer in the box below and click 'Submit answer'.");
+    if (trackMutedRef.current) {
+      setMicDiagnostic("muted-track");
+      setError(
+        "Your microphone track was muted during recording. Unmute your mic (or select another input device) and try again, or switch to Type (Text)."
+      );
+    } else {
+      setMicDiagnostic("no-speech");
+      setError(
+        "No speech was heard before stopping. Speak closer to your microphone, switch input device, or switch to Type (Text)."
+      );
+    }
   }
   stopListeningRef.current = stopListening;
 
-  function handleReRecord() {
+  async function handleReRecord() {
     if (busy || remaining <= 0) return;
     isRecordingRef.current = false;
     stopping.current = true;
@@ -1768,19 +1987,32 @@ export function LiveInterviewRoom() {
     if (typingRestartTimerRef.current) window.clearTimeout(typingRestartTimerRef.current);
     typingRestartTimerRef.current = null;
 
+    try {
+      recognition.current?.stop?.();
+    } catch {}
     cleanupSpeechEngine();
     cleanupRecorder();
     stopTracks();
 
-    setTranscriptDraft("");
-    setPartial("");
+    // 1. Clear all audio chunks, blobs, interim transcripts, and state completely
+    chunks.current = [];
+    speechSessionFinalsRef.current = [];
+    activeEngineFinalsRef.current = "";
+    speechSessionInterimRef.current = "";
+    interimTranscriptRef.current = "";
+    restartCountRef.current = 0;
+    peakMicVolumeRef.current = 0;
     committedTextRef.current = "";
     finalText.current = "";
     latestRecognizedText.current = "";
     baseTranscript.current = "";
+    finalTranscriptRef.current = "";
     setCapturedAudio(null);
+    setTranscriptDraft("");
+    setPartial("");
     setError("");
 
+    // 2. Remove saved draft from storage so it never re-hydrates
     if (session?.id && current?.id) {
       if (session.owner_id) {
         safeStorage.removeItem(
@@ -1791,7 +2023,8 @@ export function LiveInterviewRoom() {
     }
 
     stopping.current = false;
-    void startListening();
+    // 3. Immediately start fresh recording session with empty base text ("")
+    await startListening("");
   }
   async function continueSaved() {
     if (!current?.transcript) return;
@@ -1891,7 +2124,9 @@ export function LiveInterviewRoom() {
   const phaseLabel = questionAudioPending
     ? "Starting question audio"
     : labels[phase];
-  const isPastDeadline = remaining <= 0 || (session ? Date.now() >= Date.parse(session.deadline_at) : false);
+  const isPastDeadline = Boolean(
+    session?.deadline_at && Date.now() >= Date.parse(session.deadline_at)
+  );
   return (
     <div className="page-stack live-interview-page">
       <PageHeading
@@ -2314,6 +2549,57 @@ export function LiveInterviewRoom() {
                     : "Speak using microphone or edit speech below"}
                 </span>
               </div>
+              {answerMode === "speak" && (audioInputs.length > 1 || micDiagnostic) && phase !== "LISTENING" && (
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                    marginBottom: "10px",
+                    fontSize: "0.8rem",
+                  }}
+                >
+                  {audioInputs.length > 1 && (
+                    <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", color: "#cbd5e1" }}>
+                      <span>Mic:</span>
+                      <select
+                        aria-label="Microphone input device"
+                        className="input"
+                        style={{
+                          padding: "4px 8px",
+                          fontSize: "0.8rem",
+                          borderRadius: "6px",
+                          maxWidth: "240px",
+                        }}
+                        value={selectedMicId}
+                        disabled={busy}
+                        onChange={e => {
+                          selectMicDevice(e.target.value);
+                          setError("");
+                        }}
+                      >
+                        <option value="">System default microphone</option>
+                        {audioInputs.map(dev => (
+                          <option key={dev.deviceId} value={dev.deviceId}>
+                            {dev.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    style={{ padding: "4px 10px", fontSize: "0.78rem", marginLeft: "auto" }}
+                    onClick={() => void recheckMicrophone()}
+                    disabled={busy}
+                  >
+                    <RotateCcw size={12} /> Re-check mic
+                  </button>
+                </div>
+              )}
               {phase === "LISTENING" && (
                 <div
                   style={{
@@ -2405,6 +2691,8 @@ export function LiveInterviewRoom() {
                   finalText.current = newText;
                   latestRecognizedText.current = newText;
                   baseTranscript.current = newText;
+                  finalTranscriptRef.current = newText;
+                  interimTranscriptRef.current = "";
 
                   if (phaseRef.current === "LISTENING") {
                     if (typingRestartTimerRef.current) {
@@ -2539,14 +2827,55 @@ export function LiveInterviewRoom() {
                   Continue to next question
                 </button>
               )}
-              {audioRetryAction === "transcribe" && capturedAudio && (
-                <button
-                  className="button button-secondary"
-                  onClick={() => void transcribeCapturedAudio(capturedAudio)}
-                  disabled={busy}
-                >
-                  Retry transcription from captured audio
-                </button>
+              {audioRetryAction === "transcribe" && (
+                <div style={{ display: "flex", gap: "8px", marginTop: "8px", flexWrap: "wrap" }}>
+                  {capturedAudio && (
+                    <button
+                      type="button"
+                      className="button button-secondary"
+                      onClick={() => void transcribeCapturedAudio(capturedAudio)}
+                      disabled={busy}
+                    >
+                      <RotateCcw size={14} /> Retry transcription from captured audio
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="button button-primary"
+                    onClick={() => {
+                      setError("");
+                      setMicDiagnostic("");
+                      void startListening();
+                    }}
+                    disabled={busy || remaining <= 0}
+                  >
+                    <Mic size={14} /> Speak again (Record new audio)
+                  </button>
+                </div>
+              )}
+              {micDiagnostic && audioRetryAction !== "transcribe" && (
+                <div style={{ display: "flex", gap: "8px", marginTop: "8px", flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    onClick={() => void recheckMicrophone()}
+                    disabled={busy}
+                  >
+                    <RotateCcw size={14} /> Re-check mic
+                  </button>
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    onClick={() => {
+                      setError("");
+                      setMicDiagnostic("");
+                      setAnswerMode("type");
+                      safeStorage.setItem("live_interview_mode", "type");
+                    }}
+                  >
+                    <Keyboard size={14} /> Switch to Type (Text)
+                  </button>
+                </div>
               )}
               {audioRetryAction === "save-transcript" && (
                 <button
@@ -2691,6 +3020,7 @@ export function LiveInterviewRoom() {
 export function LiveInterviewReport() {
   const p = useParams<{ id: string }>();
   const id = p?.id || "";
+  const [, navigate] = useLocation();
   const q = trpc.liveInterview.get.useQuery(
     { id },
     {
@@ -2703,13 +3033,47 @@ export function LiveInterviewReport() {
           : 2000,
     }
   );
-  if (q.isLoading) return <LoadingState text="Loading your saved report…" />;
+
+  useEffect(() => {
+    if (!q.error || !id) return;
+    let active = true;
+    void (async () => {
+      try {
+        const c = await getSupabase();
+        const { data } = await c
+          .from("interview_sessions")
+          .select("id")
+          .eq("id", id)
+          .maybeSingle();
+        if (active && data?.id) {
+          navigate(`/report/${id}`, { replace: true });
+        }
+      } catch {}
+    })();
+    return () => {
+      active = false;
+    };
+  }, [q.error, id, navigate]);
+
   const session = q.data?.session as Session | undefined;
   const report = session?.report;
   const cameraSummary = report?.cameraSummary as
     | FramingSummary
     | null
     | undefined;
+
+  const derivedMetrics = useMemo(() => {
+    if (!report) return null;
+    return {
+      strengths: report.analysis?.strengths || [],
+      weaknesses: report.analysis?.weaknesses || [],
+      nextSteps: report.analysis?.next_steps || [],
+      communicationIssues: report.analysis?.communication_issues || [],
+      limitations: report.limitations || [],
+    };
+  }, [report]);
+
+  if (q.isLoading) return <LoadingState text="Loading your saved report…" />;
 
   if (session?.status === "finalizing" || (session?.status === "completed" && !report)) {
     return (
@@ -2783,27 +3147,27 @@ export function LiveInterviewReport() {
           )}
           <h4>Strengths</h4>
           <ul>
-            {(report.analysis?.strengths || []).map((x: string, i: number) => (
+            {(derivedMetrics?.strengths || []).map((x: string, i: number) => (
               <li key={i}>{x}</li>
             ))}
           </ul>
           <h4>Areas to improve</h4>
           <ul>
-            {(report.analysis?.weaknesses || []).map((x: string, i: number) => (
+            {(derivedMetrics?.weaknesses || []).map((x: string, i: number) => (
               <li key={i}>{x}</li>
             ))}
           </ul>
           <h4>Next steps</h4>
           <ul>
-            {(report.analysis?.next_steps || []).map((x: string, i: number) => (
+            {(derivedMetrics?.nextSteps || []).map((x: string, i: number) => (
               <li key={i}>{x}</li>
             ))}
           </ul>
-          {report.analysis?.communication_issues?.length > 0 && (
+          {(derivedMetrics?.communicationIssues?.length ?? 0) > 0 && (
             <>
               <h4>Transcript-based communication observations</h4>
               <ul>
-                {report.analysis.communication_issues.map(
+                {derivedMetrics?.communicationIssues.map(
                   (x: string, i: number) => (
                     <li key={i}>{x}</li>
                   )
@@ -2925,7 +3289,7 @@ export function LiveInterviewReport() {
       </Panel>
       <Panel title="Limitations">
         <ul>
-          {(report.limitations || []).map((x: string, i: number) => (
+          {(derivedMetrics?.limitations || []).map((x: string, i: number) => (
             <li key={i}>{x}</li>
           ))}
         </ul>

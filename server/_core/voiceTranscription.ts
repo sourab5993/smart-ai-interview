@@ -33,7 +33,7 @@ export type TranscriptionError = {
   details?: string;
 };
 
-const REQUEST_TIMEOUT_MS = 60_000;
+const REQUEST_TIMEOUT_MS = 15_000;
 const ALLOWED_AUDIO_TYPES = new Set([
   "audio/aac",
   "audio/flac",
@@ -97,9 +97,10 @@ export async function transcribeAudioBuffer(options: {
     };
   }
 
-  const languagePrompt = options.language
-    ? `Transcribe the speech faithfully in ${options.language} (English, Hindi, or mixed Hinglish).`
-    : "Transcribe the speech faithfully in its spoken language (English, Hindi, or mixed Hinglish).";
+  const isEnglish = !options.language || options.language.toLowerCase().startsWith("en");
+  const languagePrompt = isEnglish
+    ? "Transcribe only the exact spoken words verbatim in English (Latin script). Do not translate into Hindi or output Devanagari script."
+    : `Transcribe the speech faithfully in ${options.language}.`;
 
   const geminiMimeType =
     mimeType === "audio/x-m4a" || mimeType === "audio/m4a"
@@ -110,128 +111,153 @@ export async function transcribeAudioBuffer(options: {
 
   // 1. Google Gemini Audio Transcription
   if (geminiApiKey) {
-    await enforceGeminiRateLimit("audio_transcription");
-    const primaryModel =
-      process.env.GEMINI_AUDIO_MODEL?.trim() || "gemini-2.5-flash";
-    const candidateModels = Array.from(
-      new Set(
-        [
-          primaryModel,
-          "gemini-3.5-transcribe",
-          "gemini-flash-lite-latest",
-          "gemini-3.5-flash-lite",
-          "gemini-3.8-flash",
-          "gemini-3.1-flash-lite-preview",
-          "gemini-2.5-flash",
-          "gemini-2.5-flash-lite",
-        ].filter(Boolean) as string[]
-      )
-    );
-
-    for (let i = 0; i < candidateModels.length; i++) {
-      const model = candidateModels[i];
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 10_000);
+    try {
       try {
-        const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-          {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              "x-goog-api-key": geminiApiKey,
-            },
-            body: JSON.stringify({
-              contents: [
-                {
-                  role: "user",
-                  parts: [
-                    {
-                      text: `${options.prompt?.trim() || languagePrompt}
-CRITICAL INSTRUCTION: Transcribe only genuine spoken human speech verbatim. If the audio contains only silence, background noise, breathing, static, or no clearly intelligible speech, return an empty string. Never invent or hallucinate default sentences or phrases such as "Where is a hospital in this city?" or "Thank you for watching". Return only the transcript with no commentary.`,
-                    },
-                    {
-                      inlineData: {
-                        mimeType: geminiMimeType,
-                        data: options.audioBuffer.toString("base64"),
-                      },
-                    },
-                  ],
-                },
-              ],
-            }),
-            signal: controller.signal,
-          }
-        );
+        await enforceGeminiRateLimit("audio_transcription");
+      } catch (rateLimitErr) {
+        console.warn("[AudioTranscription] Gemini rate limiter notice:", rateLimitErr);
+      }
+      const primaryModel =
+        process.env.GEMINI_AUDIO_MODEL?.trim() || "gemini-3.5-flash-lite";
+      const candidateModels = Array.from(
+        new Set(
+          [
+            primaryModel,
+            "gemini-3.5-flash-lite",
+            "gemini-3-flash-preview",
+            "gemini-flash-lite-latest",
+            "gemini-flash-latest",
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+          ].filter(Boolean) as string[]
+        )
+      );
 
-        if (!response.ok) {
-          const errorBody = await response.text();
-          console.error(
-            `[AudioTranscription] Provider: Google Gemini | Model: "${model}" | Stage: gemini_generate_content | Status: ${response.status} ${response.statusText} | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error: ${errorBody.slice(0, 300)}`
-          );
-          if (i < candidateModels.length - 1) {
-            continue;
-          }
-          break;
-        }
-
-        let result: {
-          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-        };
+      for (let i = 0; i < candidateModels.length; i++) {
+        const model = candidateModels[i];
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
         try {
-          result = (await response.json()) as typeof result;
-        } catch (error) {
-          if (error instanceof SyntaxError) {
+          const response = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+            {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                "x-goog-api-key": geminiApiKey,
+              },
+              body: JSON.stringify({
+                generationConfig: {
+                  temperature: 0,
+                },
+                contents: [
+                  {
+                    role: "user",
+                    parts: [
+                      {
+                        text: `${options.prompt?.trim() || languagePrompt}
+CRITICAL INSTRUCTION: Transcribe ONLY actual, clearly audible human speech verbatim with standard punctuation. If the audio is silent, contains only background noise, static, breathing, or unintelligible sound, you MUST return an empty string (""). Never invent, guess, or fabricate sentences or interview answers such as "Where is a hospital in this city?", "Thank you for watching", "In the city, there are many people.", or "To achieve this, I closely monitored...". Return ONLY the transcript text without any commentary or markdown fences.`,
+                      },
+                      {
+                        inlineData: {
+                          mimeType: geminiMimeType,
+                          data: options.audioBuffer.toString("base64"),
+                        },
+                      },
+                    ],
+                  },
+                ],
+              }),
+              signal: controller.signal,
+            }
+          );
+
+          if (!response.ok) {
+            const errorBody = await response.text();
             console.error(
-              `[AudioTranscription] Provider: Google Gemini | Model: "${model}" | Stage: gemini_json_parse | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error:`,
-              error
+              `[AudioTranscription] Provider: Google Gemini | Model: "${model}" | Stage: gemini_generate_content | Status: ${response.status} ${response.statusText} | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error: ${errorBody.slice(0, 300)}`
             );
+            if (i < candidateModels.length - 1) {
+              continue;
+            }
             break;
           }
-          throw error;
-        }
 
-        const text = result.candidates?.[0]?.content?.parts
-          ?.map(part => part.text ?? "")
-          .join("")
-          .trim();
+          let result: {
+            candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+          };
+          try {
+            result = (await response.json()) as typeof result;
+          } catch (error) {
+            if (error instanceof SyntaxError) {
+              console.error(
+                `[AudioTranscription] Provider: Google Gemini | Model: "${model}" | Stage: gemini_json_parse | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error:`,
+                error
+              );
+              break;
+            }
+            throw error;
+          }
 
-        if (!text || isSilenceHallucination(text)) {
+          const text = result.candidates?.[0]?.content?.parts
+            ?.map(part => part.text ?? "")
+            .join("")
+            .trim();
+
+          if (!text || isSilenceHallucination(text)) {
+            return {
+              task: "transcribe",
+              language: options.language ?? "und",
+              duration: null,
+              text: "",
+              segments: [],
+            };
+          }
+
           return {
             task: "transcribe",
             language: options.language ?? "und",
             duration: null,
-            text: "",
+            text,
             segments: [],
           };
+        } catch (error: any) {
+          if (controller.signal.aborted) {
+            console.error(
+              `[AudioTranscription] Provider: Google Gemini | Model: "${model}" | Stage: gemini_request_timeout | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error: Request timed out after ${REQUEST_TIMEOUT_MS}ms`
+            );
+            if (i < candidateModels.length - 1) continue;
+          } else {
+            console.error(
+              `[AudioTranscription] Provider: Google Gemini | Model: "${model}" | Stage: gemini_fetch_exception | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error: ${error?.message || error}`
+            );
+          }
+        } finally {
+          clearTimeout(timeout);
         }
-
-        return {
-          task: "transcribe",
-          language: options.language ?? "und",
-          duration: null,
-          text,
-          segments: [],
-        };
-      } catch (error: any) {
-        if (controller.signal.aborted) {
-          console.error(
-            `[AudioTranscription] Provider: Google Gemini | Model: "${model}" | Stage: gemini_request_timeout | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error: Request timed out after ${REQUEST_TIMEOUT_MS}ms`
-          );
-          if (i < candidateModels.length - 1) continue;
-        } else {
-          console.error(
-            `[AudioTranscription] Provider: Google Gemini | Model: "${model}" | Stage: gemini_fetch_exception | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error: ${error?.message || error}`
-          );
-        }
-      } finally {
-        clearTimeout(timeout);
       }
+    } catch (geminiBlockErr: any) {
+      console.warn("[AudioTranscription] Gemini provider error, proceeding to fallback providers:", geminiBlockErr);
     }
   }
 
+  // Determine whisper language ISO code (enforce English by default)
+  const whisperLang = options.language
+    ? options.language.toLowerCase().includes("hinglish")
+      ? undefined
+      : options.language.toLowerCase().startsWith("hi")
+        ? "hi"
+        : options.language.toLowerCase().startsWith("en")
+          ? "en"
+          : undefined
+    : "en";
+
   // 2. Fallback to Groq Whisper if configured
   if (groqApiKey) {
+    const groqController = new AbortController();
+    const groqTimeout = setTimeout(() => groqController.abort(), REQUEST_TIMEOUT_MS);
     try {
       const formData = new FormData();
       formData.append(
@@ -240,14 +266,15 @@ CRITICAL INSTRUCTION: Transcribe only genuine spoken human speech verbatim. If t
         `recording.${ext}`
       );
       formData.append("model", "whisper-large-v3-turbo");
-      if (options.language) {
-        formData.append("language", options.language.slice(0, 2).toLowerCase());
+      if (whisperLang) {
+        formData.append("language", whisperLang);
       }
 
       const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
         method: "POST",
         headers: { Authorization: `Bearer ${groqApiKey}` },
         body: formData,
+        signal: groqController.signal,
       });
 
       if (res.ok) {
@@ -272,11 +299,15 @@ CRITICAL INSTRUCTION: Transcribe only genuine spoken human speech verbatim. If t
       console.error(
         `[AudioTranscription] Provider: Groq Whisper | Model: whisper-large-v3-turbo | Stage: groq_exception | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error: ${groqErr?.message || groqErr}`
       );
+    } finally {
+      clearTimeout(groqTimeout);
     }
   }
 
   // 3. Fallback to OpenAI Whisper if configured
   if (openaiApiKey) {
+    const openaiController = new AbortController();
+    const openaiTimeout = setTimeout(() => openaiController.abort(), REQUEST_TIMEOUT_MS);
     try {
       const formData = new FormData();
       formData.append(
@@ -285,14 +316,15 @@ CRITICAL INSTRUCTION: Transcribe only genuine spoken human speech verbatim. If t
         `recording.${ext}`
       );
       formData.append("model", "whisper-1");
-      if (options.language) {
-        formData.append("language", options.language.slice(0, 2).toLowerCase());
+      if (whisperLang) {
+        formData.append("language", whisperLang);
       }
 
       const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
         method: "POST",
         headers: { Authorization: `Bearer ${openaiApiKey}` },
         body: formData,
+        signal: openaiController.signal,
       });
 
       if (res.ok) {
@@ -317,6 +349,8 @@ CRITICAL INSTRUCTION: Transcribe only genuine spoken human speech verbatim. If t
       console.error(
         `[AudioTranscription] Provider: OpenAI Whisper | Model: whisper-1 | Stage: openai_exception | MIME: ${mimeType} | Ext: ${ext} | AudioSize: ${options.audioBuffer.length} bytes | Error: ${openaiErr?.message || openaiErr}`
       );
+    } finally {
+      clearTimeout(openaiTimeout);
     }
   }
 

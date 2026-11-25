@@ -1,6 +1,9 @@
 export const SILENCE_HALLUCINATION_PATTERNS = [
   /where is (a|the) hospital in this city/i,
   /where is the nearest hospital/i,
+  /in the city,? (there are )?many people/i,
+  /there are many people in the city/i,
+  /the computer'?s on the table/i,
   /thank you for watching/i,
   /thanks for watching/i,
   /please subscribe/i,

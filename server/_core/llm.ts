@@ -443,17 +443,17 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
   };
   const configuredModel = process.env.GEMINI_MODEL?.trim();
   const primaryModel =
-    params.model || configuredModel || "gemini-2.5-flash";
+    params.model || configuredModel || "gemini-3.5-flash-lite";
 
   const allCandidateModels = Array.from(
     new Set(
       [
         primaryModel,
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-flash-lite-latest",
         "gemini-3.5-flash-lite",
         "gemini-3-flash-preview",
+        "gemini-flash-lite-latest",
+        "gemini-flash-latest",
+        "gemini-3.6-flash",
       ].filter(Boolean) as string[]
     )
   );
@@ -467,7 +467,7 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     candidateModels = allCandidateModels;
   }
 
-  const attemptTimeoutMs = params.timeoutMs ?? 4500;
+  const attemptTimeoutMs = params.timeoutMs ?? 15_000;
   let lastResponse: { status: number; body: string } | null = null;
   let lastError: unknown = null;
 
@@ -501,6 +501,16 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
       if (response.status === 400) {
         console.error(`[Gemini LLM] Model "${currentModel}" failed with client error 400.`);
         throw new Error(`LLM invoke failed: ${response.status}`);
+      }
+
+      if (response.status === 404) {
+        modelCooldowns.set(currentModel, Date.now() + 86400_000);
+        console.warn(
+          `[Gemini LLM] Model "${currentModel}" failed with status 404 (deprecated or unavailable). Trying candidate model...`
+        );
+        if (i < candidateModels.length - 1) {
+          continue;
+        }
       }
 
       if (response.status === 503 || response.status === 429 || response.status >= 500) {

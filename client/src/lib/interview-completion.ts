@@ -32,7 +32,7 @@ type Session = {
   created_at: string;
 };
 type Question = { id: string; question_text: string };
-type Answer = { question_id: string; answer_text: string };
+type Answer = { id?: string; question_id: string; answer_text: string };
 type RubricCriterion = { name: string; description: string; weight: number };
 
 type CompletionInput = {
@@ -42,6 +42,18 @@ type CompletionInput = {
   questions: Question[];
   answers: Answer[];
   evaluations: Record<string, Evaluation>;
+  evaluate?: (input: {
+    question: string;
+    answer: string;
+    course: string;
+    role: string;
+    type: string;
+    specialization?: string;
+    semester?: string;
+    skills?: string[];
+    criteria?: RubricCriterion[];
+    language?: "English" | "Hindi" | "Hinglish";
+  }) => Promise<any>;
   summarize: (input: {
     course: string;
     role: string;
@@ -130,8 +142,127 @@ async function persistInterviewCompletionClaimed(
   input: CompletionInput,
   claimToken: string
 ) {
-  const { client, ownerId, session, questions, answers, evaluations } = input;
-  const scored = Object.values(evaluations).filter(
+  const { client, ownerId, session, questions, answers, evaluations, evaluate } = input;
+  const mergedEvaluations: Record<string, Evaluation> = { ...(evaluations || {}) };
+
+  try {
+    const { data: dbEvalRows } = await client
+      .from("answer_evaluations")
+      .select("*,interview_answers!inner(id,question_id,answer_text)")
+      .eq("owner_id", ownerId)
+      .eq("interview_answers.session_id", session.id);
+
+    if (dbEvalRows) {
+      for (const e of dbEvalRows as any[]) {
+        const qid = e.interview_answers?.question_id;
+        if (qid && (!mergedEvaluations[qid] || mergedEvaluations[qid].source !== "ai")) {
+          mergedEvaluations[qid] = {
+            overall_score: Number(e.overall_score),
+            dimensions: Array.isArray(e.dimensions) ? e.dimensions : [],
+            strengths: Array.isArray(e.strengths) ? e.strengths : [],
+            weaknesses: Array.isArray(e.weaknesses) ? e.weaknesses : [],
+            missing_points: Array.isArray(e.missing_points) ? e.missing_points : [],
+            better_answer: e.better_answer || "",
+            improvement_tip: e.improvement_tip || "",
+            source: e.source === "baseline" ? "baseline" : "ai",
+            modelVersion: e.model_version || undefined,
+            promptVersion: e.prompt_version || undefined,
+            rubricVersion: e.rubric_version || undefined,
+          };
+        }
+      }
+    }
+  } catch (dbErr) {
+    console.warn("Failed to query existing answer_evaluations during completion:", dbErr);
+  }
+
+  const answersByQuestion = new Map(
+    answers.map(answer => [answer.question_id, answer.answer_text])
+  );
+  const answerRowByQuestion = new Map(
+    answers.map(answer => [answer.question_id, answer])
+  );
+
+  if (typeof evaluate === "function") {
+    const criteria = evaluationCriteriaFromContext((session as any).context_notes || "");
+    for (const q of questions) {
+      const ansText = answersByQuestion.get(q.id)?.trim();
+      const existing = mergedEvaluations[q.id];
+      const hasValidEvaluation =
+        existing?.source === "ai" &&
+        Number.isFinite(Number(existing.overall_score)) &&
+        Number(existing.overall_score) >= 0 &&
+        Number(existing.overall_score) <= 100;
+
+      if (ansText && !hasValidEvaluation) {
+        try {
+          const evalResult = await evaluate({
+            question: q.question_text,
+            answer: ansText,
+            course: session.course,
+            role: session.target_role,
+            type: session.interview_type,
+            specialization: session.specialization,
+            criteria,
+          });
+
+          if (evalResult && Number.isFinite(Number(evalResult.overall_score))) {
+            const mappedEval: Evaluation = {
+              overall_score: Number(evalResult.overall_score),
+              dimensions: Array.isArray(evalResult.dimensions) ? evalResult.dimensions : [],
+              strengths: Array.isArray(evalResult.strengths) ? evalResult.strengths : [],
+              weaknesses: Array.isArray(evalResult.weaknesses) ? evalResult.weaknesses : [],
+              missing_points: Array.isArray(evalResult.missing_points) ? evalResult.missing_points : [],
+              better_answer: evalResult.better_answer || "",
+              improvement_tip: evalResult.improvement_tip || "",
+              source: evalResult.source || "ai",
+              modelVersion: evalResult.modelVersion,
+              promptVersion: evalResult.promptVersion,
+              rubricVersion: evalResult.rubricVersion,
+            };
+            mergedEvaluations[q.id] = mappedEval;
+
+            let answerId = answerRowByQuestion.get(q.id)?.id;
+            if (!answerId) {
+              const { data: ansDbRow } = await client
+                .from("interview_answers")
+                .select("id")
+                .eq("session_id", session.id)
+                .eq("question_id", q.id)
+                .eq("owner_id", ownerId)
+                .maybeSingle();
+              answerId = ansDbRow?.id;
+            }
+
+            if (answerId) {
+              await client.from("answer_evaluations").upsert(
+                {
+                  owner_id: ownerId,
+                  answer_id: answerId,
+                  overall_score: mappedEval.overall_score,
+                  dimensions: mappedEval.dimensions || [],
+                  strengths: mappedEval.strengths || [],
+                  weaknesses: mappedEval.weaknesses || [],
+                  missing_points: mappedEval.missing_points || [],
+                  better_answer: mappedEval.better_answer || "",
+                  improvement_tip: mappedEval.improvement_tip || "",
+                  source: mappedEval.source || "ai",
+                  model_version: mappedEval.modelVersion || null,
+                  prompt_version: mappedEval.promptVersion || null,
+                  rubric_version: mappedEval.rubricVersion || null,
+                },
+                { onConflict: "answer_id" }
+              );
+            }
+          }
+        } catch (evalErr) {
+          console.warn("Failed to evaluate answer during completion finalization:", evalErr);
+        }
+      }
+    }
+  }
+
+  const scored = Object.values(mergedEvaluations).filter(
     value =>
       value?.source === "ai" &&
       Number.isFinite(Number(value.overall_score)) &&
@@ -146,16 +277,13 @@ async function persistInterviewCompletionClaimed(
   const savedAnswerCount = answers.filter(answer =>
     answer.answer_text.trim()
   ).length;
-  const answersByQuestion = new Map(
-    answers.map(answer => [answer.question_id, answer.answer_text])
-  );
   const answerSet = questions
     .map(question => ({
       id: question.id,
       question: question.question_text.slice(0, 2000),
       answer: answersByQuestion.get(question.id) || "",
-      score: evaluations[question.id]?.overall_score,
-      source: evaluations[question.id]?.source,
+      score: mergedEvaluations[question.id]?.overall_score,
+      source: mergedEvaluations[question.id]?.source,
     }))
     .filter(
       answer =>
@@ -239,9 +367,9 @@ async function persistInterviewCompletionClaimed(
             role: session.target_role,
             answers: answerSet.slice(0, 12),
           })
-          .catch(() => {
-            // Do not save a misleading heuristic report when AI analysis is unavailable.
-            throw new Error("AI report analysis is unavailable. Please retry.");
+          .catch(err => {
+            console.warn("AI report analysis fallback to transparent-baseline:", err);
+            return null;
           })
       : Promise.resolve(null),
     dimensionRecords.length

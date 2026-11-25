@@ -191,18 +191,20 @@ export const appRouter = router({
           language: z.string().max(12).optional(),
         })
       )
-      .mutation(async ({ input }) => {
-        const result = await transcribeAudioBuffer({
-          audioBuffer: Buffer.from(input.audioBase64, "base64"),
-          mimeType: input.mimeType,
-          language: input.language,
-        });
-        if ("error" in result)
-          throw new TRPCError({
-            code: "SERVICE_UNAVAILABLE",
-            message: result.error,
+      .mutation(async ({ ctx, input }) => {
+        return runAi(ctx, async () => {
+          const result = await transcribeAudioBuffer({
+            audioBuffer: Buffer.from(input.audioBase64, "base64"),
+            mimeType: input.mimeType,
+            language: input.language,
           });
-        return result;
+          if ("error" in result)
+            throw new TRPCError({
+              code: "SERVICE_UNAVAILABLE",
+              message: result.error,
+            });
+          return result;
+        });
       }),
   }),
   behavioral: router({
