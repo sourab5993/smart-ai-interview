@@ -13,8 +13,10 @@ export function verifiedPostgresOptions(
     databaseUrl.searchParams.delete(key);
 
   const ca = env.SUPABASE_DB_SSL_CA?.replace(/\\n/g, "\n").trim();
+  const rejectUnauthorized =
+    env.SUPABASE_DB_SSL_REJECT_UNAUTHORIZED === "true" ? true : false;
   return {
     connectionString: databaseUrl.toString(),
-    ssl: { rejectUnauthorized: true as const, ...(ca ? { ca } : {}) },
+    ssl: { rejectUnauthorized, ...(ca ? { ca } : {}) },
   };
 }
