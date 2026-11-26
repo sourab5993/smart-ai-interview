@@ -464,13 +464,13 @@ async function structured<T>(
     },
     { role: "user" as const, content: prompt },
   ];
-  const result = await invokeLLM({
+ const result = await invokeLLM({
     model: AI_MODEL,
     timeoutMs:
       name === "answer_evaluation"
-        ? 6000
+        ? 15000
         : name === "interview_analysis"
-          ? 12000
+          ? 20000
           : 15000,
     max_tokens:
       name === "interview_analysis"

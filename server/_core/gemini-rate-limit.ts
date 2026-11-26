@@ -130,7 +130,13 @@ export async function enforceGeminiRateLimit(
       ]
     );
     rows = result.rows;
-  } catch {
+  } catch (err) {
+    const pgError = err as { code?: string; message?: string };
+    console.error("[enforceGeminiRateLimit] DB query failed:", {
+      operation,
+      code: pgError?.code,
+      message: pgError?.message ?? String(err),
+    });
     throw new TRPCError({
       code: "SERVICE_UNAVAILABLE",
       message: "AI requests are temporarily unavailable. Please try again later.",
