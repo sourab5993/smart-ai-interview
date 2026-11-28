@@ -805,6 +805,7 @@ export function LiveInterviewRoom() {
       worker.onmessage = event => {
         const data = event.data as {
           type?: string;
+          message?: string;
           counts?: {
             samples?: number;
             facePresent?: number;
@@ -849,20 +850,26 @@ export function LiveInterviewRoom() {
           return;
         }
         if (data?.type === "error") {
+          console.warn("[FramingWorker error]:", data?.message || data);
           stopCamera();
           cameraStatusRef.current = "error";
           setCameraStatus("error");
           setCameraError(
-            "Local framing models could not run on this device. The interview can continue without camera analysis."
+            data?.message
+              ? `Local framing models could not run on this device (${data.message}). The interview can continue without camera analysis.`
+              : "Local framing models could not run on this device. The interview can continue without camera analysis."
           );
         }
       };
-      worker.onerror = () => {
+      worker.onerror = event => {
+        console.warn("[FramingWorker uncaught error]:", event?.message || event);
         stopCamera();
         cameraStatusRef.current = "error";
         setCameraStatus("error");
         setCameraError(
-          "Local framing analysis stopped unexpectedly; your interview is unaffected."
+          event?.message
+            ? `Local framing analysis stopped unexpectedly (${event.message}); your interview is unaffected.`
+            : "Local framing analysis stopped unexpectedly; your interview is unaffected."
         );
       };
       worker.postMessage({ type: "init" });
@@ -879,7 +886,7 @@ export function LiveInterviewRoom() {
         const currentWorker = framingWorkerRef.current;
         if (!currentWorker) return;
         framingBusyRef.current = true;
-        void createImageBitmap(video, { resizeWidth: 320, resizeHeight: 240 })
+        void createImageBitmap(video, { resizeWidth: 240, resizeHeight: 180 })
           .then(bitmap => {
             if (framingWorkerRef.current !== currentWorker) {
               bitmap.close();
@@ -894,8 +901,9 @@ export function LiveInterviewRoom() {
           .catch(() => {
             framingBusyRef.current = false;
           });
-      }, 650);
-    } catch {
+      }, 900);
+    }  catch (err) {
+      console.warn("[LiveInterview] Camera setup error:", err);
       stopCamera(false);
       cameraStatusRef.current = "error";
       setCameraStatus("error");
