@@ -38,43 +38,99 @@ function post(message: Record<string, unknown>) {
   (self as unknown as Worker).postMessage(message);
 }
 
-async function init() {
-  const vision = await FilesetResolver.forVisionTasks(WASM_ROOT, false);
-  face = await FaceLandmarker.createFromOptions(vision, {
-    baseOptions: { modelAssetPath: MODELS.face },
-    runningMode: "VIDEO",
-    numFaces: 1,
-    minFaceDetectionConfidence: 0.5,
-    minFacePresenceConfidence: 0.5,
-    minTrackingConfidence: 0.5,
-  });
-  pose = await PoseLandmarker.createFromOptions(vision, {
-    baseOptions: { modelAssetPath: MODELS.pose },
-    runningMode: "VIDEO",
-    numPoses: 1,
-    minPoseDetectionConfidence: 0.5,
-    minPosePresenceConfidence: 0.5,
-    minTrackingConfidence: 0.5,
-  });
-  hands = await HandLandmarker.createFromOptions(vision, {
-    baseOptions: { modelAssetPath: MODELS.hand },
-    runningMode: "VIDEO",
-    numHands: 2,
-    minHandDetectionConfidence: 0.5,
-    minHandPresenceConfidence: 0.5,
-    minTrackingConfidence: 0.5,
-  });
-  post({ type: "ready" });
+async function createLandmarker<T>(
+  createFn: (opts: any) => Promise<T>,
+  modelAssetPath: string,
+  extraOptions: Record<string, unknown>
+): Promise<T | null> {
+  try {
+    return await createFn({
+      baseOptions: { modelAssetPath, delegate: "GPU" },
+      runningMode: "VIDEO",
+      ...extraOptions,
+    });
+  } catch {
+    try {
+      return await createFn({
+        baseOptions: { modelAssetPath, delegate: "CPU" },
+        runningMode: "VIDEO",
+        ...extraOptions,
+      });
+    } catch {
+      return null;
+    }
+  }
 }
 
+async function init() {
+  const vision = await FilesetResolver.forVisionTasks(WASM_ROOT, false);
+
+  face = await createLandmarker(
+    opts => FaceLandmarker.createFromOptions(vision, opts),
+    MODELS.face,
+    {
+      numFaces: 1,
+      minFaceDetectionConfidence: 0.5,
+      minFacePresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    }
+  );
+
+  pose = await createLandmarker(
+    opts => PoseLandmarker.createFromOptions(vision, opts),
+    MODELS.pose,
+    {
+      numPoses: 1,
+      minPoseDetectionConfidence: 0.5,
+      minPosePresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    }
+  );
+
+  hands = await createLandmarker(
+    opts => HandLandmarker.createFromOptions(vision, opts),
+    MODELS.hand,
+    {
+      numHands: 2,
+      minHandDetectionConfidence: 0.5,
+      minHandPresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    }
+  );
+
+  if (!face && !pose && !hands) {
+    throw new Error("Could not initialize any MediaPipe framing model on this device");
+  }
+
+  post({ type: "ready" });
+}
 function frame(bitmap: ImageBitmap, timestampMs: number) {
-  if (!face || !pose || !hands) throw new Error("Models are not ready");
-  const faceFound = (face.detectForVideo(bitmap, timestampMs).faceLandmarks || []).length > 0;
-  const poseLandmarks = pose.detectForVideo(bitmap, timestampMs).landmarks?.[0] || [];
-  const visible = (index: number) =>
-    Boolean(poseLandmarks[index] && (poseLandmarks[index].visibility ?? 0) >= 0.5);
-  const shouldersFound = visible(11) && visible(12);
-  const handsFound = (hands.detectForVideo(bitmap, timestampMs).landmarks || []).length > 0;
+  if (!face && !pose && !hands) throw new Error("Models are not ready");
+
+  let faceFound = false;
+  let shouldersFound = false;
+  let handsFound = false;
+
+  if (face) {
+    try {
+      faceFound = (face.detectForVideo(bitmap, timestampMs).faceLandmarks || []).length > 0;
+    } catch {}
+  }
+
+  if (pose) {
+    try {
+      const poseLandmarks = pose.detectForVideo(bitmap, timestampMs).landmarks?.[0] || [];
+      const visible = (index: number) =>
+        Boolean(poseLandmarks[index] && (poseLandmarks[index].visibility ?? 0) >= 0.5);
+      shouldersFound = visible(11) && visible(12);
+    } catch {}
+  }
+
+  if (hands) {
+    try {
+      handsFound = (hands.detectForVideo(bitmap, timestampMs).landmarks || []).length > 0;
+    } catch {}
+  }
 
   counts = {
     samples: Math.min(10000, counts.samples + 1),
@@ -85,7 +141,6 @@ function frame(bitmap: ImageBitmap, timestampMs: number) {
     ),
     handsPresent: Math.min(10000, counts.handsPresent + Number(handsFound)),
   };
-  // No per-frame booleans, coordinates, landmarks, or image-derived details cross the worker boundary.
   post({ type: "counts", counts });
 }
 
@@ -102,7 +157,13 @@ function dispose() {
 self.onmessage = event => {
   const input = event.data as WorkerInput;
   if (input.type === "init") {
-    void init().catch(() => post({ type: "error", code: "model_unavailable" }));
+    void init().catch(err =>
+      post({
+        type: "error",
+        code: "model_unavailable",
+        message: err instanceof Error ? err.message : String(err),
+      })
+    );
     return;
   }
   if (input.type === "dispose") {
@@ -112,8 +173,12 @@ self.onmessage = event => {
   if (input.type === "frame") {
     try {
       frame(input.bitmap, input.timestampMs);
-    } catch {
-      post({ type: "error", code: "inference_unavailable" });
+    } catch (err) {
+      post({
+        type: "error",
+        code: "inference_unavailable",
+        message: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       input.bitmap.close();
     }
