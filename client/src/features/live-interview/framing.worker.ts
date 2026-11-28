@@ -11,6 +11,7 @@ type Counts = {
   shouldersPresent: number;
   handsPresent: number;
 };
+
 type WorkerInput =
   | { type: "init" }
   | { type: "dispose" }
@@ -21,6 +22,7 @@ const MODELS = {
   pose: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
   hand: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
 };
+
 const WASM_ROOT =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm";
 
@@ -42,30 +44,32 @@ async function createLandmarker<T>(
   createFn: (opts: any) => Promise<T>,
   modelAssetPath: string,
   extraOptions: Record<string, unknown>
-): Promise<T | null> {
+): Promise<{ model: T | null; error: unknown }> {
   try {
-    return await createFn({
+    const model = await createFn({
       baseOptions: { modelAssetPath, delegate: "GPU" },
       runningMode: "VIDEO",
       ...extraOptions,
     });
-  } catch {
+    return { model, error: null };
+  } catch (gpuErr) {
     try {
-      return await createFn({
+      const model = await createFn({
         baseOptions: { modelAssetPath, delegate: "CPU" },
         runningMode: "VIDEO",
         ...extraOptions,
       });
-    } catch {
-      return null;
+      return { model, error: null };
+    } catch (cpuErr) {
+      return { model: null, error: cpuErr || gpuErr };
     }
   }
 }
 
 async function init() {
-  const vision = await FilesetResolver.forVisionTasks(WASM_ROOT, false);
+  const vision = await FilesetResolver.forVisionTasks(WASM_ROOT);
 
-  face = await createLandmarker(
+  const faceRes = await createLandmarker(
     opts => FaceLandmarker.createFromOptions(vision, opts),
     MODELS.face,
     {
@@ -75,8 +79,9 @@ async function init() {
       minTrackingConfidence: 0.5,
     }
   );
+  face = faceRes.model;
 
-  pose = await createLandmarker(
+  const poseRes = await createLandmarker(
     opts => PoseLandmarker.createFromOptions(vision, opts),
     MODELS.pose,
     {
@@ -86,8 +91,9 @@ async function init() {
       minTrackingConfidence: 0.5,
     }
   );
+  pose = poseRes.model;
 
-  hands = await createLandmarker(
+  const handRes = await createLandmarker(
     opts => HandLandmarker.createFromOptions(vision, opts),
     MODELS.hand,
     {
@@ -97,13 +103,22 @@ async function init() {
       minTrackingConfidence: 0.5,
     }
   );
+  hands = handRes.model;
 
   if (!face && !pose && !hands) {
-    throw new Error("Could not initialize any MediaPipe framing model on this device");
+    const firstErr = faceRes.error || poseRes.error || handRes.error;
+    const reason =
+      firstErr instanceof Error
+        ? firstErr.message
+        : firstErr
+          ? String(firstErr)
+          : "MediaPipe models failed to load on this device";
+    throw new Error(reason);
   }
 
   post({ type: "ready" });
 }
+
 function frame(bitmap: ImageBitmap, timestampMs: number) {
   if (!face && !pose && !hands) throw new Error("Models are not ready");
 
@@ -113,22 +128,28 @@ function frame(bitmap: ImageBitmap, timestampMs: number) {
 
   if (face) {
     try {
-      faceFound = (face.detectForVideo(bitmap, timestampMs).faceLandmarks || []).length > 0;
+      faceFound =
+        (face.detectForVideo(bitmap, timestampMs).faceLandmarks || []).length >
+        0;
     } catch {}
   }
 
   if (pose) {
     try {
-      const poseLandmarks = pose.detectForVideo(bitmap, timestampMs).landmarks?.[0] || [];
+      const poseLandmarks =
+        pose.detectForVideo(bitmap, timestampMs).landmarks?.[0] || [];
       const visible = (index: number) =>
-        Boolean(poseLandmarks[index] && (poseLandmarks[index].visibility ?? 0) >= 0.5);
+        Boolean(
+          poseLandmarks[index] && (poseLandmarks[index].visibility ?? 0) >= 0.5
+        );
       shouldersFound = visible(11) && visible(12);
     } catch {}
   }
 
   if (hands) {
     try {
-      handsFound = (hands.detectForVideo(bitmap, timestampMs).landmarks || []).length > 0;
+      handsFound =
+        (hands.detectForVideo(bitmap, timestampMs).landmarks || []).length > 0;
     } catch {}
   }
 
@@ -151,7 +172,12 @@ function dispose() {
   face = null;
   pose = null;
   hands = null;
-  counts = { samples: 0, facePresent: 0, shouldersPresent: 0, handsPresent: 0 };
+  counts = {
+    samples: 0,
+    facePresent: 0,
+    shouldersPresent: 0,
+    handsPresent: 0,
+  };
 }
 
 self.onmessage = event => {
